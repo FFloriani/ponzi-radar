@@ -52,6 +52,7 @@ class NoBase(ABC):
     entradas: tuple[str, ...] = ()  # obrigatórias
     opcionais: tuple[str, ...] = ()
     exige_um_de: tuple[str, ...] = ()
+    saidas: tuple[str, ...] = ()  # declarativo (spec 5): o motor não confere
     toca_alvo: bool = False
     as_of: CapacidadeAsOf = "exato"
 
@@ -62,6 +63,7 @@ class NoBase(ABC):
         entradas: Iterable[str] | None = None,
         opcionais: Iterable[str] | None = None,
         exige_um_de: Iterable[str] | None = None,
+        saidas: Iterable[str] | None = None,
         toca_alvo: bool | None = None,
         as_of: CapacidadeAsOf | None = None,
     ) -> None:
@@ -73,6 +75,8 @@ class NoBase(ABC):
             self.opcionais = tuple(opcionais)
         if exige_um_de is not None:
             self.exige_um_de = tuple(exige_um_de)
+        if saidas is not None:
+            self.saidas = tuple(saidas)
         if toca_alvo is not None:
             self.toca_alvo = toca_alvo
         if as_of is not None:
@@ -264,11 +268,16 @@ class Motor:
         try:
             resultado = await no.executar(self.ctx, entradas, respostas, self.servicos)
         except ErroNo as e:
-            self._mudar(nome, "erro", e.mensagem)
+            self._mudar(nome, "erro", str(e.mensagem))
         except Exception as e:
             self._mudar(nome, "erro", f"erro inesperado: {type(e).__name__}: {e}")
         else:
-            self._aplicar(nome, resultado)
+            # um resultado malformado também é falha do nó: nunca pode derrubar o motor nem
+            # deixar o nó `executando` (a retomada o reexecutaria e cairia de novo)
+            try:
+                self._aplicar(nome, resultado)
+            except Exception as e:
+                self._mudar(nome, "erro", f"resultado inválido: {type(e).__name__}: {e}")
         self._salvar()
 
     def _aplicar(self, nome: str, resultado: Any) -> None:
@@ -282,13 +291,27 @@ class Motor:
             self._saidas[nome] = saidas
             self._evidencias_sujas = True
         elif isinstance(resultado, Pulado):
+            if not isinstance(resultado.motivo, str):
+                veio = type(resultado.motivo).__name__
+                motivo = f"resultado inválido: Pulado.motivo precisa ser texto (veio {veio})"
+                self._mudar(nome, "erro", motivo)
+                return
             self._mudar(nome, "pulado", resultado.motivo)
         elif isinstance(resultado, Aguardando):
-            self._registrar_pendencias(nome, list(resultado.pendencias))
+            self._registrar_pendencias(nome, resultado.pendencias)
         else:
             self._mudar(nome, "erro", f"resultado inválido: {type(resultado).__name__}")
 
-    def _registrar_pendencias(self, nome: str, pendencias: list[Pendencia]) -> None:
+    def _registrar_pendencias(self, nome: str, pendencias: Any) -> None:
+        if not isinstance(pendencias, list | tuple):
+            veio = type(pendencias).__name__
+        else:
+            estranhos = (type(p).__name__ for p in pendencias if not isinstance(p, Pendencia))
+            veio = next((f"item {tipo}" for tipo in estranhos), None)
+        if veio is not None:
+            motivo = f"resultado inválido: Aguardando.pendencias precisa ser lista de Pendencia (veio {veio})"
+            self._mudar(nome, "erro", motivo)
+            return
         if not pendencias:
             self._mudar(nome, "erro", "Aguardando sem pendências")
             return

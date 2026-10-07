@@ -202,6 +202,72 @@ async def test_resultado_invalido_e_saidas_normalizadas(tmp_path, serv, diario):
     assert diario.entradas["usa"] == {"data": {"d": "2020-01-02", "t": [1, 2]}}
 
 
+class FeitoQuebrado(Feito):
+    """Passa no isinstance, mas ler `saidas` levanta: exercita a proteção genérica do resultado."""
+
+    @property
+    def saidas(self):
+        raise RuntimeError("quebrou")
+
+
+async def test_resultado_malformado_vira_erro_e_a_retomada_segue(tmp_path, serv, diario):
+    def explode_erro(entradas, respostas):
+        raise ErroNo(object(), permanente=True)  # mensagem que não é texto
+
+    def nos():
+        return [
+            Falso("lista_de_dict", diario, lambda e, r: Aguardando([{"id": "P-1"}])),
+            Falso("pendencias_none", diario, lambda e, r: Aguardando(None)),
+            Falso("nada", diario, lambda e, r: None),
+            Falso("dict", diario, lambda e, r: {"x": 1}),
+            Falso("pulado_ruim", diario, lambda e, r: Pulado(object())),
+            Falso("erro_ruim", diario, explode_erro),
+            Falso("quebrado", diario, lambda e, r: object.__new__(FeitoQuebrado)),
+            Falso("x", diario),
+            Falso("dep", diario, entradas=("x",)),
+        ]
+
+    ruins = ["lista_de_dict", "pendencias_none", "nada", "dict", "pulado_ruim", "erro_ruim", "quebrado"]
+    esperado = {**dict.fromkeys(ruins, "erro"), "x": "feito", "dep": "feito"}
+    m = Motor(ctx(tmp_path), nos(), serv)
+    await m.executar()
+    assert m.status() == esperado
+    assert {n: v["status"] for n, v in ler_json(tmp_path / "estado.json")["nos"].items()} == esperado
+    aguardando_ruim = "resultado inválido: Aguardando.pendencias precisa ser lista de Pendencia"
+    assert motivos(tmp_path) | {"erro_ruim": None} == {
+        "lista_de_dict": f"{aguardando_ruim} (veio item dict)",
+        "pendencias_none": f"{aguardando_ruim} (veio NoneType)",
+        "nada": "resultado inválido: NoneType",
+        "dict": "resultado inválido: dict",
+        "pulado_ruim": "resultado inválido: Pulado.motivo precisa ser texto (veio object)",
+        "erro_ruim": None,
+        "quebrado": "resultado inválido: RuntimeError: quebrou",
+        "x": None,
+        "dep": None,
+    }
+    assert motivos(tmp_path)["erro_ruim"].startswith("<object object at ")
+    assert m.pendencias_abertas() == []
+
+    # a retomada não levanta e não reexecuta nada: os nós ruins ficam em `erro`
+    m2 = Motor.carregar(tmp_path, nos(), serv)
+    await m2.executar()
+    assert m2.status() == esperado and diario.contador == Counter(dict.fromkeys(esperado, 1))
+
+
+def test_no_declara_saidas(diario):
+    class Rdap(NoBase):
+        nome = "rdap"
+        saidas = ("registro", "expiracao")
+
+        async def executar(self, ctx, entradas, respostas, s):
+            return Feito({})
+
+    assert NoBase.saidas == () and Falso("x", diario).saidas == ()
+    assert Rdap().saidas == ("registro", "expiracao")
+    assert Rdap(saidas=["cnpj_titular"]).saidas == ("cnpj_titular",)
+    assert Rdap.saidas == ("registro", "expiracao")  # a troca é só na instância
+
+
 async def test_pulado_e_opcionais(tmp_path, serv, diario):
     nos = [
         Falso("pula", diario, lambda e, r: Pulado("modo nenhum")),
