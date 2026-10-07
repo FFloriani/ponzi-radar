@@ -123,18 +123,19 @@ O slug sai do domínio registrável (`exemplo.com.br` vira `exemplo-com-br`), ex
 | `dns` | DNS sobre HTTPS (Cloudflare `cloudflare-dns.com/dns-query`) | A, AAAA, MX, NS, TXT; provedor de hospedagem e de e-mail | não | só atual |
 | `ct` | crt.sh (JSON) | primeiro certificado, SANs (subdomínios, domínios irmãos) | não | exato (`not_before` ≤ `as_of`) |
 | `wayback_indice` | CDX do Wayback | primeiro e último snapshot, capturas por mês | não | exato |
-| `cvm_alertas` | listas de Deliberações e Atos Declaratórios da CVM no gov.br, indexadas em `casos/_indices/` e renovadas se o índice tiver mais de 24 h | correspondências por CNPJ, domínio ou nome | não | exato (data do ato) |
+| `cvm_alertas` | Deliberações de "Atuação Irregular" da CVM (stop orders; 273 em 07/10/2026), indexadas em `casos/_indices/` e renovadas se o índice tiver mais de 24 h. Os Atos Declaratórios ficam num sistema legado sem lista navegável e são consultados pela P-C4 | correspondências por CNPJ, domínio ou nome | não | exato (data do ato) |
 | `captura` | o site, via Playwright | por página: DOM, texto, screenshot, HAR, domínios de terceiros carregados | **sim** | só atual |
 | `wayback_snapshot` | Wayback (modo `id_`, HTML cru) | página inicial e até 10 subpáginas como estavam até o `as_of` | não | exato |
 | `extracao` | regex sobre o texto de `captura` ou de `wayback_snapshot` | candidatos com trecho, hash do artefato e posição | não | herda |
-| `cnpj` | BrasilAPI `/api/cnpj/v1/{cnpj}`; fallback: segunda API pública gratuita (escolhida e conferida no plano); depois disso, P-CNPJ | razão social, abertura, CNAE, capital, situação, quadro de sócios (nome, qualificação, data de entrada) | não | abertura: exato · resto: só atual |
-| `registros` | dados abertos da CVM (`dados.cvm.gov.br`: `INTERMED/CAD`, `CROWDFUNDING/CAD`, `ADM_CART`, `CONSULTOR_VLMOB`) · BCB Olinda `Instituicoes_em_funcionamento` | registrado ou não, por CNPJ (por nome se não houver CNPJ) | não | filtrável |
+| `cnpj` | BrasilAPI `/api/cnpj/v1/{cnpj}`; fallback: `minhareceita.org/{cnpj}` (mesmo esquema); P-CNPJ quando não há CNPJ ou há mais de um candidato | razão social, abertura, CNAE, capital, situação, quadro de sócios (nome, qualificação, data de entrada) | não | abertura: exato · resto: só atual |
+| `registros` | dados abertos da CVM (`dados.cvm.gov.br`: `INTERMED/CAD`, `CROWDFUNDING/CAD`, `ADM_CART`, `CONSULTOR_VLMOB`) · BCB Olinda `Instituicoes_em_funcionamento` (`SedesBancoComMultCE`, `SedesSociedades`, `SedesCooperativas`, `SedesConsorcios`, comparando pela raiz de 8 dígitos do CNPJ; `DominiosVerificados`, comparando pelo domínio) | registrado ou não, por CNPJ e pelo domínio | não | filtrável |
 | `cvm_sancionador` | dados abertos da CVM `PROCESSO/SANCIONADOR` | processos ligados ao CNPJ ou aos sócios | não | filtrável |
 | `pend_*` | Claude, via MCP | respostas às pendências (seção 7) | não | restrito ao `as_of` |
 | `pontuacao` → `dossie` → `diff` | — | seção 8 | não | — |
 
 **Dependências:**
-- `rdap`, `dns`, `ct`, `wayback_indice` e `cvm_alertas` dependem de `alvo`.
+- `rdap`, `dns`, `ct` e `wayback_indice` dependem de `alvo`.
+- `cvm_alertas` depende de `alvo` e, como opcional, de `cnpj`, para casar também por CNPJ e razão social.
 - `captura` ou `wayback_snapshot` dependem de `alvo`.
 - `extracao` depende da página.
 - `cnpj` depende de `extracao` e de `rdap`.
@@ -185,14 +186,14 @@ Cada candidato guarda o trecho (±120 caracteres), o hash do artefato e a posiç
 | P-A3 | A3 | A1 > 0 ou oferta de investimento sem taxa fixa |
 | P-B | B1, B2, B3, B4 | sempre (uma resposta com quatro subitens) |
 | P-C | C2 e a parte de C3 que exige leitura (conta de PF ou de terceiro, sede offshore alegada) | sempre |
-| P-C4 | C4 (I-SCAN e alertas estrangeiros; correspondências só por nome na `cvm_alertas`) | sempre |
+| P-C4 | C4 (I-SCAN, alertas estrangeiros, Atos Declaratórios da CVM; correspondências só por nome na `cvm_alertas`) | sempre |
 | P-D1 | D1 | há nomes no quadro de sócios ou nomes de responsáveis no site |
 | P-D4 | D4 | sempre |
 | P-E | sinais do eixo 2 (tipos de `estagios` em `matriz.yaml`, mais `prova_aportes_novos` para a R3) e modificadores com `origem: P-E`; cada sinal com data e tipo de fonte | sempre |
 
 O item D2 fica "não verificado" até o subprojeto 2.
 
-### 7.2 Ferramentas MCP (transporte stdio, SDK `mcp`/FastMCP)
+### 7.2 Ferramentas MCP (transporte stdio, SDK `mcp` 2.x, `MCPServer`)
 
 | Ferramenta | Comportamento |
 |---|---|
@@ -431,7 +432,7 @@ A execução antiga é **pontuada de novo com a matriz atual** a partir dos julg
 | Erro permanente (4xx, formato inesperado) | nó `erro` com a mensagem; dependentes `bloqueado`; itens afetados `nao_verificado`; o resto do DAG continua |
 | Captura bloqueada por anti-bot ou CAPTCHA | nunca contornar; marcar "bloqueada" e usar `wayback_snapshot` |
 | Site fora do ar numa execução | usar `wayback_snapshot`; vira sinal E6 só pela regra de 8.3 |
-| BrasilAPI indisponível | fallback; depois P-CNPJ |
+| BrasilAPI indisponível | fallback para minhareceita.org; se as duas falharem, o nó `cnpj` fica em `erro` e os itens dependentes viram `nao_verificado` |
 | Resposta inválida em `responder_pendencia` | rejeição com motivo e campo; nada é gravado |
 | Processo morto no meio | retomada pelo `estado.json` (seção 5) |
 | Artefato alterado | `radar verificar` acusa o registro e o arquivo |
@@ -470,18 +471,15 @@ investimentos/
 - pacotes: `httpx`, `playwright`, `mcp`, `pydantic` v2, `jinja2`, `pyyaml`, `tldextract`;
 - testes: `pytest`, `pytest-asyncio`, `respx`.
 
-## 13. Verificações para o plano de implementação
+## 13. Verificações (feitas em 07/10/2026, antes do plano)
 
-Estas são checagens de ambiente e de fonte. Não são decisões de design em aberto.
+1. **Fallback do CNPJ:** minhareceita.org devolve o mesmo esquema da BrasilAPI, então o parser é um só. O publica.cnpj.ws não respondeu e o ReceitaWS usa outro esquema.
+2. **BCB Olinda:** os conjuntos são `SedesBancoComMultCE`, `SedesSociedades`, `SedesCooperativas`, `SedesConsorcios` e `DominiosVerificados`. O campo `CNPJ` é a raiz de 8 dígitos.
+3. **Dados abertos da CVM:** os ZIPs ficam em `dados.cvm.gov.br/dados/<DATASET>/.../DADOS/`, com CSV separado por `;` e codificação latin-1.
+   - Colunas usadas: `CNPJ`, `DENOM_SOCIAL`, `DENOM_COMERC`, `SIT`, `DT_REG` e `DT_CANCEL`.
+   - O processo sancionador vem em dois arquivos: `processo_sancionador.csv` e `processo_sancionador_acusado.csv`.
+4. **Deliberações:** a busca de "Atuação Irregular" em `conteudo.cvm.gov.br/legislacao` é paginada e cada deliberação tem página HTML com o texto completo. Os Atos Declaratórios ficam em `sistemas.cvm.gov.br`, sistema ASP em frames, e passam para a P-C4.
+5. **Pacotes no Python 3.14.7:** todos instalam. Versões: `mcp` 2.3.0, `playwright` 1.63.0, `pydantic` 2.13.5, `tldextract` 5.4.0, `respx` 0.23.1, `pytest` 9.1.1. No `mcp` 2.x, o FastMCP virou `MCPServer` (`mcp.server.mcpserver`).
+6. **Limites:** o Wayback devolveu 429 em `archive.org/wayback/available`, enquanto o CDX respondeu. Os limites ficam conservadores: Wayback a 1 req/2 s, crt.sh a 1 req/3 s.
 
-1. Escolher e conferir a API pública gratuita de fallback do CNPJ.
-2. Conferir os campos do serviço Olinda `Instituicoes_em_funcionamento` do BCB e o formato dos CSV de cadastro da CVM.
-3. Conferir o formato das listas de Deliberações e Atos Declaratórios da CVM para o índice local.
-4. Confirmar Playwright e `mcp` no Python 3.14. Se falhar, usar venv com Python 3.12.
-5. Medir os limites reais do Wayback e do crt.sh e ajustar `config.toml`.
-
-**Conferido em 07/10/2026** (BrasilAPI, RDAP, crt.sh, CDX do Wayback, DoH, índice de dados abertos da CVM e página de alertas):
-- BrasilAPI devolve o quadro de sócios;
-- o RDAP do registro.br devolve o CNPJ do titular PJ;
-- o CDX do Wayback funciona;
-- `archive.org/wayback/available` devolveu 429.
+**Também conferido:** a BrasilAPI devolve o quadro de sócios, o RDAP do registro.br devolve o CNPJ do titular PJ, e crt.sh e DoH respondem.
