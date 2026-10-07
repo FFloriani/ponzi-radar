@@ -12,6 +12,7 @@ import contextlib
 import json
 import re
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -27,10 +28,14 @@ from radar.motor import NoBase, Servicos
 from radar.nos._paginas import Chave, chave_da_pagina, ordenar_paginas
 from radar.nos.alvo import dominio_registravel
 
-# Desafio anti-bot: o título da página de verificação, ou marcas de captcha/desafio no HTML numa
-# página quase sem texto (a de um site de verdade, com captcha num formulário, tem mais de 200 caracteres)
+# Desafio anti-bot (R-T8-desafio). O título da página de verificação basta. Marca no HTML sozinha não:
+# um login ou cadastro com reCAPTCHA tem `g-recaptcha` e pouco texto e é uma página de verdade, e
+# `challenge-platform` aparece em qualquer página atrás da Cloudflare. Marca só conta com um segundo
+# sinal de que o servidor barrou o visitante (status 403/429/503 ou `cf-mitigated: challenge`) e
+# com a página quase sem texto.
 _TITULO_DESAFIO = re.compile(r"just a moment|attention required|verifique (que )?você é humano", re.IGNORECASE)
-_MARCAS_DESAFIO = ("cf-chl", "challenge-platform", "g-recaptcha", "h-captcha")
+_MARCAS_DESAFIO = ("cf-chl", "_cf_chl_opt", "cf-turnstile", "challenge-form", "g-recaptcha", "h-captcha")
+_STATUS_DE_BLOQUEIO = frozenset({403, 429, 503})
 _TEXTO_CURTO = 200
 _MOTIVO_DESAFIO = "desafio anti-bot"
 # links para estes arquivos nunca são seguidos (não é página e abrir um download é contato demais)
@@ -38,12 +43,31 @@ _EXTENSOES_DE_ARQUIVO = frozenset({"zip", "pdf", "exe", "apk", "rar", "7z", "dmg
 _JS_LINKS = "() => Array.from(document.links, (link) => link.href)"
 
 
-def _e_desafio(titulo: str, html: str, texto: str) -> bool:
-    """A página é uma verificação anti-bot (Cloudflare, reCAPTCHA, hCaptcha...), não o conteúdo do site."""
+def _e_desafio(
+    titulo: str, html: str, texto: str, status: int | None, cabecalhos: Mapping[str, str]
+) -> bool:
+    """A página é uma verificação anti-bot (Cloudflare, reCAPTCHA, hCaptcha...), não o conteúdo do site.
+
+    `status` e `cabecalhos` são os da resposta do `goto`. É desafio quando o título casa com
+    `_TITULO_DESAFIO`, ou quando o HTML tem uma de `_MARCAS_DESAFIO` E o servidor barrou o
+    visitante (`status` em `_STATUS_DE_BLOQUEIO` ou `cf-mitigated: challenge`) E o texto, sem os
+    espaços das pontas, tem menos de 200 caracteres.
+    """
     if _TITULO_DESAFIO.search(titulo):
         return True
+    mitigado = any(
+        nome.lower() == "cf-mitigated" and valor.strip().lower() == "challenge"
+        for nome, valor in cabecalhos.items()
+    )
+    if status not in _STATUS_DE_BLOQUEIO and not mitigado:
+        return False
     html = html.lower()
     return any(marca in html for marca in _MARCAS_DESAFIO) and len(texto.strip()) < _TEXTO_CURTO
+
+
+def _e_erro_http(status: int | None) -> bool:
+    """A resposta foi um erro HTTP (a página é a de erro do servidor, não o conteúdo do site)."""
+    return status is not None and status >= 400
 
 
 def _opcoes_do_contexto(rede: RedeConfig, caminho_har: Path) -> dict[str, Any]:
@@ -107,18 +131,22 @@ def _link_do_site(href: Any, hosts: set[str]) -> str | None:
     return urlunsplit(partes._replace(fragment=""))
 
 
-def _escolher_links(hrefs: list, site: list[str], limite: int) -> list[str]:
-    """As subpáginas a visitar: até `limite` links do mesmo host que as páginas do `site`.
+def _escolher_links(hrefs: list, url_inicial: str, url_final: str, alvo: str, limite: int) -> list[str]:
+    """As subpáginas a visitar: até `limite` links do mesmo host da `url_inicial` (com ou sem `www.`).
 
-    `site` são as páginas já capturadas (a URL inicial e a em que ela terminou, depois dos
-    redirects): o host de cada uma vale como "mesmo host" (com ou sem `www.`) e nenhuma é revisitada.
-    Links para arquivos, de outro esquema que não http(s) e repetidos depois de tirar o fragmento
-    ficam de fora. A ordem e o corte de variantes de query são os do `wayback_snapshot`
+    `url_final` é onde a página inicial terminou depois dos redirects. Ela nunca é revisitada, mas o
+    host dela só vale como "mesmo host" se for do domínio registrável do `alvo` (`www.exemplo.com`,
+    `app.exemplo.com`). Um golpe que redireciona para `t.me` ou `wa.me` não faz a captura rastrear
+    o Telegram. Links para arquivos, de outro esquema que não http(s) e repetidos depois de tirar o
+    fragmento ficam de fora. A ordem e o corte de variantes de query são os do `wayback_snapshot`
     (`ordenar_paginas`): as páginas de regras primeiro, as sem query antes das com query, no máximo
     1 variante de query por caminho (a primeira do documento).
     """
-    hosts = {host for host in map(_host_do_site, site) if host}
-    ja_vistas = {chave for chave in map(chave_da_pagina, site) if chave is not None}
+    hosts = {host for host in [_host_do_site(url_inicial)] if host}
+    host_final = _host_do_site(url_final)
+    if host_final and dominio_registravel(host_final) == alvo.lower():
+        hosts.add(host_final)
+    ja_vistas = {chave for chave in map(chave_da_pagina, [url_inicial, url_final]) if chave is not None}
     candidatas: dict[Chave, tuple[int, str]] = {}
     for posicao, href in enumerate(hrefs):
         url = _link_do_site(href, hosts)
@@ -145,9 +173,15 @@ def _bytes(texto: str) -> bytes:
 
 @dataclass
 class _Visita:
-    """O que o navegador viu numa página, ainda fora da custódia. `url` é onde ela terminou."""
+    """O que o navegador viu numa página, ainda fora da custódia.
+
+    `url` é onde ela terminou; `status` e `cabecalhos` são os da resposta do `goto` (`None` e `{}` se o
+    Playwright não devolveu resposta).
+    """
 
     url: str
+    status: int | None
+    cabecalhos: dict[str, str]
     titulo: str
     html: str
     texto: str
@@ -156,20 +190,26 @@ class _Visita:
 
     @property
     def e_desafio(self) -> bool:
-        return _e_desafio(self.titulo, self.html, self.texto)
+        return _e_desafio(self.titulo, self.html, self.texto, self.status, self.cabecalhos)
+
+    @property
+    def e_erro_http(self) -> bool:
+        return _e_erro_http(self.status)
 
 
 async def _visitar(contexto: BrowserContext, url: str, cfg: CapturaConfig, com_links: bool) -> _Visita:
     """Abre `url` numa aba nova (o travamento de uma não contamina as outras) e lê o que renderizou."""
     pagina = await contexto.new_page()
     try:
-        await pagina.goto(url, wait_until="domcontentloaded")
+        resposta = await pagina.goto(url, wait_until="domcontentloaded")
         try:
             await pagina.wait_for_load_state("networkidle", timeout=cfg.networkidle_s * 1000)
         except PlaywrightTimeout:
             pass  # polling e relógios mantêm a rede ocupada para sempre: o que já carregou basta
         return _Visita(
             url=pagina.url,
+            status=resposta.status if resposta else None,
+            cabecalhos=dict(resposta.headers) if resposta else {},
             titulo=await pagina.title(),
             html=await pagina.content(),
             texto=await pagina.inner_text("body"),
@@ -184,6 +224,7 @@ async def _visitar(contexto: BrowserContext, url: str, cfg: CapturaConfig, com_l
 def _guardar_pagina(s: Servicos, v: _Visita) -> dict:
     return {
         "url": v.url,
+        "status": v.status,
         "html": s.custodia.guardar(_bytes(v.html), "html", tipo="pagina", origem=v.url),
         "texto": s.custodia.guardar(_bytes(v.texto), "txt", tipo="texto", origem=v.url),
         "screenshot": s.custodia.guardar(v.screenshot, "png", tipo="screenshot", origem=v.url),
@@ -196,28 +237,38 @@ def _guardar_desafio(s: Servicos, v: _Visita) -> None:
 
 
 async def _percorrer(
-    contexto: BrowserContext, url_inicial: str, cfg: CapturaConfig, s: Servicos
+    contexto: BrowserContext, ctx: Contexto, cfg: CapturaConfig, s: Servicos
 ) -> tuple[list[dict], bool, list[dict]]:
     """Visita a página inicial e as subpáginas. Devolve `(paginas sem o HAR, bloqueada, falhas)`.
 
-    Falha na página inicial levanta (`PlaywrightError`). Falha numa subpágina, inclusive erro
-    inesperado ao processar o conteúdo do site, vai para `falhas` e as outras seguem.
+    Falha na página inicial levanta: `PlaywrightError` se a navegação falhou, `ErroNo` se o servidor
+    respondeu com erro HTTP (o HTML da página de erro fica na custódia como prova). Falha numa
+    subpágina, inclusive erro HTTP e erro inesperado ao processar o conteúdo do site, vai para
+    `falhas` e as outras seguem.
     """
-    inicio = await _visitar(contexto, url_inicial, cfg, com_links=True)
+    inicio = await _visitar(contexto, ctx.url_inicial, cfg, com_links=True)
     if inicio.e_desafio:
         _guardar_desafio(s, inicio)
         screenshot = s.custodia.guardar(inicio.screenshot, "png", tipo="screenshot", origem=inicio.url)
-        return [{"url": inicio.url, "screenshot": screenshot}], True, []  # sem texto e sem seguir links
+        # sem texto e sem seguir links
+        return [{"url": inicio.url, "status": inicio.status, "screenshot": screenshot}], True, []
+    if inicio.e_erro_http:
+        # o site caiu ou recusou o visitante: sem conteúdo para analisar, o motor cai no Wayback
+        s.custodia.guardar(_bytes(inicio.html), "html", tipo="pagina", origem=inicio.url)
+        raise ErroNo(f"captura falhou: HTTP {inicio.status}", permanente=False)
 
     paginas = [_guardar_pagina(s, inicio)]
     falhas: list[dict] = []
-    for url in _escolher_links(inicio.links, [url_inicial, inicio.url], cfg.max_subpaginas):
+    for url in _escolher_links(inicio.links, ctx.url_inicial, inicio.url, ctx.alvo, cfg.max_subpaginas):
         try:
             visita = await _visitar(contexto, url, cfg, com_links=False)
             if visita.e_desafio:
                 _guardar_desafio(s, visita)
                 falhas.append({"url": url, "motivo": _MOTIVO_DESAFIO})
                 break  # o site pediu verificação: não insiste
+            if visita.e_erro_http:
+                falhas.append({"url": url, "motivo": f"HTTP {visita.status}"})
+                continue
             paginas.append(_guardar_pagina(s, visita))
         except Exception as erro:  # o conteúdo é do site investigado: nada dele derruba o nó
             falhas.append({"url": url, "motivo": _motivo(erro)})
@@ -234,7 +285,7 @@ async def _capturar(ctx: Contexto, dominio: str, s: Servicos) -> Feito:
                 contexto = await navegador.new_context(**_opcoes_do_contexto(s.config.rede, caminho_har))
                 try:
                     contexto.set_default_timeout(cfg.timeout_pagina_s * 1000)
-                    paginas, bloqueada, falhas = await _percorrer(contexto, ctx.url_inicial, cfg, s)
+                    paginas, bloqueada, falhas = await _percorrer(contexto, ctx, cfg, s)
                 finally:
                     await contexto.close()  # o HAR só é gravado quando o contexto fecha
                 har = caminho_har.read_bytes()
@@ -253,15 +304,17 @@ async def _capturar(ctx: Contexto, dominio: str, s: Servicos) -> Feito:
 
 
 class CapturaNo(NoBase):
-    """Visita passiva da página inicial e de até `max_subpaginas` links do mesmo host.
+    """Visita passiva da página inicial e de até `max_subpaginas` links do mesmo host da `url_inicial`.
 
-    Saídas: `paginas` (`url`, `html`, `texto`, `screenshot`, `har`: refs da custódia), `terceiros`
-    (domínios registráveis das requisições, diferentes do alvo), `bloqueada` e `falhas` (as
-    subpáginas que não puderam ser capturadas, com o motivo).
+    Saídas: `paginas` (`url`, `status` HTTP, e `html`, `texto`, `screenshot`, `har` como refs da
+    custódia), `terceiros` (domínios registráveis das requisições, diferentes do alvo), `bloqueada` e
+    `falhas` (as subpáginas que não puderam ser capturadas, com o motivo).
 
-    Se a página inicial é uma verificação anti-bot, `bloqueada` é `True` e `paginas` só tem a
-    screenshot dela (sem `html` nem `texto`); nenhum link é seguido e o `wayback_snapshot` assume.
-    Falha ao abrir a página inicial é `ErroNo` não permanente.
+    Se a página inicial é uma verificação anti-bot (ver `_e_desafio`), `bloqueada` é `True` e
+    `paginas` só tem a `url`, o `status`, a screenshot e o HAR dela (sem `html` nem `texto`); nenhum
+    link é seguido e o `wayback_snapshot` assume. Falha ao abrir a página inicial, ou resposta dela com
+    erro HTTP (status >= 400 que não é desafio), é `ErroNo` não permanente: o `wayback_snapshot` assume
+    do mesmo jeito. Subpágina com erro HTTP vai para `falhas` com o motivo `HTTP <status>`.
     """
 
     nome = "captura"

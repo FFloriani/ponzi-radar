@@ -25,6 +25,7 @@ from radar.nos.captura import (
     CapturaNo,
     _bytes,
     _e_desafio,
+    _e_erro_http,
     _escolher_links,
     _opcoes_do_contexto,
     _terceiros,
@@ -110,6 +111,15 @@ async def test_pulado_sem_contato(tmp_path, monkeypatch):
 
 # ---------------------------------------------------------------------------- regra do desafio anti-bot
 
+MARCAS = ["cf-chl", "_cf_chl_opt", "cf-turnstile", "challenge-form", "g-recaptcha", "h-captcha"]
+STATUS_DE_BLOQUEIO = [403, 429, 503]
+LOGIN_COM_RECAPTCHA = '<form><div class="g-recaptcha" data-sitekey="chave"></div><button>Entrar</button></form>'
+TEXTO_DO_LOGIN = "Entrar\nE-mail\nSenha\nEsqueci minha senha\nNão tem conta? Cadastre-se"  # 66 caracteres
+
+
+def html_com(marca: str) -> str:
+    return f'<html><body><div class="{marca}"></div></body></html>'
+
 
 @pytest.mark.parametrize(
     "titulo",
@@ -123,8 +133,9 @@ async def test_pulado_sem_contato(tmp_path, monkeypatch):
         "VERIFIQUE QUE VOCÊ É HUMANO",
     ],
 )
-def test_desafio_pelo_titulo_vale_com_texto_longo_e_sem_marcas(titulo):
-    assert _e_desafio(titulo, "<html><body>nada de especial</body></html>", "x" * 5000) is True
+@pytest.mark.parametrize("status", [200, 403, None])
+def test_titulo_de_desafio_basta_com_qualquer_status_texto_ou_html(titulo, status):
+    assert _e_desafio(titulo, "<html><body>nada de especial</body></html>", "x" * 5000, status, {}) is True
 
 
 @pytest.mark.parametrize(
@@ -132,40 +143,89 @@ def test_desafio_pelo_titulo_vale_com_texto_longo_e_sem_marcas(titulo):
     ["", "InvestMax Brasil", "Um momento de atenção", "Verifique seus dados", "Você é humano? Cadastre-se"],
 )
 def test_titulo_comum_nao_e_desafio(titulo):
-    assert _e_desafio(titulo, "<html></html>", "") is False
+    assert _e_desafio(titulo, "<html></html>", "", 403, {}) is False
 
 
-@pytest.mark.parametrize("marca", ["cf-chl", "challenge-platform", "g-recaptcha", "h-captcha"])
-def test_marca_com_texto_curto_e_desafio(marca):
-    html = f'<html><body><div class="{marca}"></div></body></html>'
-    assert _e_desafio("Entrar", html, "Verificando...") is True
-    assert _e_desafio("Entrar", html, "") is True
+def test_login_com_recaptcha_e_status_200_nao_e_desafio():
+    # o falso positivo medido na revisão: pouco texto + g-recaptcha, mas é uma página de verdade
+    assert len(TEXTO_DO_LOGIN) == 66
+    assert _e_desafio("Entrar - InvestMax", LOGIN_COM_RECAPTCHA, TEXTO_DO_LOGIN, 200, {}) is False
 
 
-@pytest.mark.parametrize("marca", ["cf-chl", "challenge-platform", "g-recaptcha", "h-captcha"])
-def test_marca_com_texto_longo_nao_e_desafio(marca):
-    html = f'<html><body><div class="{marca}"></div></body></html>'
-    assert _e_desafio("Entrar", html, "a" * 200) is False
-    assert _e_desafio("Entrar", html, "a" * 5000) is False
+def test_o_mesmo_login_com_status_403_e_desafio():
+    assert _e_desafio("Entrar - InvestMax", LOGIN_COM_RECAPTCHA, TEXTO_DO_LOGIN, 403, {}) is True
+
+
+@pytest.mark.parametrize("marca", MARCAS)
+@pytest.mark.parametrize("status", STATUS_DE_BLOQUEIO)
+def test_marca_com_status_de_bloqueio_e_texto_curto_e_desafio(marca, status):
+    assert _e_desafio("Entrar", html_com(marca), "Verificando...", status, {}) is True
+    assert _e_desafio("Entrar", html_com(marca), "", status, {}) is True
+
+
+@pytest.mark.parametrize("marca", MARCAS)
+@pytest.mark.parametrize("status", [200, 301, 404, 500, None])
+def test_marca_sem_sinal_de_bloqueio_nao_e_desafio(marca, status):
+    assert _e_desafio("Entrar", html_com(marca), "Verificando...", status, {}) is False
+
+
+@pytest.mark.parametrize("marca", MARCAS)
+def test_marca_com_cf_mitigated_challenge_e_texto_curto_e_desafio(marca):
+    # o segundo sinal pode ser o cabeçalho, mesmo com status 200
+    assert _e_desafio("Entrar", html_com(marca), "Verificando...", 200, {"cf-mitigated": "challenge"}) is True
+    assert _e_desafio("Entrar", html_com(marca), "Verificando...", None, {"cf-mitigated": "challenge"}) is True
+
+
+@pytest.mark.parametrize(
+    "cabecalhos",
+    [{"cf-mitigated": "block"}, {"cf-mitigated": ""}, {"cf-ray": "abc"}, {"server": "cloudflare"}, {}],
+)
+def test_outros_cabecalhos_nao_sao_segundo_sinal(cabecalhos):
+    assert _e_desafio("Entrar", html_com("g-recaptcha"), "Verificando...", 200, cabecalhos) is False
+
+
+def test_cf_mitigated_ignora_caixa_do_nome_e_do_valor():
+    assert _e_desafio("Entrar", html_com("cf-chl"), "curto", 200, {"CF-Mitigated": " Challenge "}) is True
+
+
+def test_challenge_platform_nao_e_mais_marca():
+    # aparece em qualquer página atrás da Cloudflare: nem com status de bloqueio nem com texto curto
+    html = '<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>'
+    assert _e_desafio("Entrar", html, "Olá", 200, {}) is False
+    assert _e_desafio("Entrar", html, "Olá", 403, {}) is False
+    assert _e_desafio("Entrar", html, "Olá", 200, {"cf-mitigated": "challenge"}) is False
+
+
+@pytest.mark.parametrize("marca", MARCAS)
+def test_marca_com_status_de_bloqueio_e_texto_longo_nao_e_desafio(marca):
+    assert _e_desafio("Entrar", html_com(marca), "a" * 200, 403, {}) is False
+    assert _e_desafio("Entrar", html_com(marca), "a" * 5000, 403, {}) is False
+    assert _e_desafio("Entrar", html_com(marca), "a" * 5000, 200, {"cf-mitigated": "challenge"}) is False
 
 
 def test_desafio_fronteira_de_200_caracteres():
-    html = '<script src="/cdn-cgi/challenge-platform/h/b/orchestrate"></script>'
-    assert _e_desafio("Entrar", html, "a" * 199) is True
-    assert _e_desafio("Entrar", html, "a" * 200) is False
+    html = html_com("cf-chl")
+    assert _e_desafio("Entrar", html, "a" * 199, 403, {}) is True
+    assert _e_desafio("Entrar", html, "a" * 200, 403, {}) is False
 
 
 def test_desafio_espacos_nas_pontas_do_texto_nao_contam():
-    html = '<div class="g-recaptcha"></div>'
-    assert _e_desafio("Entrar", html, "\n\n" + "a" * 150 + "\n" * 100) is True
+    assert _e_desafio("Entrar", html_com("g-recaptcha"), "\n\n" + "a" * 150 + "\n" * 100, 403, {}) is True
 
 
-def test_marca_sem_texto_curto_e_texto_curto_sem_marca_nao_sao_desafio():
-    assert _e_desafio("Entrar", "<html><body>Olá</body></html>", "Olá") is False
+def test_status_de_bloqueio_sozinho_nao_e_desafio():
+    assert _e_desafio("Entrar", "<html><body>Olá</body></html>", "Olá", 403, {}) is False
+    assert _e_desafio("Entrar", "<html><body>Olá</body></html>", "Olá", 503, {"cf-mitigated": "challenge"}) is False
 
 
 def test_marca_em_maiusculas_tambem_vale():
-    assert _e_desafio("Entrar", '<div class="G-Recaptcha"></div>', "curto") is True
+    assert _e_desafio("Entrar", '<div class="G-Recaptcha"></div>', "curto", 403, {}) is True
+
+
+def test_erro_http_e_status_400_ou_mais():
+    assert [_e_erro_http(s) for s in (None, 200, 204, 301, 399, 400, 404, 500, 503)] == [
+        False, False, False, False, False, True, True, True, True,
+    ]
 
 
 # ---------------------------------------------------------------------------- opções do contexto
@@ -252,11 +312,9 @@ def test_terceiros_sem_entradas():
 
 # ---------------------------------------------------------------------------- escolha dos links
 
-SITE_EXEMPLO = ["http://exemplo.com/"]
-
-
-def escolher(*hrefs, limite=10, site=SITE_EXEMPLO):
-    return _escolher_links(list(hrefs), site, limite)
+def escolher(*hrefs, limite=10, inicial="http://exemplo.com/", final=None, alvo="exemplo.com"):
+    """`final` é a URL em que a página inicial terminou depois dos redirects (padrão: a própria inicial)."""
+    return _escolher_links(list(hrefs), inicial, final or inicial, alvo, limite)
 
 
 def test_links_so_do_mesmo_host_com_esquema_http():
@@ -323,23 +381,50 @@ def test_a_propria_pagina_inicial_nao_e_subpagina():
     ) == ["http://exemplo.com/termos"]
 
 
-def test_pagina_inicial_depois_do_redirect_tambem_conta():
-    # a URL inicial foi redirecionada para outra: as duas são "o site" e nenhuma é subpágina
-    site = ["http://exemplo.com/", "https://www.exemplo.com/inicio"]
+def test_pagina_inicial_depois_do_redirect_nao_e_revisitada():
+    # a URL inicial foi redirecionada para outra do mesmo site: nenhuma das duas é subpágina
     assert escolher(
         "https://www.exemplo.com/inicio",
         "https://www.exemplo.com/termos",
         "http://exemplo.com/planos",
-        site=site,
+        final="https://www.exemplo.com/inicio",
     ) == ["http://exemplo.com/planos", "https://www.exemplo.com/termos"]
 
 
-def test_redirect_para_outro_host_leva_o_filtro_junto():
-    site = ["http://exemplo.com/", "https://novo-nome.com.br/"]
-    assert escolher("https://novo-nome.com.br/termos", "http://exemplo.com/planos", "http://outro.com/x", site=site) == [
+def test_redirect_para_subdominio_do_alvo_aceita_tambem_o_host_final():
+    assert escolher(
+        "https://app.exemplo.com/termos",
         "http://exemplo.com/planos",
-        "https://novo-nome.com.br/termos",
-    ]
+        "http://outro.com/x",
+        final="https://app.exemplo.com/inicio",
+    ) == ["https://app.exemplo.com/termos", "http://exemplo.com/planos"]
+
+
+@pytest.mark.parametrize(
+    "final",
+    [
+        "https://t.me/golpe",
+        "https://wa.me/5511999999999",
+        "https://www.facebook.com/golpe",
+        "https://naoexemplo.com/",  # termina igual ao alvo, mas é outro domínio
+        "https://exemplo.com.evil.net/",  # contém o alvo, mas o registrável é outro
+    ],
+)
+def test_redirect_para_outro_dominio_nao_leva_os_links_junto(final):
+    # os links da plataforma de destino não são seguidos; só os do host da url_inicial
+    host = final.split("/")[2]
+    assert escolher(
+        f"https://{host}/termos",
+        f"https://{host}/outra",
+        final,
+        "http://exemplo.com/planos",
+        final=final,
+    ) == ["http://exemplo.com/planos"]
+
+
+def test_so_a_url_inicial_define_o_host_quando_o_redirect_vai_para_fora():
+    assert escolher("https://t.me/termos", final="https://t.me/golpe") == []
+    assert escolher("http://exemplo.com/termos", final="https://t.me/golpe") == ["http://exemplo.com/termos"]
 
 
 def test_links_de_regras_vem_primeiro_e_o_resto_depois():
@@ -360,8 +445,10 @@ def test_links_de_regras_vem_primeiro_e_o_resto_depois():
 
 
 def test_prioridade_olha_o_caminho_e_nao_o_dominio():
-    site = ["http://planofacil.com.br/"]
-    assert escolher("http://planofacil.com.br/contato", "http://planofacil.com.br/faq", site=site) == [
+    inicial = "http://planofacil.com.br/"
+    assert escolher(
+        "http://planofacil.com.br/contato", "http://planofacil.com.br/faq", inicial=inicial, alvo="planofacil.com.br"
+    ) == [
         "http://planofacil.com.br/faq",
         "http://planofacil.com.br/contato",
     ]
@@ -481,8 +568,8 @@ async def test_artefatos_na_custodia(servidor_local, tmp_path):
     r, serv = await capturar(tmp_path, url, max_subpaginas=0)
 
     (pagina,) = r.saidas["paginas"]
-    assert list(pagina) == ["url", "html", "texto", "screenshot", "har"]
-    assert pagina["url"] == url
+    assert list(pagina) == ["url", "status", "html", "texto", "screenshot", "har"]
+    assert pagina["url"] == url and pagina["status"] == 200
     assert r.saidas["terceiros"] == [] and r.saidas["bloqueada"] is False
 
     assert b"Plano Ouro" in serv.custodia.ler(pagina["html"])
@@ -516,8 +603,8 @@ async def test_saidas_sao_json_e_o_har_e_um_so_para_todas_as_paginas(servidor_lo
     pedidas = {e["request"]["url"] for e in json.loads(serv.custodia.ler(paginas[0]["har"]))["log"]["entries"]}
     assert {p["url"] for p in paginas} <= pedidas
     for p in paginas:
-        assert set(p) == {"url", "html", "texto", "screenshot", "har"}
-        assert all(v.startswith("sha256:") for k, v in p.items() if k != "url")
+        assert set(p) == {"url", "status", "html", "texto", "screenshot", "har"} and p["status"] == 200
+        assert all(v.startswith("sha256:") for k, v in p.items() if k not in ("url", "status"))
     assert verificar(tmp_path) == []
 
 
@@ -550,7 +637,7 @@ async def test_user_agent_da_config(servidor_local, pedidos_locais, tmp_path):
 
 
 @lento
-async def test_opcoes_e_proxy_da_config_chegam_ao_new_context(servidor_local, tmp_path, monkeypatch):
+async def test_opcoes_do_contexto_chegam_ao_new_context(servidor_local, tmp_path, monkeypatch):
     chamadas = []
     original = Browser.new_context
 
@@ -559,15 +646,26 @@ async def test_opcoes_e_proxy_da_config_chegam_ao_new_context(servidor_local, tm
         return await original(self, **kwargs)
 
     monkeypatch.setattr(Browser, "new_context", espiao)
-    # o Chromium não usa proxy para 127.0.0.1: a página carrega mesmo com este proxy que não existe
-    rede = RedeConfig(proxy="http://127.0.0.1:8080")
-    r, _ = await capturar(tmp_path, servidor_local + "/planos.html", rede=rede, max_subpaginas=0)
+    r, _ = await capturar(tmp_path, servidor_local + "/planos.html", max_subpaginas=0)
     assert len(r.saidas["paginas"]) == 1
     (kwargs,) = chamadas
-    assert kwargs["proxy"] == {"server": "http://127.0.0.1:8080"}
+    assert "proxy" not in kwargs  # sem proxy na config, conexão direta
     assert kwargs["accept_downloads"] is False and kwargs["service_workers"] == "block"
     assert kwargs["user_agent"] == UA_NAVEGADOR
     assert kwargs["record_har_content"] == "embed" and kwargs["record_har_path"].endswith(".har")
+
+
+@lento
+async def test_proxy_da_config_e_usado_pelo_navegador(proxy_local, tmp_path):
+    # o Chromium manda até as requisições de 127.0.0.1 pelo proxy do contexto: este proxy responde por
+    # um site que não existe, então a página só pode ter vindo dele
+    rede = RedeConfig(proxy=f"http://127.0.0.1:{proxy_local.server_port}")
+    url = "http://alvo-atras-do-proxy.test/index.html"
+    r, serv = await capturar(tmp_path, url, rede=rede, max_subpaginas=0)
+    (pagina,) = r.saidas["paginas"]
+    assert pagina["url"] == url
+    assert "Conteúdo servido pelo proxy" in texto_de(serv, pagina)
+    assert proxy_local.requisicoes == [url]
 
 
 # ---------------------------------------------------------------------------- navegador: terceiros e falhas
@@ -656,7 +754,8 @@ async def test_desafio_antibot(servidor_local, pedidos_locais, tmp_path):
     assert r.saidas["bloqueada"] is True and r.saidas["falhas"] == []
     (pagina,) = r.saidas["paginas"]  # só a página inicial
     assert "texto" not in pagina and "html" not in pagina
-    assert set(pagina) == {"url", "screenshot", "har"} and pagina["url"] == url
+    assert set(pagina) == {"url", "status", "screenshot", "har"} and pagina["url"] == url
+    assert pagina["status"] == 200  # o título da verificação basta: vale com qualquer status
     assert serv.custodia.ler(pagina["screenshot"]).startswith(PNG)
     assert json.loads(serv.custodia.ler(pagina["har"]))["log"]["entries"]
 
@@ -684,3 +783,79 @@ async def test_desafio_numa_subpagina_vira_falha_e_a_captura_nao_insiste(servido
     assert "/ocupada.html" not in caminhos(pedidos_locais)  # depois do desafio, para
     assert "Just a moment" not in "".join(texto_de(serv, p) for p in r.saidas["paginas"])
     assert any(e["tipo"] == "desafio" for e in log_custodia(tmp_path))
+
+
+@lento
+async def test_login_com_recaptcha_e_status_200_nao_e_desafio(servidor_local, pedidos_locais, tmp_path):
+    # R-T8-desafio: pouco texto + g-recaptcha, mas o servidor respondeu 200: é a página de verdade
+    url = servidor_local + "/login.html"
+    r, serv = await capturar(tmp_path, url)
+    assert r.saidas["bloqueada"] is False and r.saidas["falhas"] == []
+    paginas = r.saidas["paginas"]
+    # e a captura segue os links dela (regras primeiro)
+    assert [p["url"][len(servidor_local) :] for p in paginas] == ["/login.html", "/termos.html", "/cadastro.html"]
+    assert [p["status"] for p in paginas] == [200, 200, 200]
+    assert "Esqueci minha senha" in texto_de(serv, paginas[0]) and len(texto_de(serv, paginas[0])) < 200
+    assert b"g-recaptcha" in serv.custodia.ler(paginas[0]["html"])
+    assert not any(e["tipo"] == "desafio" for e in log_custodia(tmp_path))
+
+
+@lento
+async def test_o_mesmo_login_com_status_403_e_desafio(servidor_local, pedidos_locais, tmp_path):
+    url = servidor_local + "/status/403/login.html"
+    r, serv = await capturar(tmp_path, url)
+    assert r.saidas["bloqueada"] is True and r.saidas["falhas"] == []
+    (pagina,) = r.saidas["paginas"]
+    assert set(pagina) == {"url", "status", "screenshot", "har"}
+    assert (pagina["url"], pagina["status"]) == (url, 403)
+    (desafio,) = (e for e in log_custodia(tmp_path) if e["tipo"] == "desafio")
+    assert b"g-recaptcha" in serv.custodia.ler(f"sha256:{desafio['sha256']}")
+    assert caminhos(pedidos_locais) == ["/status/403/login.html"]  # não seguiu os links
+
+
+@lento
+async def test_login_com_cabecalho_cf_mitigated_challenge_e_desafio(servidor_local, pedidos_locais, tmp_path):
+    # o servidor respondeu 200, mas avisou que a resposta foi um desafio
+    url = servidor_local + "/mitigado/login.html"
+    r, _ = await capturar(tmp_path, url)
+    assert r.saidas["bloqueada"] is True
+    (pagina,) = r.saidas["paginas"]
+    assert (pagina["url"], pagina["status"]) == (url, 200)
+    assert caminhos(pedidos_locais) == ["/mitigado/login.html"]
+
+
+@lento
+@pytest.mark.parametrize("status", [403, 404, 429, 500, 503])
+async def test_home_com_erro_http_vira_erro_do_no_com_o_html_como_prova(servidor_local, tmp_path, status):
+    # R-T8-status: sem título nem marca de desafio, a página de erro não é conteúdo do site
+    url = f"{servidor_local}/status/{status}"
+    with pytest.raises(ErroNo) as e:
+        await capturar(tmp_path, url)
+    assert e.value.mensagem == f"captura falhou: HTTP {status}" and e.value.permanente is False
+    (registro,) = log_custodia(tmp_path)  # só o HTML da página de erro: sem texto, screenshot nem HAR
+    assert (registro["tipo"], registro["origem"]) == ("pagina", url)
+    assert "Página de erro do servidor".encode() in Custodia(tmp_path).ler(f"sha256:{registro['sha256']}")
+
+
+@lento
+async def test_subpagina_com_erro_http_vai_para_falhas(servidor_local, tmp_path):
+    r, serv = await capturar(tmp_path, servidor_local + "/liga_status.html")
+    paginas = r.saidas["paginas"]
+    assert [p["url"][len(servidor_local) :] for p in paginas] == ["/liga_status.html", "/termos.html"]
+    assert [p["status"] for p in paginas] == [200, 200]
+    assert r.saidas["falhas"] == [{"url": servidor_local + "/status/500", "motivo": "HTTP 500"}]
+    assert not any(e["origem"].endswith("/status/500") for e in log_custodia(tmp_path))  # a página de erro não vira prova
+    assert r.saidas["bloqueada"] is False
+    assert verificar(tmp_path) == []
+
+
+@lento
+async def test_redirect_para_outro_dominio_nao_rastreia_o_destino(servidor_local, pedidos_locais, tmp_path):
+    # "/saida" manda de 127.0.0.1 para localhost (outro host, outro domínio): como um golpe que redireciona
+    # para o Telegram. O alvo é 127.0.0.1, então os links do destino não são seguidos.
+    r, _ = await capturar(tmp_path, servidor_local + "/saida")
+    (pagina,) = r.saidas["paginas"]
+    assert pagina["url"] == servidor_local.replace("127.0.0.1", "localhost") + "/index.html"
+    assert r.saidas["falhas"] == []
+    assert caminhos(pedidos_locais) == ["/saida", "/index.html"]  # nem termos.html nem planos.html
+    assert r.saidas["terceiros"] == ["localhost"]
