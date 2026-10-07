@@ -7,12 +7,13 @@ from radar.nos.alvo import AlvoNo
 from radar.nos.captura import CapturaNo
 from radar.nos.ct import CtNo
 from radar.nos.dns import DnsNo
+from radar.nos.extracao import ExtracaoNo
 from radar.nos.rdap import RdapNo
 from radar.nos.wayback import WaybackIndiceNo, WaybackSnapshotNo
 
 
 # `WaybackSnapshotNo` declara `captura` como opcional e o motor recusa dependência inexistente: os
-# dois entram juntos, a captura antes do snapshot.
+# dois entram juntos, a captura antes do snapshot. `ExtracaoNo` lê os dois.
 def nos_do_nucleo() -> list[NoBase]:
     return [
         AlvoNo(),
@@ -22,4 +23,5 @@ def nos_do_nucleo() -> list[NoBase]:
         WaybackIndiceNo(),
         CapturaNo(),
         WaybackSnapshotNo(),
+        ExtracaoNo(),
     ]
