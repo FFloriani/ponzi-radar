@@ -12,6 +12,9 @@ _URL = "https://cloudflare-dns.com/dns-query"
 # número do tipo de registro no DNS: a resposta de um A pode trazer CNAMEs (5) que não são endereços
 _TIPOS = {"A": 1, "AAAA": 28, "MX": 15, "NS": 2, "TXT": 16}
 _NXDOMAIN = 3
+# RCODE do DoH: 0 (NOERROR) e 3 (NXDOMAIN) são respostas de verdade; o resto é falha de resolução
+_STATUS_VALIDOS = (0, _NXDOMAIN)
+_NOMES_STATUS = {1: "FORMERR", 2: "SERVFAIL", 4: "NOTIMP", 5: "REFUSED"}
 
 
 class DnsNo(NoBase):
@@ -37,6 +40,16 @@ class DnsNo(NoBase):
             )
             if not isinstance(dados, dict):
                 raise ErroNo(f"DNS {tipo}: resposta não é um objeto JSON", permanente=True)
+            status = dados.get("Status")
+            if status not in _STATUS_VALIDOS:
+                # SERVFAIL, REFUSED, FORMERR...: o resolvedor não conseguiu responder. Lista vazia
+                # aqui seria "sem registros", e isso o DNS não disse
+                nome = _NOMES_STATUS.get(status) if isinstance(status, int) else None
+                raise ErroNo(
+                    f"DNS {tipo}: Status {status} ({nome or 'desconhecido'}) "
+                    f"para {entradas['alvo']['dominio']}: falha de resolução, não ausência de registros",
+                    permanente=False,
+                )
             registros = dados.get("Answer")
             saidas[tipo] = [
                 r["data"]

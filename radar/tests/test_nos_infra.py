@@ -234,7 +234,7 @@ async def test_rdap_registrador_cai_no_handle_sem_vcard(respx_mock, tmp_path, se
     assert resultado.saidas["registrador"] == "376"
 
 
-async def test_rdap_titular_pessoa_fisica_nao_vira_cnpj_nem_grava_cpf(respx_mock, ctx_hoje, serv):
+async def test_rdap_titular_pessoa_fisica_nao_vira_cnpj_nas_saidas(respx_mock, ctx_hoje, serv):
     dados = copy.deepcopy(fixture("rdap_registrobr_petrobras"))
     dados["entities"][0]["publicIds"] = [{"type": "cpf", "identifier": "123.456.789-09"}]
     respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(200, json=dados))
@@ -365,6 +365,38 @@ async def test_dns_um_tipo_com_erro_derruba_o_no(respx_mock, ctx_hoje, serv):
         await DnsNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
     assert e.value.permanente is True
     assert "TXT" in e.value.mensagem
+
+
+@pytest.mark.parametrize("tipo", ["A", "MX"])
+@pytest.mark.parametrize("status", [1, 2, 5])  # FORMERR, SERVFAIL, REFUSED
+async def test_dns_status_de_falha_de_resolucao_vira_erro(respx_mock, ctx_hoje, serv, tipo, status):
+    # lista vazia e `nxdomain=False` seriam "sem registros", e o resolvedor não disse isso
+    def responder(req):
+        consultado = req.url.params["type"]
+        return httpx.Response(200, json=_doh(status if consultado == tipo else 0, 1))
+
+    respx_mock.get(URL_DOH).mock(side_effect=responder)
+    with pytest.raises(ErroNo) as e:
+        await DnsNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+    assert e.value.permanente is False
+    assert f"DNS {tipo}: Status {status}" in e.value.mensagem
+    assert "petrobras.com.br" in e.value.mensagem
+    # a resposta bruta que causou o erro fica na custódia
+    assert log_custodia(ctx_hoje.pasta)[-1]["origem"] == f"{URL_DOH}?name=petrobras.com.br&type={tipo}"
+
+
+@pytest.mark.parametrize("status", [None, 4, "2", []])
+async def test_dns_status_ausente_ou_estranho_tambem_e_erro(respx_mock, ctx_hoje, serv, status):
+    corpo = _doh(0, 1)
+    if status is None:
+        del corpo["Status"]
+    else:
+        corpo["Status"] = status
+    respx_mock.get(URL_DOH).mock(return_value=httpx.Response(200, json=corpo))
+    with pytest.raises(ErroNo) as e:
+        await DnsNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+    assert e.value.permanente is False
+    assert "DNS A: Status" in e.value.mensagem
 
 
 async def test_dns_corpo_que_nao_e_json_e_erro_permanente(respx_mock, ctx_hoje, serv):
@@ -730,6 +762,17 @@ async def test_nucleo_retroativo_pula_dns_e_esconde_o_titular(respx_mock, tmp_pa
     assert ex.saidas["rdap"]["vazamento_temporal"] == ["cnpj_titular"]
     assert ex.saidas["ct"]["total"] == 6
     assert "dns" not in ex.saidas
+
+
+async def test_nucleo_dns_servfail_deixa_o_no_em_erro_e_sem_saidas(respx_mock, tmp_path):
+    respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(200, json=fixture("rdap_registrobr_petrobras")))
+    respx_mock.get(URL_CRTSH).mock(return_value=httpx.Response(200, json=fixture("crtsh")))
+    _rota_doh(respx_mock, dict.fromkeys(("A", "AAAA", "MX", "NS", "TXT"), _doh(2, 1)))
+    ctx, motor = await _rodar_nucleo(tmp_path, None)
+    assert motor.status() == {"alvo": "feito", "rdap": "feito", "dns": "erro", "ct": "feito"}
+    ex = carregar_execucao(ctx.pasta)
+    assert "Status 2 (SERVFAIL)" in ex.status["dns"]["motivo"]
+    assert "dns" not in ex.saidas  # nada de `nxdomain=False` com cara de dado coletado
 
 
 async def test_nucleo_rdap_em_erro_nao_derruba_dns_e_ct(respx_mock, tmp_path):
