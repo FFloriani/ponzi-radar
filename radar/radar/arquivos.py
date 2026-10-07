@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Any
 
 _ESPERA_TRAVA_S = 0.05
+# teto de ~1 s (19 esperas de 50 ms) para o destino ficar livre no os.replace
+_TENTATIVAS_REPLACE = 20
+_ESPERA_REPLACE_S = 0.05
 
 
 def _serializar(obj: Any) -> str:
@@ -25,11 +28,29 @@ def _serializar(obj: Any) -> str:
     raise TypeError(f"{type(obj).__name__} não é serializável em JSON")
 
 
+def _substituir(origem: Path, destino: Path) -> None:
+    """`os.replace` com repetição curta para o `PermissionError` transitório do Windows.
+
+    No Windows, trocar um destino que outro handle mantém aberto (leitor, antivírus,
+    indexador) dá "acesso negado" até o handle fechar. Fora do Windows, ou esgotadas as
+    tentativas, o erro sobe.
+    """
+    for tentativa in range(1, _TENTATIVAS_REPLACE + 1):
+        try:
+            os.replace(origem, destino)
+            return
+        except PermissionError:
+            if sys.platform != "win32" or tentativa == _TENTATIVAS_REPLACE:
+                raise
+            time.sleep(_ESPERA_REPLACE_S)
+
+
 def gravar_json_atomico(caminho: Path, dados: Any) -> None:
     """Grava `dados` em `caminho` sem nunca deixar o arquivo pela metade.
 
     Escreve num `.tmp` do mesmo diretório e troca com `os.replace`: quem lê vê o conteúdo
-    antigo ou o novo, nunca um parcial. Se a serialização falhar, o original fica intacto.
+    antigo ou o novo, nunca um parcial. Se a serialização ou a troca falhar, o original
+    fica intacto e o `.tmp` é removido.
     """
     caminho = Path(caminho)
     tmp = caminho.with_name(f"{caminho.name}.{uuid.uuid4().hex}.tmp")
@@ -38,7 +59,7 @@ def gravar_json_atomico(caminho: Path, dados: Any) -> None:
             json.dump(dados, f, ensure_ascii=False, indent=2, default=_serializar)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, caminho)
+        _substituir(tmp, caminho)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise

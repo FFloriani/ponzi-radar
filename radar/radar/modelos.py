@@ -68,8 +68,11 @@ class Resposta(BaseModel):
 
     @model_validator(mode="after")
     def _regras_por_status(self) -> Resposta:
-        if self.status in ("confirmado", "corrigido") and not self.evidencias:
-            raise ValueError(f"status '{self.status}' exige ao menos 1 evidência")
+        # o trecho tem de ter texto: um trecho vazio passaria trivialmente na checagem
+        # "trecho conferido" (`"" in texto` é sempre True)
+        tem_trecho = any(e.trecho.strip() for e in self.evidencias)
+        if self.status in ("confirmado", "corrigido") and not tem_trecho:
+            raise ValueError(f"status '{self.status}' exige ao menos 1 evidência com trecho")
         if self.status == "nao_encontrado" and not self.onde_procurou:
             raise ValueError("status 'nao_encontrado' exige 'onde_procurou' não vazio")
         return self

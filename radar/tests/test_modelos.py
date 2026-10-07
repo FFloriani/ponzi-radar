@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from radar import arquivos
 from radar.arquivos import gravar_json_atomico, ler_json, trava
 from radar.modelos import (
     Aguardando,
@@ -64,6 +65,24 @@ def test_corrigido_exige_evidencia():
 def test_confirmado_com_evidencia_ok():
     r = Resposta(status="confirmado", valor={"x": 1}, evidencias=[_evidencia()])
     assert r.valor == {"x": 1} and r.substitui is None
+
+
+@pytest.mark.parametrize("status", ["confirmado", "corrigido"])
+@pytest.mark.parametrize("trecho", ["", "  ", "\n\t "])
+def test_confirmado_e_corrigido_exigem_evidencia_com_trecho(status, trecho):
+    # trecho vazio passaria trivialmente na checagem "trecho conferido" (`"" in texto`)
+    with pytest.raises(ValidationError):
+        Resposta(status=status, evidencias=[_evidencia(trecho=trecho)])
+
+
+def test_basta_uma_evidencia_com_trecho():
+    r = Resposta(status="confirmado", evidencias=[_evidencia(trecho=""), _evidencia(trecho="texto citado")])
+    assert len(r.evidencias) == 2
+
+
+def test_evidencia_isolada_continua_aceitando_trecho_vazio():
+    # a regra é da Resposta; Evidencia também é usada por Item e Sinal
+    assert _evidencia(trecho="").trecho == ""
 
 
 def test_nao_encontrado_exige_onde_procurou():
@@ -244,6 +263,83 @@ def test_gravar_temporario_fica_no_mesmo_diretorio_e_termina_em_tmp(tmp_path, mo
     gravar_json_atomico(p, {"v": 1})
     assert visto["destino"] == p
     assert visto["origem"].parent == p.parent and visto["origem"].suffix == ".tmp"
+
+
+def _replace_falhando(vezes: int, erro=lambda: PermissionError(13, "Acesso negado"), real=os.replace):
+    """`os.replace` que falha `vezes` vezes e depois funciona; devolve (função, chamadas)."""
+    chamadas: list[Path] = []
+
+    def falso(origem, destino):
+        chamadas.append(Path(origem))
+        if len(chamadas) <= vezes:
+            raise erro()
+        return real(origem, destino)
+
+    return falso, chamadas
+
+
+no_windows = pytest.mark.skipif(sys.platform != "win32", reason="repetição do os.replace é só do Windows")
+fora_do_windows = pytest.mark.skipif(sys.platform == "win32", reason="no Windows o PermissionError é repetido")
+
+
+@no_windows
+def test_gravar_repete_replace_quando_o_permission_error_e_transitorio(tmp_path, monkeypatch):
+    monkeypatch.setattr("radar.arquivos._ESPERA_REPLACE_S", 0)
+    falso, chamadas = _replace_falhando(1)
+    monkeypatch.setattr("radar.arquivos.os.replace", falso)
+    p = tmp_path / "e.json"
+    gravar_json_atomico(p, {"v": 1})
+    assert len(chamadas) == 2
+    assert ler_json(p) == {"v": 1} and [f.name for f in tmp_path.iterdir()] == ["e.json"]
+
+
+@no_windows
+def test_gravar_desiste_do_replace_apos_o_limite_sem_deixar_tmp(tmp_path, monkeypatch):
+    p = tmp_path / "e.json"
+    gravar_json_atomico(p, {"v": 1})
+    monkeypatch.setattr("radar.arquivos._ESPERA_REPLACE_S", 0)
+    falso, chamadas = _replace_falhando(10**6)
+    monkeypatch.setattr("radar.arquivos.os.replace", falso)
+    with pytest.raises(PermissionError):
+        gravar_json_atomico(p, {"v": 2})
+    assert len(chamadas) == arquivos._TENTATIVAS_REPLACE
+    assert ler_json(p) == {"v": 1} and [f.name for f in tmp_path.iterdir()] == ["e.json"]
+
+
+@no_windows
+def test_gravar_espera_um_leitor_que_segura_o_destino_aberto(tmp_path):
+    p = tmp_path / "e.json"
+    gravar_json_atomico(p, {"v": 1})
+    leitor = p.open("rb")  # sem FILE_SHARE_DELETE: o os.replace dá WinError 5 enquanto aberto
+    timer = threading.Timer(0.3, leitor.close)
+    timer.start()
+    try:
+        gravar_json_atomico(p, {"v": 2})
+    finally:
+        timer.join(5)
+        leitor.close()
+    assert ler_json(p) == {"v": 2} and [f.name for f in tmp_path.iterdir()] == ["e.json"]
+
+
+@fora_do_windows
+def test_gravar_nao_repete_permission_error_fora_do_windows(tmp_path, monkeypatch):
+    p = tmp_path / "e.json"
+    gravar_json_atomico(p, {"v": 1})
+    falso, chamadas = _replace_falhando(1)
+    monkeypatch.setattr("radar.arquivos.os.replace", falso)
+    with pytest.raises(PermissionError):
+        gravar_json_atomico(p, {"v": 2})
+    assert len(chamadas) == 1
+    assert ler_json(p) == {"v": 1} and [f.name for f in tmp_path.iterdir()] == ["e.json"]
+
+
+def test_gravar_so_repete_permission_error(tmp_path, monkeypatch):
+    p = tmp_path / "e.json"
+    falso, chamadas = _replace_falhando(1, erro=lambda: OSError(28, "sem espaço no disco"))
+    monkeypatch.setattr("radar.arquivos.os.replace", falso)
+    with pytest.raises(OSError):
+        gravar_json_atomico(p, {"v": 1})
+    assert len(chamadas) == 1 and list(tmp_path.iterdir()) == []
 
 
 def test_ler_json_inexistente_devolve_padrao(tmp_path):
