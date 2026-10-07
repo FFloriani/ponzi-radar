@@ -15,6 +15,11 @@ import httpx
 from radar.config import RedeConfig
 
 _TETO_RETRY_AFTER_S = 60.0
+_MAX_REDIRECTS = 10
+# texto do RemoteProtocolError do httpx quando o `Location` da resposta não é uma URL
+_LOCATION_INVALIDO = "Invalid URL in location header"
+# cabeçalhos do chamador que não podem acompanhar um redirect para outra origem
+_CREDENCIAIS = ("authorization", "cookie")
 _RETRY_AFTER = re.compile(r"\d+(?:\.\d+)?")
 _CHARSET = re.compile(r"""charset\s*=\s*["']?([^\s;"']+)""", re.IGNORECASE)
 
@@ -79,12 +84,40 @@ def _descrever(exc: Exception) -> str:
     return f"{type(exc).__name__}: {detalhe}" if detalhe else type(exc).__name__
 
 
+def _origem(url: httpx.URL) -> tuple[str, str, int | None]:
+    return (url.scheme, url.host.lower(), url.port)
+
+
+def _destino_do_redirect(atual: httpx.URL, resposta: httpx.Response, url_pedida: str) -> httpx.URL:
+    """Resolve o `Location` contra a URL que o devolveu; só http/https, senão erro permanente."""
+    location = resposta.headers["location"]
+    try:
+        destino = atual.join(location)
+    except httpx.InvalidURL as exc:
+        raise ErroRede(
+            f"GET {url_pedida}: Location inválido no redirect de {atual}: {location!r} ({exc})",
+            permanente=True,
+            status=resposta.status_code,
+            url=url_pedida,
+        ) from exc
+    if destino.scheme not in ("http", "https"):
+        raise ErroRede(
+            f"GET {url_pedida}: redirect de {atual} para protocolo não suportado: {location!r}",
+            permanente=True,
+            status=resposta.status_code,
+            url=url_pedida,
+        )
+    return destino
+
+
 class Rede:
     """Cliente HTTP assíncrono compartilhado por todos os coletores.
 
-    O limite é por host e conta do FIM da requisição anterior ao mesmo host. O cache é
-    por instância e só guarda respostas com status < 400. O limite não cobre os hosts
-    de redirects: o host controlado é o da URL pedida.
+    O limite é por host e conta do FIM da requisição anterior ao mesmo host. Os redirects
+    são seguidos aqui, não pelo httpx (até 10 saltos): cada salto é uma requisição como
+    outra qualquer, com o limite do seu host e as suas novas tentativas. O cache é por
+    instância e só guarda respostas com status < 400. O proxy vem só de `config.proxy`:
+    as variáveis de ambiente (HTTP_PROXY etc.) são ignoradas.
     """
 
     def __init__(
@@ -96,7 +129,14 @@ class Rede:
         self._config = config
         self._dormir = dormir
         self._relogio = relogio
-        self._client = httpx.AsyncClient(proxy=config.proxy, timeout=config.timeout_s)
+        # follow_redirects=False: quem segue o Location é `get`, salto a salto, pelo limite do host.
+        # trust_env=False: sem proxy configurado a conexão é direta, nunca a do ambiente.
+        self._client = httpx.AsyncClient(
+            proxy=config.proxy,
+            timeout=config.timeout_s,
+            follow_redirects=False,
+            trust_env=False,
+        )
         self._travas: dict[str, asyncio.Lock] = {}
         self._ultima: dict[str, float] = {}
         self._cache: dict[tuple, RespostaRede] = {}
@@ -117,7 +157,7 @@ class Rede:
             alvo = base.copy_merge_params(params) if params else base
         except httpx.InvalidURL as exc:
             raise ErroRede(f"GET {url}: URL inválida ({exc})", permanente=True, url=url) from exc
-        url_final = str(alvo)
+        url_pedida = str(alvo)
 
         cabecalhos = httpx.Headers(
             {"User-Agent": self._config.ua_navegador if tipo == "navegador" else self._config.ua_api}
@@ -132,57 +172,35 @@ class Rede:
         if (guardada := self._cache.get(chave)) is not None:
             return replace(guardada, de_cache=True)
 
-        host = alvo.host.lower()
-        total = max(1, self._config.tentativas)
-        for n in range(1, total + 1):
-            retry_after = None
-            try:
-                resposta = await self._requisitar(host, alvo, cabecalhos, seguir_redirect)
-            except httpx.UnsupportedProtocol as exc:
+        atual = alvo
+        for salto in range(_MAX_REDIRECTS + 1):
+            resposta = await self._buscar(atual, cabecalhos)
+            if not seguir_redirect or not resposta.has_redirect_location:
+                break
+            if salto == _MAX_REDIRECTS:
                 raise ErroRede(
-                    f"GET {url_final}: {_descrever(exc)}", permanente=True, url=url_final
-                ) from exc
-            except httpx.TransportError as exc:  # inclui TimeoutException
-                erro = ErroRede(
-                    f"GET {url_final}: {_descrever(exc)} (tentativa {n} de {total})",
-                    permanente=False,
-                    url=url_final,
+                    f"GET {url_pedida}: mais de {_MAX_REDIRECTS} redirects seguidos (último: {atual})",
+                    permanente=True,
+                    status=resposta.status_code,
+                    url=url_pedida,
                 )
-                erro.__cause__ = exc
-            except httpx.RequestError as exc:  # ex.: excesso de redirects: repetir não muda nada
-                raise ErroRede(
-                    f"GET {url_final}: {_descrever(exc)}", permanente=True, url=url_final
-                ) from exc
-            else:
-                status = resposta.status_code
-                if status < 400:
-                    guardada = RespostaRede(
-                        status=status,
-                        url=str(resposta.url),
-                        conteudo=resposta.content,
-                        headers=dict(resposta.headers),
-                        de_cache=False,
-                    )
-                    self._cache[chave] = guardada
-                    return guardada
-                if status != 429 and status < 500:
-                    raise ErroRede(
-                        f"GET {url_final}: HTTP {status} (permanente, sem nova tentativa)",
-                        permanente=True,
-                        status=status,
-                        url=url_final,
-                    )
-                retry_after = _retry_after(resposta)
-                erro = ErroRede(
-                    f"GET {url_final}: HTTP {status} (tentativa {n} de {total})",
-                    permanente=False,
-                    status=status,
-                    url=url_final,
-                )
-            if n == total:
-                raise erro
-            await self._dormir(retry_after if retry_after is not None else float(2 ** (n - 1)))
-        raise AssertionError("inalcançável: o laço sempre retorna ou levanta")  # pragma: no cover
+            destino = _destino_do_redirect(atual, resposta, url_pedida)
+            if _origem(destino) != _origem(atual):
+                # credenciais do chamador não seguem para outra origem
+                cabecalhos = httpx.Headers(cabecalhos)
+                for nome in _CREDENCIAIS:
+                    cabecalhos.pop(nome, None)
+            atual = destino
+
+        guardada = RespostaRede(
+            status=resposta.status_code,
+            url=str(resposta.url),
+            conteudo=resposta.content,
+            headers=dict(resposta.headers),
+            de_cache=False,
+        )
+        self._cache[chave] = guardada
+        return guardada
 
     async def get_json(self, url: str, **kw: Any) -> Any:
         resposta = await self.get(url, **kw)
@@ -199,8 +217,57 @@ class Rede:
     async def fechar(self) -> None:
         await self._client.aclose()
 
+    async def _buscar(self, alvo: httpx.URL, cabecalhos: httpx.Headers) -> httpx.Response:
+        """Uma URL (sem seguir redirect), com novas tentativas. Devolve só status < 400."""
+        url = str(alvo)
+        host = alvo.host.lower()
+        total = max(1, self._config.tentativas)
+        for n in range(1, total + 1):
+            retry_after = None
+            try:
+                resposta = await self._requisitar(host, alvo, cabecalhos)
+            except (httpx.UnsupportedProtocol, httpx.InvalidURL) as exc:
+                # a URL do salto já foi validada; o InvalidURL vem do Location que o httpx
+                # tenta resolver mesmo sem seguir o redirect
+                raise ErroRede(f"GET {url}: {_descrever(exc)}", permanente=True, url=url) from exc
+            except httpx.TransportError as exc:  # inclui TimeoutException
+                if _LOCATION_INVALIDO in str(exc):  # o servidor vai repetir o mesmo Location
+                    raise ErroRede(
+                        f"GET {url}: {_descrever(exc)}", permanente=True, url=url
+                    ) from exc
+                erro = ErroRede(
+                    f"GET {url}: {_descrever(exc)} (tentativa {n} de {total})",
+                    permanente=False,
+                    url=url,
+                )
+                erro.__cause__ = exc
+            except httpx.RequestError as exc:  # o que sobra não é transitório: repetir não muda nada
+                raise ErroRede(f"GET {url}: {_descrever(exc)}", permanente=True, url=url) from exc
+            else:
+                status = resposta.status_code
+                if status < 400:
+                    return resposta
+                if status != 429 and status < 500:
+                    raise ErroRede(
+                        f"GET {url}: HTTP {status} (permanente, sem nova tentativa)",
+                        permanente=True,
+                        status=status,
+                        url=url,
+                    )
+                retry_after = _retry_after(resposta)
+                erro = ErroRede(
+                    f"GET {url}: HTTP {status} (tentativa {n} de {total})",
+                    permanente=False,
+                    status=status,
+                    url=url,
+                )
+            if n == total:
+                raise erro
+            await self._dormir(retry_after if retry_after is not None else float(2 ** (n - 1)))
+        raise AssertionError("inalcançável: o laço sempre retorna ou levanta")  # pragma: no cover
+
     async def _requisitar(
-        self, host: str, alvo: httpx.URL, cabecalhos: httpx.Headers, seguir_redirect: bool
+        self, host: str, alvo: httpx.URL, cabecalhos: httpx.Headers
     ) -> httpx.Response:
         """Uma requisição respeitando o limite do host. A trava cobre espera + requisição."""
         trava = self._travas.get(host)
@@ -214,8 +281,6 @@ class Rede:
                 if espera > 0:
                     await self._dormir(espera)
             try:
-                return await self._client.get(
-                    alvo, headers=cabecalhos, follow_redirects=seguir_redirect
-                )
+                return await self._client.get(alvo, headers=cabecalhos)
             finally:
                 self._ultima[host] = self._relogio()

@@ -303,6 +303,8 @@ async def test_proxy_e_timeout_vao_para_o_cliente_httpx(monkeypatch):
     monkeypatch.setattr(modulo_rede.httpx, "AsyncClient", espiao)
     rede = Rede(cfg(proxy="socks5://127.0.0.1:9050", timeout_s=12.0))
     assert recebidos["proxy"] == "socks5://127.0.0.1:9050" and recebidos["timeout"] == 12.0
+    # redirect é seguido por Rede (cada salto passa pelo limite do host) e o ambiente não manda no proxy
+    assert recebidos["follow_redirects"] is False and recebidos["trust_env"] is False
     await rede.fechar()
 
 
@@ -317,6 +319,155 @@ async def test_sem_proxy_nao_configura_proxy(monkeypatch):
     monkeypatch.setattr(modulo_rede.httpx, "AsyncClient", espiao)
     await Rede(cfg()).fechar()
     assert recebidos.get("proxy") is None
+
+
+# ---------------------------------------------------------------- redirects
+
+
+async def test_redirect_no_mesmo_host_respeita_o_limite_no_segundo_salto(respx_mock):
+    a = respx_mock.get("https://web.archive.org/web/2020/alvo.x").mock(return_value=httpx.Response(302, headers={"Location": "/web/20200102/alvo.x"}))
+    b = respx_mock.get("https://web.archive.org/web/20200102/alvo.x").mock(return_value=httpx.Response(200, text="snapshot"))
+    esperas = []; rede = Rede(cfg(limites={"*": 0, "web.archive.org": 2.0}), dormir=lambda s: registrar(esperas, s), relogio=lambda: 100.0)
+    r = await rede.get("https://web.archive.org/web/2020/alvo.x")
+    assert (r.status, r.url, r.texto) == (200, "https://web.archive.org/web/20200102/alvo.x", "snapshot")
+    assert a.call_count == 1 and b.call_count == 1
+    assert esperas == [2.0]  # o 2º salto espera o limite do host, como qualquer outra requisição
+
+
+async def test_redirect_para_outro_host_respeita_o_limite_do_destino(respx_mock):
+    respx_mock.get("https://b.x/2").mock(return_value=httpx.Response(200))
+    respx_mock.get("https://a.x/1").mock(return_value=httpx.Response(302, headers={"Location": "https://b.x/destino"}))
+    respx_mock.get("https://b.x/destino").mock(return_value=httpx.Response(200, text="chegou"))
+    esperas = []; rede = Rede(cfg(limites={"*": 0, "b.x": 5.0}), dormir=lambda s: registrar(esperas, s), relogio=lambda: 100.0)
+    await rede.get("https://b.x/2")
+    assert esperas == []
+    r = await rede.get("https://a.x/1")  # a.x não tem limite; o salto para b.x espera os 5 s de b.x
+    assert r.url == "https://b.x/destino" and r.texto == "chegou"
+    assert esperas == [5.0]
+
+
+async def test_loop_de_redirect_vira_erro_permanente_e_cada_salto_respeita_o_limite(respx_mock):
+    rota = respx_mock.get("https://l.x/loop").mock(return_value=httpx.Response(302, headers={"Location": "/loop"}))
+    esperas = []; rede = Rede(cfg(limites={"*": 1.0}), dormir=lambda s: registrar(esperas, s), relogio=lambda: 100.0)
+    with pytest.raises(ErroRede) as e:
+        await rede.get("https://l.x/loop")
+    assert e.value.permanente is True and e.value.status == 302 and e.value.url == "https://l.x/loop"
+    assert "redirect" in str(e.value) and "https://l.x/loop" in str(e.value)
+    assert rota.call_count == 11  # a requisição original + 10 saltos
+    assert esperas == [1.0] * 10
+
+
+async def test_cadeia_de_redirects_longa_mas_dentro_do_teto_funciona(respx_mock):
+    for i in range(10):
+        respx_mock.get(f"https://c.x/{i}").mock(return_value=httpx.Response(301, headers={"Location": f"/{i + 1}"}))
+    respx_mock.get("https://c.x/10").mock(return_value=httpx.Response(200, text="fim"))
+    r = await rede_sem_espera().get("https://c.x/0")
+    assert r.status == 200 and r.url == "https://c.x/10"
+
+
+async def test_redirect_nao_seguido_nao_toca_o_destino(respx_mock):
+    origem = respx_mock.get("https://api.x/o3").mock(return_value=httpx.Response(302, headers={"Location": "https://outro.x/"}))
+    r = await rede_sem_espera().get("https://api.x/o3", seguir_redirect=False)
+    assert r.status == 302 and r.headers["location"] == "https://outro.x/" and origem.call_count == 1
+
+
+async def test_3xx_sem_location_e_devolvido_como_esta(respx_mock):
+    respx_mock.get("https://api.x/o4").mock(return_value=httpx.Response(300))
+    assert (await rede_sem_espera().get("https://api.x/o4")).status == 300
+
+
+async def test_cache_guarda_o_resultado_final_do_redirect(respx_mock):
+    a = respx_mock.get("https://api.x/o5").mock(return_value=httpx.Response(302, headers={"Location": "/o6"}))
+    b = respx_mock.get("https://api.x/o6").mock(return_value=httpx.Response(200, text="fim"))
+    r = rede_sem_espera()
+    primeira = await r.get("https://api.x/o5")
+    segunda = await r.get("https://api.x/o5")
+    assert (a.call_count, b.call_count) == (1, 1)
+    assert primeira.de_cache is False and segunda.de_cache is True and segunda.url == "https://api.x/o6"
+
+
+async def test_novas_tentativas_valem_dentro_de_cada_salto(respx_mock):
+    respx_mock.get("https://api.x/o7").mock(return_value=httpx.Response(302, headers={"Location": "/o8"}))
+    destino = respx_mock.get("https://api.x/o8").mock(side_effect=[httpx.Response(503), httpx.Response(200, text="ok")])
+    esperas = []; rede = Rede(cfg(limites={"*": 0}), dormir=lambda s: registrar(esperas, s))
+    r = await rede.get("https://api.x/o7")
+    assert r.texto == "ok" and r.url == "https://api.x/o8" and destino.call_count == 2 and esperas == [1.0]
+
+
+async def test_erro_permanente_no_salto_aponta_a_url_do_salto(respx_mock):
+    respx_mock.get("https://api.x/o9").mock(return_value=httpx.Response(302, headers={"Location": "/o10"}))
+    respx_mock.get("https://api.x/o10").mock(return_value=httpx.Response(404))
+    with pytest.raises(ErroRede) as e:
+        await rede_sem_espera().get("https://api.x/o9")
+    assert e.value.permanente is True and e.value.status == 404 and e.value.url == "https://api.x/o10"
+
+
+async def test_redirect_para_outro_protocolo_e_erro_permanente(respx_mock):
+    rota = respx_mock.get("https://api.x/o11").mock(return_value=httpx.Response(302, headers={"Location": "ftp://x.x/y"}))
+    with pytest.raises(ErroRede) as e:
+        await rede_sem_espera().get("https://api.x/o11")
+    assert e.value.permanente is True and e.value.status == 302 and e.value.url == "https://api.x/o11"
+    assert "redirect" in str(e.value) and "ftp://x.x/y" in str(e.value) and rota.call_count == 1
+
+
+@pytest.mark.parametrize("location", ["javascript:alert(1)", "http://[::1"])
+async def test_location_que_nao_e_url_e_erro_permanente_sem_nova_tentativa(respx_mock, location):
+    # o httpx resolve o Location na hora e rejeita; repetir só devolveria o mesmo Location
+    rota = respx_mock.get("https://api.x/o12").mock(return_value=httpx.Response(302, headers={"Location": location}))
+    with pytest.raises(ErroRede) as e:
+        await rede_sem_espera().get("https://api.x/o12")
+    assert e.value.permanente is True and e.value.url == "https://api.x/o12" and rota.call_count == 1
+
+
+async def test_credenciais_nao_acompanham_redirect_para_outra_origem(respx_mock):
+    primeira = respx_mock.get("https://a.x/1").mock(return_value=httpx.Response(302, headers={"Location": "https://b.x/2"}))
+    segunda = respx_mock.get("https://b.x/2").mock(return_value=httpx.Response(200))
+    sensiveis = {"Authorization": "Bearer segredo", "Cookie": "sessao=1", "X-Chave": "v"}
+    await rede_sem_espera().get("https://a.x/1", headers=sensiveis)
+    enviados = segunda.calls[0].request.headers
+    assert primeira.calls[0].request.headers["authorization"] == "Bearer segredo"
+    assert "authorization" not in enviados and "cookie" not in enviados and enviados["x-chave"] == "v"
+
+
+async def test_credenciais_acompanham_redirect_na_mesma_origem(respx_mock):
+    respx_mock.get("https://a.x/1").mock(return_value=httpx.Response(302, headers={"Location": "/2"}))
+    segunda = respx_mock.get("https://a.x/2").mock(return_value=httpx.Response(200))
+    await rede_sem_espera().get("https://a.x/1", headers={"Authorization": "Bearer segredo"})
+    assert segunda.calls[0].request.headers["authorization"] == "Bearer segredo"
+
+
+async def _servidor_local(recebidos: list[bytes]):
+    """Servidor HTTP mínimo em 127.0.0.1 que registra o cabeçalho de cada requisição e responde `ok`."""
+    async def atender(leitor, escritor):
+        try:
+            recebidos.append(await leitor.readuntil(b"\r\n\r\n"))
+            escritor.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            await escritor.drain()
+        finally:
+            escritor.close()
+
+    servidor = await asyncio.start_server(atender, "127.0.0.1", 0)
+    return servidor, servidor.sockets[0].getsockname()[1]
+
+
+async def test_proxy_das_variaveis_de_ambiente_e_ignorado(monkeypatch):
+    no_alvo, no_proxy = [], []
+    alvo, porta_alvo = await _servidor_local(no_alvo)
+    proxy, porta_proxy = await _servidor_local(no_proxy)
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.setenv(var, f"http://127.0.0.1:{porta_proxy}")
+    for var in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    try:
+        rede = rede_sem_espera()  # config.proxy = None: conexão direta, nunca o proxy do ambiente
+        resposta = await rede.get(f"http://127.0.0.1:{porta_alvo}/x")
+        await rede.fechar()
+    finally:
+        for servidor in (alvo, proxy):
+            servidor.close()
+            await servidor.wait_closed()
+    assert resposta.texto == "ok"
+    assert len(no_alvo) == 1 and no_proxy == []
 
 
 # ---------------------------------------------------------------- RespostaRede
