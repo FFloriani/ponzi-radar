@@ -55,13 +55,18 @@ class RespostaRede:
 
     @property
     def texto(self) -> str:
-        """Decodifica pelo charset do Content-Type; sem ele (ou desconhecido), UTF-8 com `replace`."""
+        """Decodifica pelo charset do Content-Type; sem ele (ou desconhecido), UTF-8 com `replace`.
+
+        O cabeçalho vem do servidor consultado, então o charset pode ser qualquer coisa: o nome
+        que o Python não conhece (`LookupError`) e o codec que não decodifica texto, como `idna` ou
+        `undefined` (`UnicodeError`), caem no UTF-8.
+        """
         charset = self._charset()
         texto = None
         if charset:
             try:
                 texto = self.conteudo.decode(charset, errors="replace")
-            except LookupError:
+            except (LookupError, UnicodeError):
                 pass
         if texto is None:
             texto = self.conteudo.decode("utf-8", errors="replace")
@@ -116,8 +121,9 @@ class Rede:
     O limite é por host e conta do FIM da requisição anterior ao mesmo host. Os redirects
     são seguidos aqui, não pelo httpx (até 10 saltos): cada salto é uma requisição como
     outra qualquer, com o limite do seu host e as suas novas tentativas. O cache é por
-    instância e só guarda respostas com status < 400. O proxy vem só de `config.proxy`:
-    as variáveis de ambiente (HTTP_PROXY etc.) são ignoradas.
+    instância e só guarda respostas com status < 400. O timeout de cada requisição (e de cada
+    salto) é `config.timeouts[host]` ou, sem entrada para o host, `config.timeout_s`. O proxy
+    vem só de `config.proxy`: as variáveis de ambiente (HTTP_PROXY etc.) são ignoradas.
     """
 
     def __init__(
@@ -280,7 +286,9 @@ class Rede:
                 espera = limites.get(host, limites["*"]) - (self._relogio() - ultima)
                 if espera > 0:
                     await self._dormir(espera)
+            # o timeout vale por requisição, no host de cada salto: o Wayback é bem mais lento que o resto
+            timeout = self._config.timeouts.get(host, self._config.timeout_s)
             try:
-                return await self._client.get(alvo, headers=cabecalhos)
+                return await self._client.get(alvo, headers=cabecalhos, timeout=timeout)
             finally:
                 self._ultima[host] = self._relogio()

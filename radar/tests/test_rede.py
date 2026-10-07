@@ -321,6 +321,81 @@ async def test_sem_proxy_nao_configura_proxy(monkeypatch):
     assert recebidos.get("proxy") is None
 
 
+# ---------------------------------------------------------------- timeout por host
+
+
+def _espiar_timeouts(respx_mock, *urls: str) -> list[tuple[str, float]]:
+    """Registra `(host, timeout de leitura)` que o httpx recebeu em cada requisição."""
+    vistos: list[tuple[str, float]] = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        vistos.append((request.url.host, request.extensions["timeout"]["read"]))
+        return httpx.Response(200, text="ok")
+
+    for url in urls:
+        respx_mock.get(url).mock(side_effect=responder)
+    return vistos
+
+
+async def test_timeout_especifico_do_host_vale_em_cada_requisicao(respx_mock):
+    vistos = _espiar_timeouts(respx_mock, "https://lento.x/a", "https://rapido.x/b")
+    rede = rede_sem_espera(timeout_s=30.0, timeouts={"lento.x": 90.0})
+    await rede.get("https://lento.x/a")
+    await rede.get("https://rapido.x/b")
+    assert vistos == [("lento.x", 90.0), ("rapido.x", 30.0)]
+    await rede.fechar()
+
+
+async def test_timeout_do_wayback_e_120s_por_padrao_e_outros_hosts_usam_timeout_s(respx_mock):
+    vistos = _espiar_timeouts(respx_mock, "https://web.archive.org/x", "https://api.x/y")
+    rede = rede_sem_espera()
+    await rede.get("https://web.archive.org/x")
+    await rede.get("https://api.x/y")
+    assert vistos == [("web.archive.org", 120.0), ("api.x", 30.0)]
+    await rede.fechar()
+
+
+async def test_timeout_do_wayback_pode_ser_trocado_na_config(respx_mock):
+    vistos = _espiar_timeouts(respx_mock, "https://web.archive.org/x")
+    rede = rede_sem_espera(timeouts={"web.archive.org": 7.0})
+    await rede.get("https://web.archive.org/x")
+    assert vistos == [("web.archive.org", 7.0)]
+    await rede.fechar()
+
+
+async def test_timeout_acompanha_o_host_de_cada_salto_do_redirect(respx_mock):
+    vistos: list[tuple[str, float]] = []
+
+    def salto(request: httpx.Request) -> httpx.Response:
+        vistos.append((request.url.host, request.extensions["timeout"]["read"]))
+        if request.url.host == "api.x":
+            return httpx.Response(302, headers={"Location": "https://web.archive.org/web/2020id_/alvo.x"})
+        return httpx.Response(200, text="snapshot")
+
+    respx_mock.get("https://api.x/ir").mock(side_effect=salto)
+    respx_mock.get("https://web.archive.org/web/2020id_/alvo.x").mock(side_effect=salto)
+    rede = rede_sem_espera()
+    resposta = await rede.get("https://api.x/ir")
+    assert resposta.texto == "snapshot"
+    assert vistos == [("api.x", 30.0), ("web.archive.org", 120.0)]  # cada salto leva o timeout do seu host
+    await rede.fechar()
+
+
+async def test_timeout_vale_tambem_nas_novas_tentativas(respx_mock):
+    vistos: list[float] = []
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        vistos.append(request.extensions["timeout"]["read"])
+        return httpx.Response(503)
+
+    respx_mock.get("https://web.archive.org/x").mock(side_effect=responder)
+    rede = rede_sem_espera()
+    with pytest.raises(ErroRede):
+        await rede.get("https://web.archive.org/x")
+    assert vistos == [120.0] * 4
+    await rede.fechar()
+
+
 # ---------------------------------------------------------------- redirects
 
 
@@ -490,6 +565,12 @@ def test_texto_sem_charset_e_utf8_com_replace():
 
 def test_texto_com_charset_desconhecido_cai_em_utf8():
     assert _resp("ação".encode("utf-8"), "text/html; charset=nao-existe").texto == "ação"
+
+
+@pytest.mark.parametrize("charset", ["idna", "undefined"])
+def test_texto_com_charset_que_nao_decodifica_texto_cai_em_utf8(charset):
+    # o cabeçalho vem do servidor investigado: o codec `idna` e o `undefined` levantam UnicodeError
+    assert _resp("ação".encode("utf-8"), f"text/html; charset={charset}").texto == "ação"
 
 
 def test_texto_acha_content_type_em_qualquer_caixa():

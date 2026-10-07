@@ -96,17 +96,18 @@ def log_custodia(pasta: Path) -> list[dict]:
     return [json.loads(linha) for linha in texto.split("\n") if linha]
 
 
-def params_indice(dominio: str, to: str) -> dict[str, str]:
-    return {
-        "url": dominio,
-        "matchType": "domain",
-        "output": "json",
-        "fl": "timestamp,original",
-        "filter": "statuscode:200",
-        "collapse": "timestamp:8",
-        "limit": "10000",
-        "to": to,
-    }
+def params_indice(dominio: str, to: str) -> list[tuple[str, str]]:
+    """A consulta de listagem do domínio (R-T7-cdx): sem `collapse`, só HTML, `filter` repetido."""
+    return [
+        ("url", dominio),
+        ("matchType", "domain"),
+        ("output", "json"),
+        ("fl", "timestamp,original"),
+        ("filter", "statuscode:200"),
+        ("filter", "mimetype:text/html"),
+        ("limit", "10000"),
+        ("to", to),
+    ]
 
 
 def params_home(dominio: str, to: str) -> dict[str, str]:
@@ -119,7 +120,7 @@ def params_home(dominio: str, to: str) -> dict[str, str]:
     }
 
 
-def rota_cdx(respx_mock, params: dict[str, str], corpo):
+def rota_cdx(respx_mock, params: dict[str, str] | list[tuple[str, str]], corpo):
     return respx_mock.get(CDX, params=params).mock(return_value=httpx.Response(200, json=corpo))
 
 
@@ -147,26 +148,40 @@ async def test_indice_por_mes(respx_mock, ctx_2019, serv):
     rota_cdx(respx_mock, params_indice("example.com", "20190606"), fixture("cdx_dominio"))
     resultado = await WaybackIndiceNo().executar(ctx_2019, entrada_alvo(), {}, serv)
     saidas = resultado.saidas
-    assert set(saidas) == {"primeiro", "ultimo", "total", "por_mes"}
-    # total = linhas do CDX sem o cabeçalho; as linhas vêm ordenadas por URL, não por data,
-    # então primeiro/ultimo são o mínimo e o máximo, não a primeira e a última linha
-    assert saidas["total"] == len(fixture("cdx_dominio")) - 1 == 24
-    assert (saidas["primeiro"], saidas["ultimo"]) == ("2002-01-20", "2018-03-23")
+    assert set(saidas) == {"primeiro", "ultimo", "total", "por_mes", "truncado"}
+    # total = capturas HTML (as linhas do CDX sem o cabeçalho); as linhas vêm ordenadas por URL,
+    # não por data, então primeiro/ultimo são o mínimo e o máximo, não a primeira e a última linha
+    assert saidas["total"] == len(fixture("cdx_dominio")) - 1 == 22
+    assert (saidas["primeiro"], saidas["ultimo"]) == ("2002-01-20", "2015-10-31")
     por_mes = saidas["por_mes"]
-    assert (por_mes["2002-01"], por_mes["2004-10"], por_mes["2005-05"], por_mes["2007-08"]) == (1, 2, 2, 2)
+    assert (por_mes["2002-01"], por_mes["2005-11"], por_mes["2013-08"], por_mes["2014-12"]) == (1, 2, 2, 2)
     assert sum(por_mes.values()) == saidas["total"]
-    assert len(por_mes) == 21  # 24 linhas, três meses com duas
+    assert len(por_mes) == 18  # 22 capturas, quatro meses com duas
     assert list(por_mes) == sorted(por_mes)  # chaves AAAA-MM em ordem
+    assert saidas["truncado"] is False
+
+
+async def test_indice_primeiro_e_ultimo_nao_dependem_da_ordem_das_linhas(respx_mock, ctx_2019, serv):
+    linhas = fixture("cdx_dominio")
+    linhas[1:] = list(reversed(linhas[1:]))
+    rota_cdx(respx_mock, params_indice("example.com", "20190606"), linhas)
+    saidas = (await WaybackIndiceNo().executar(ctx_2019, entrada_alvo(), {}, serv)).saidas
+    assert (saidas["primeiro"], saidas["ultimo"], saidas["total"]) == ("2002-01-20", "2015-10-31", 22)
 
 
 async def test_indice_pede_o_cdx_com_os_parametros_da_spec(respx_mock, ctx_2019, serv):
     rota = rota_cdx(respx_mock, params_indice("example.com", "20190606"), fixture("cdx_vazio"))
     await WaybackIndiceNo().executar(ctx_2019, entrada_alvo(), {}, serv)
     pedido = rota.calls.last.request.url
-    assert dict(pedido.params) == params_indice("example.com", "20190606")
+    # `filter` aparece duas vezes e não há `collapse`: o índice conta capturas, não URLs por dia
+    assert pedido.params.multi_items() == params_indice("example.com", "20190606")
+    assert "collapse" not in pedido.params
     (registro,) = log_custodia(ctx_2019.pasta)  # o CDX bruto vai para a custódia
     assert registro["tipo"] == "api"
-    assert registro["origem"].startswith(f"{CDX}?url=example.com&matchType=domain&")
+    assert registro["origem"] == (
+        f"{CDX}?url=example.com&matchType=domain&output=json&fl=timestamp,original"
+        "&filter=statuscode:200&filter=mimetype:text/html&limit=10000&to=20190606"
+    )
     assert json.loads(serv.custodia.ler(f"sha256:{registro['sha256']}")) == []
 
 
@@ -180,7 +195,30 @@ async def test_indice_to_vem_do_as_of(respx_mock, ctx_hoje, serv):
 async def test_indice_sem_capturas(respx_mock, ctx_2019, serv, corpo):
     rota_cdx(respx_mock, params_indice("example.com", "20190606"), corpo)
     resultado = await WaybackIndiceNo().executar(ctx_2019, entrada_alvo(), {}, serv)
-    assert resultado == Feito({"primeiro": None, "ultimo": None, "total": 0, "por_mes": {}})
+    assert resultado == Feito(
+        {"primeiro": None, "ultimo": None, "total": 0, "por_mes": {}, "truncado": False}
+    )
+
+
+def _linhas_do_cdx(n: int) -> list[list[str]]:
+    return [["timestamp", "original"], *([["20190101120000", f"http://example.com/p{i}"] for i in range(n)])]
+
+
+@pytest.mark.parametrize(
+    "linhas_de_dados,truncado", [(9999, False), (10000, True), (10001, True)], ids=["9999", "10000", "10001"]
+)
+async def test_indice_truncado_quando_o_cdx_chega_ao_limite(respx_mock, ctx_2019, serv, linhas_de_dados, truncado):
+    rota_cdx(respx_mock, params_indice("example.com", "20190606"), _linhas_do_cdx(linhas_de_dados))
+    saidas = (await WaybackIndiceNo().executar(ctx_2019, entrada_alvo(), {}, serv)).saidas
+    assert saidas["truncado"] is truncado
+    assert saidas["total"] == linhas_de_dados
+
+
+async def test_indice_truncado_conta_as_linhas_antes_de_descartar_as_invalidas(respx_mock, ctx_2019, serv):
+    linhas = _linhas_do_cdx(9900) + [["lixo", "http://example.com/x"]] * 100  # 10000 linhas de dados
+    rota_cdx(respx_mock, params_indice("example.com", "20190606"), linhas)
+    saidas = (await WaybackIndiceNo().executar(ctx_2019, entrada_alvo(), {}, serv)).saidas
+    assert saidas["total"] == 9900 and saidas["truncado"] is True
 
 
 async def test_indice_ignora_linhas_invalidas_e_respeita_a_ordem_das_colunas(respx_mock, ctx_2019, serv):
@@ -205,6 +243,7 @@ async def test_indice_ignora_linhas_invalidas_e_respeita_a_ordem_das_colunas(res
         "ultimo": "2019-05-10",
         "total": 2,
         "por_mes": {"2019-05": 2},
+        "truncado": False,
     }
 
 
@@ -240,7 +279,7 @@ def test_indice_declaracao():
         "exato",
         False,
     )
-    assert set(no.saidas) == {"primeiro", "ultimo", "total", "por_mes"}
+    assert set(no.saidas) == {"primeiro", "ultimo", "total", "por_mes", "truncado"}
 
 
 # ---------------------------------------------------------------------------- snapshot: quando roda
@@ -297,7 +336,7 @@ async def test_snapshot_ate_as_of_usa_id_(respx_mock, ctx_2019, serv):
     assert dict(rota_home.calls.last.request.url.params) == params_home("example.com", "20190606")
     # pede o snapshot cru (`id_`), sem a barra do Wayback nem links reescritos
     assert str(rota.calls.last.request.url) == url_snapshot(HOME_TS, HOME_ORIGINAL)
-    assert resultado.saidas["falhas"] == []
+    assert resultado.saidas["falhas"] == [] and resultado.saidas["truncado"] is False
     (pagina,) = resultado.saidas["paginas"]
     assert set(pagina) == {"url", "timestamp", "html", "texto"}
     assert (pagina["url"], pagina["timestamp"]) == (HOME_ORIGINAL, HOME_TS)
@@ -374,6 +413,7 @@ LISTAGEM = [
     ["20190407000000", "http://example.com/blog/2019/como-funciona-o-saque"],
     ["20190408000000", "http://example.com/?page=termos"],  # roteamento por query
     ["20190409000000", "http://example.com/termos.pdf"],  # casa, mas é documento
+    ["20190410000000", "http://[::1/termos"],  # URL que nem o urlsplit aceita: o CDX traz o que o site serviu
 ]
 
 
@@ -389,17 +429,18 @@ async def test_snapshot_subpaginas_prioritarias_mais_recentes_ate_o_as_of(respx_
     resultado = await WaybackSnapshotNo().executar(ctx_2019, entrada_alvo(), {}, serv)
 
     paginas = resultado.saidas["paginas"]
-    # a home primeiro; depois as subpáginas, das mais rasas e curtas para as mais fundas
+    # a home primeiro; depois as subpáginas sem query, das mais rasas e curtas para as mais fundas;
+    # as que dependem de query ficam para o fim
     assert [(p["timestamp"], p["url"]) for p in paginas] == [
         (HOME_TS, HOME_ORIGINAL),
-        ("20190408000000", "http://example.com/?page=termos"),
         ("20190401000000", "http://example.com/faq"),
         ("20190406000000", "http://blog.example.com/indicacao"),
         ("20190301120000", "https://www.example.com/termos-de-uso/"),  # http/https/www/:80 viraram uma
         ("20190405000000", "http://example.com/como-funciona.html"),
         ("20190407000000", "http://example.com/blog/2019/como-funciona-o-saque"),
+        ("20190408000000", "http://example.com/?page=termos"),
     ]
-    assert resultado.saidas["falhas"] == []
+    assert resultado.saidas["falhas"] == [] and resultado.saidas["truncado"] is False
     pedidos = [str(c.request.url) for c in rota.calls]
     assert pedidos == [url_snapshot(p["timestamp"], p["url"]) for p in paginas[1:]]
     # cada subpágina tem o HTML e o texto na custódia
@@ -437,8 +478,8 @@ async def test_snapshot_limita_ao_max_subpaginas_da_config(respx_mock, ctx_2019,
         resultado = await WaybackSnapshotNo().executar(ctx_2019, entrada_alvo(), {}, s)
     assert [p["url"] for p in resultado.saidas["paginas"]] == [
         HOME_ORIGINAL,
-        "http://example.com/?page=termos",
         "http://example.com/faq",
+        "http://blog.example.com/indicacao",
     ]
     assert rota.call_count == 2
 
@@ -472,14 +513,86 @@ async def test_snapshot_falha_de_subpagina_so_descarta_a_subpagina(respx_mock, c
     assert "404" in falha["motivo"] and "wayback" in falha["motivo"].lower()
 
 
-async def test_snapshot_listagem_do_dominio_com_erro_derruba_o_no(respx_mock, ctx_2019, serv):
+async def test_snapshot_falha_que_nao_e_erro_no_numa_subpagina_vai_para_falhas(
+    respx_mock, ctx_2019, serv, monkeypatch
+):
+    montar_subpaginas(respx_mock)
+    guardar = serv.custodia.guardar
+
+    def guardar_com_defeito(dados, ext, tipo, origem):
+        if "/faq" in origem:
+            raise ValueError("custódia recusou")
+        return guardar(dados, ext, tipo, origem)
+
+    monkeypatch.setattr(serv.custodia, "guardar", guardar_com_defeito)
+    resultado = await WaybackSnapshotNo().executar(ctx_2019, entrada_alvo(), {}, serv)
+
+    urls = [p["url"] for p in resultado.saidas["paginas"]]
+    assert HOME_ORIGINAL in urls and "http://example.com/faq" not in urls and len(urls) == 6
+    (falha,) = resultado.saidas["falhas"]
+    assert (falha["url"], falha["timestamp"]) == ("http://example.com/faq", "20190401000000")
+    assert falha["motivo"] == "ValueError: custódia recusou"
+
+
+async def test_snapshot_listagem_do_dominio_com_erro_vira_falha_e_mantem_a_home(respx_mock, ctx_2019, serv):
     rota_cdx(respx_mock, params_home("example.com", "20190606"), fixture("cdx_home"))
     rota_snapshot(respx_mock, HOME_TS, HOME_ORIGINAL)
-    respx_mock.get(CDX, params=params_indice("example.com", "20190606")).mock(return_value=httpx.Response(503))
-    with pytest.raises(ErroNo) as e:
-        await WaybackSnapshotNo().executar(ctx_2019, entrada_alvo(), {}, serv)
-    assert e.value.permanente is False
-    assert "wayback cdx" in e.value.mensagem.lower() and "503" in e.value.mensagem
+    rota = respx_mock.get(CDX, params=params_indice("example.com", "20190606")).mock(
+        return_value=httpx.Response(503)
+    )
+    resultado = await WaybackSnapshotNo().executar(ctx_2019, entrada_alvo(), {}, serv)
+
+    assert rota.call_count == 4  # esgotou as tentativas antes de desistir da listagem
+    (pagina,) = resultado.saidas["paginas"]  # a home já baixada não se perde
+    assert (pagina["url"], pagina["timestamp"]) == (HOME_ORIGINAL, HOME_TS)
+    assert serv.custodia.ler(pagina["html"]) == html_home()
+    (falha,) = resultado.saidas["falhas"]
+    assert falha["url"] is None and falha["timestamp"] is None
+    assert "wayback cdx" in falha["motivo"].lower() and "503" in falha["motivo"]
+    assert resultado.saidas["truncado"] is False
+
+
+async def test_snapshot_listagem_com_formato_inesperado_tambem_vira_falha(respx_mock, ctx_2019, serv):
+    rota_cdx(respx_mock, params_home("example.com", "20190606"), fixture("cdx_home"))
+    rota_snapshot(respx_mock, HOME_TS, HOME_ORIGINAL)
+    rota_cdx(respx_mock, params_indice("example.com", "20190606"), {"erro": "manutencao"})
+    resultado = await WaybackSnapshotNo().executar(ctx_2019, entrada_alvo(), {}, serv)
+    assert len(resultado.saidas["paginas"]) == 1
+    (falha,) = resultado.saidas["falhas"]
+    assert falha["url"] is None and "wayback cdx" in falha["motivo"].lower()
+
+
+async def test_snapshot_truncado_quando_a_listagem_chegou_ao_limite(respx_mock, ctx_2019, serv):
+    rota_cdx(respx_mock, params_home("example.com", "20190606"), fixture("cdx_home"))
+    rota_cdx(respx_mock, params_indice("example.com", "20190606"), _linhas_do_cdx(10000))
+    rota_snapshot(respx_mock, HOME_TS, HOME_ORIGINAL)
+    resultado = await WaybackSnapshotNo().executar(ctx_2019, entrada_alvo(), {}, serv)
+    assert resultado.saidas["truncado"] is True
+    assert resultado.saidas["falhas"] == [] and len(resultado.saidas["paginas"]) == 1
+
+
+async def test_snapshot_variantes_de_query_nao_ocupam_os_slots(respx_mock, ctx_2019, serv):
+    # reprodução da revisão: 9 + 5 variantes de query e 3 páginas de regras reais, limite 10
+    listagem = [
+        ["timestamp", "original"],
+        *([f"201904{n:02d}000000", f"http://example.com/?indicacao=user{n}"] for n in range(1, 10)),
+        *([f"201905{n:02d}000000", f"http://example.com/cadastro?indicador=u{n}"] for n in range(1, 6)),
+        ["20190301000000", "http://example.com/termos"],
+        ["20190302000000", "http://example.com/faq"],
+        ["20190303000000", "http://example.com/saque"],
+    ]
+    rota = montar_subpaginas(respx_mock, listagem)
+    resultado = await WaybackSnapshotNo().executar(ctx_2019, entrada_alvo(), {}, serv)
+
+    # sem query primeiro (rasas e curtas antes), depois no máximo 1 variante por caminho: a mais recente
+    assert [(p["timestamp"], p["url"]) for p in resultado.saidas["paginas"][1:]] == [
+        ("20190302000000", "http://example.com/faq"),
+        ("20190303000000", "http://example.com/saque"),
+        ("20190301000000", "http://example.com/termos"),
+        ("20190409000000", "http://example.com/?indicacao=user9"),
+        ("20190505000000", "http://example.com/cadastro?indicador=u5"),
+    ]
+    assert rota.call_count == 5
 
 
 async def test_snapshot_reaproveita_a_listagem_pedida_pelo_indice(respx_mock, ctx_2019, serv):
@@ -514,14 +627,50 @@ async def test_snapshot_decodifica_pelo_charset_da_pagina(respx_mock, ctx_2019, 
     assert serv.custodia.ler(pagina["texto"]).decode("utf-8") == "Indicação de amigos"
 
 
-async def test_snapshot_com_charset_desconhecido_cai_no_utf8(respx_mock, ctx_2019, serv):
+# o charset vem do site investigado: nome que o Python não conhece (LookupError) e codec que não
+# decodifica texto (`idna`, `undefined`: UnicodeError) têm de cair no UTF-8, nunca derrubar o nó
+CHARSETS_HOSTIS = ["nao-existe", "idna", "undefined", "rot13", "base64"]
+
+
+@pytest.mark.parametrize("charset", CHARSETS_HOSTIS)
+async def test_snapshot_com_charset_hostil_no_meta_cai_no_utf8(respx_mock, ctx_2019, serv, charset):
     rota_cdx(respx_mock, params_home("example.com", "20190606"), fixture("cdx_home"))
     rota_cdx(respx_mock, params_indice("example.com", "20190606"), fixture("cdx_vazio"))
-    corpo = "<html><head><meta charset=nao-existe></head><body><p>Saque rápido</p></body></html>".encode()
+    corpo = f"<html><head><meta charset={charset}></head><body><p>Saque rápido</p></body></html>".encode()
     rota_snapshot(respx_mock, HOME_TS, HOME_ORIGINAL, corpo, {"content-type": "text/html"})
     resultado = await WaybackSnapshotNo().executar(ctx_2019, entrada_alvo(), {}, serv)
     (pagina,) = resultado.saidas["paginas"]
     assert serv.custodia.ler(pagina["texto"]).decode("utf-8") == "Saque rápido"
+
+
+@pytest.mark.parametrize("charset", CHARSETS_HOSTIS)
+async def test_snapshot_com_charset_hostil_no_cabecalho_cai_no_utf8(respx_mock, ctx_2019, serv, charset):
+    rota_cdx(respx_mock, params_home("example.com", "20190606"), fixture("cdx_home"))
+    rota_cdx(respx_mock, params_indice("example.com", "20190606"), fixture("cdx_vazio"))
+    corpo = "<html><body><p>Saque rápido</p></body></html>".encode()
+    rota_snapshot(respx_mock, HOME_TS, HOME_ORIGINAL, corpo, {"content-type": f"text/html; charset={charset}"})
+    resultado = await WaybackSnapshotNo().executar(ctx_2019, entrada_alvo(), {}, serv)
+    (pagina,) = resultado.saidas["paginas"]
+    assert serv.custodia.ler(pagina["texto"]).decode("utf-8") == "Saque rápido"
+
+
+async def test_snapshot_subpagina_com_charset_hostil_nao_derruba_o_no(respx_mock, ctx_2019, serv):
+    rota_cdx(respx_mock, params_home("example.com", "20190606"), fixture("cdx_home"))
+    rota_cdx(respx_mock, params_indice("example.com", "20190606"), LISTAGEM)
+    rota_snapshot(respx_mock, HOME_TS, HOME_ORIGINAL)
+
+    def responder(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/faq"):
+            corpo = "<meta charset=idna><p>Perguntas frequentes</p>".encode()
+            return httpx.Response(200, content=corpo, headers={"content-type": "text/html"})
+        return _paginas_fake(request)
+
+    respx_mock.get(url__startswith="https://web.archive.org/web/2019").mock(side_effect=responder)
+    resultado = await WaybackSnapshotNo().executar(ctx_2019, entrada_alvo(), {}, serv)
+
+    assert len(resultado.saidas["paginas"]) == 7 and resultado.saidas["falhas"] == []
+    faq = next(p for p in resultado.saidas["paginas"] if p["url"].endswith("/faq"))
+    assert serv.custodia.ler(faq["texto"]).decode("utf-8") == "Perguntas frequentes"
 
 
 def test_snapshot_declaracao():
@@ -533,7 +682,7 @@ def test_snapshot_declaracao():
         "exato",
         False,
     )
-    assert set(no.saidas) == {"paginas", "falhas"}
+    assert set(no.saidas) == {"paginas", "falhas", "truncado"}
 
 
 @pytest.mark.parametrize(

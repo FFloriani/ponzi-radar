@@ -23,10 +23,12 @@ _BASE = "https://web.archive.org"
 _CDX = f"{_BASE}/cdx/search/cdx"
 _LIMITE_CDX = 10000
 _TIMESTAMP = re.compile(r"\d{14}")
-# o CDX do domínio traz imagens, scripts e documentos: só estas extensões (ou nenhuma) são página
+# o CDX filtra por mimetype, mas o tipo vem do que o servidor declarou: uma imagem, um script ou um
+# documento servido como text/html (página de erro com status 200, por exemplo) não é página de regras
 _EXTENSOES_DE_PAGINA = frozenset({"html", "htm", "xhtml", "shtml", "php", "asp", "aspx", "jsp", "cfm"})
 _BYTES_PARA_META = 4096
 _META_CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?\s*([A-Za-z0-9_.:\-]+)""", re.IGNORECASE)
+_BOM = chr(0xFEFF)
 
 
 def _iso(timestamp: str) -> str:
@@ -42,13 +44,17 @@ def _data_valida(timestamp: str) -> bool:
     return True
 
 
-def _capturas(dados: Any) -> list[tuple[str, str]]:
-    """`(timestamp, original)` de cada linha do CDX. A primeira linha é o cabeçalho; resposta vazia
-    ou só com o cabeçalho é "nenhuma captura". Linha malformada ou com data impossível é ignorada."""
+def _capturas(dados: Any) -> tuple[list[tuple[str, str]], int]:
+    """`(timestamp, original)` de cada linha do CDX e quantas linhas de dados vieram.
+
+    A primeira linha é o cabeçalho; resposta vazia ou só com o cabeçalho é "nenhuma captura".
+    Linha malformada ou com data impossível é ignorada, mas a contagem de linhas de dados é feita
+    antes de qualquer descarte: é ela que mostra se o `limit` do CDX foi atingido.
+    """
     if not isinstance(dados, list):
         raise ErroNo("Wayback CDX: resposta não é uma lista de capturas", permanente=True)
     if not dados:
-        return []
+        return [], 0
     cabecalho = dados[0]
     if not (isinstance(cabecalho, list) and "timestamp" in cabecalho and "original" in cabecalho):
         raise ErroNo("Wayback CDX: primeira linha não é o cabeçalho esperado", permanente=True)
@@ -66,66 +72,74 @@ def _capturas(dados: Any) -> list[tuple[str, str]]:
             and original
         ):
             capturas.append((timestamp, original))
-    return capturas
+    return capturas, len(dados) - 1
 
 
-async def _consultar_cdx(s: Servicos, parametros: dict[str, str | int]) -> list[tuple[str, str]]:
-    # ":" e "," ficam como estão (`filter=statuscode:200`, `fl=timestamp,original`). A URL idêntica
-    # permite à `Rede` responder do cache a segunda consulta do domínio na mesma execução.
-    url = f"{_CDX}?{urlencode(parametros, safe=':,')}"
+async def _consultar_cdx(
+    s: Servicos, parametros: list[tuple[str, str | int]]
+) -> tuple[list[tuple[str, str]], int]:
+    # ":", "," e "/" ficam como estão (`filter=mimetype:text/html`, `fl=timestamp,original`). A URL
+    # idêntica permite à `Rede` responder do cache a segunda listagem do domínio na mesma execução.
+    url = f"{_CDX}?{urlencode(parametros, safe=':,/')}"
     return _capturas(await buscar_json(s, url, "Wayback CDX"))
 
 
-async def _listar_dominio(s: Servicos, dominio: str, as_of: date) -> list[tuple[str, str]]:
-    """Capturas com status 200 de todo o domínio até o `as_of`, no máximo uma por URL por dia.
+async def _listar_dominio(
+    s: Servicos, dominio: str, as_of: date
+) -> tuple[list[tuple[str, str]], bool]:
+    """Capturas HTML (status 200) de todo o domínio até o `as_of`, e se o CDX chegou ao `limit`.
 
-    A ordem do CDX é por URL e só depois por data, e o `limit` corta o fim da lista: quem usa a
-    lista não pode contar com a ordem, e em domínios com mais de 10 mil capturas ela é parcial.
+    Sem `collapse`: cada captura é uma linha. A ordem do CDX é por URL e só depois por data, e o
+    `limit` corta o fim da lista: quem usa a lista não pode contar com a ordem, e quando vem
+    `truncado` ela está incompleta (faltam capturas de qualquer época, não só as mais recentes).
     """
-    return await _consultar_cdx(
+    capturas, linhas = await _consultar_cdx(
         s,
-        {
-            "url": dominio,
-            "matchType": "domain",
-            "output": "json",
-            "fl": "timestamp,original",
-            "filter": "statuscode:200",
-            "collapse": "timestamp:8",
-            "limit": _LIMITE_CDX,
-            "to": as_of.strftime("%Y%m%d"),
-        },
+        [
+            ("url", dominio),
+            ("matchType", "domain"),
+            ("output", "json"),
+            ("fl", "timestamp,original"),
+            ("filter", "statuscode:200"),
+            ("filter", "mimetype:text/html"),
+            ("limit", _LIMITE_CDX),
+            ("to", as_of.strftime("%Y%m%d")),
+        ],
     )
+    return capturas, linhas >= _LIMITE_CDX
 
 
 async def _listar_home(s: Servicos, dominio: str, as_of: date) -> list[tuple[str, str]]:
-    return await _consultar_cdx(
+    capturas, _ = await _consultar_cdx(
         s,
-        {
-            "url": f"{dominio}/",
-            "to": as_of.strftime("%Y%m%d"),
-            "filter": "statuscode:200",
-            "fl": "timestamp,original",
-            "output": "json",
-        },
+        [
+            ("url", f"{dominio}/"),
+            ("to", as_of.strftime("%Y%m%d")),
+            ("filter", "statuscode:200"),
+            ("fl", "timestamp,original"),
+            ("output", "json"),
+        ],
     )
+    return capturas
 
 
 class WaybackIndiceNo(NoBase):
-    """Linha do tempo das capturas do domínio (e dos subdomínios) até o `as_of`.
+    """Linha do tempo das capturas HTML do domínio (e dos subdomínios) até o `as_of`.
 
-    `total` conta as linhas do CDX (uma por URL por dia), não os dias com captura. `primeiro` e
-    `ultimo` saem do menor e do maior timestamp, porque o CDX do domínio não vem em ordem de data.
+    `total` e `por_mes` contam capturas, não URLs nem dias. `primeiro` e `ultimo` saem do menor e do
+    maior timestamp, porque o CDX do domínio não vem em ordem de data. `truncado` é `True` quando o
+    CDX devolveu 10 mil linhas (o `limit`): o resto do domínio não entrou na conta.
     """
 
     nome = "wayback_indice"
     entradas = ("alvo",)
-    saidas = ("primeiro", "ultimo", "total", "por_mes")
+    saidas = ("primeiro", "ultimo", "total", "por_mes", "truncado")
     as_of = "exato"
 
     async def executar(
         self, ctx: Contexto, entradas: dict[str, dict], respostas: dict, s: Servicos
     ) -> Feito:
-        capturas = await _listar_dominio(s, entradas["alvo"]["dominio"], ctx.as_of)
+        capturas, truncado = await _listar_dominio(s, entradas["alvo"]["dominio"], ctx.as_of)
         timestamps = sorted(timestamp for timestamp, _ in capturas)
         por_mes = Counter(f"{timestamp[:4]}-{timestamp[4:6]}" for timestamp in timestamps)
         return Feito(
@@ -134,6 +148,7 @@ class WaybackIndiceNo(NoBase):
                 "ultimo": _iso(timestamps[-1]) if timestamps else None,
                 "total": len(timestamps),
                 "por_mes": dict(por_mes),  # as chaves já saem em ordem: os timestamps estão ordenados
+                "truncado": truncado,
             }
         )
 
@@ -163,8 +178,12 @@ def _subpaginas(capturas: list[tuple[str, str]], limite: int) -> list[tuple[str,
     """Até `limite` páginas de regras do domínio, cada uma pelo snapshot mais recente da lista.
 
     A home fica de fora (é buscada à parte). `PRIORIDADE` olha o caminho e a query, nunca o
-    domínio: em `planofacil.com.br` toda URL casaria com "plano". Empata-se pelas mais rasas e
-    curtas, que costumam ser as páginas principais (`/termos`, `/faq`) e não posts do blog.
+    domínio: em `planofacil.com.br` toda URL casaria com "plano".
+
+    Ordem, que decide quem entra quando há mais candidatas que `limite`: primeiro as páginas sem
+    query (`/termos`, `/faq`), das mais rasas e curtas para as mais fundas; as que dependem de query
+    ficam depois. Dessas, no máximo 1 por caminho (a de captura mais recente): rastreadores de
+    indicação geram uma URL por indicador (`/?indicacao=user1`, `user2`...), todas a mesma página.
     """
     recentes: dict[tuple[str, str, str], tuple[str, str]] = {}
     for captura in capturas:
@@ -178,21 +197,37 @@ def _subpaginas(capturas: list[tuple[str, str]], limite: int) -> list[tuple[str,
             continue
         if chave not in recentes or captura > recentes[chave]:
             recentes[chave] = captura
-    ordem = sorted(recentes, key=lambda c: (c[1].count("/"), len(c[1]), *c))
+
+    por_caminho: dict[tuple[str, str], tuple[str, str, str]] = {}  # host+caminho -> variante de query
+    candidatas = []
+    for chave, captura in recentes.items():
+        host, caminho, query = chave
+        if not query:
+            candidatas.append(chave)
+        elif (host, caminho) not in por_caminho or captura > recentes[por_caminho[(host, caminho)]]:
+            por_caminho[(host, caminho)] = chave
+    candidatas.extend(por_caminho.values())
+
+    ordem = sorted(candidatas, key=lambda c: (bool(c[2]), c[1].count("/"), len(c[1]), *c))
     return [recentes[chave] for chave in ordem[: max(0, limite)]]
 
 
 def _decodificar(resposta: RespostaRede) -> str:
-    """Charset do cabeçalho; sem ele, o do `<meta>` do HTML (sites antigos em ISO-8859-1); senão UTF-8."""
+    """Charset do cabeçalho; sem ele, o do `<meta>` do HTML (sites antigos em ISO-8859-1); senão UTF-8.
+
+    O charset vem do site investigado e pode ser qualquer coisa: o nome que o Python não conhece
+    (`LookupError`) e o codec que não decodifica texto (`idna`, `undefined`: `UnicodeError`) caem no
+    UTF-8 com `replace`, nunca derrubam o nó.
+    """
     if "charset" not in resposta.headers.get("content-type", "").lower():
         achado = _META_CHARSET.search(resposta.conteudo[:_BYTES_PARA_META])
         if achado:
             try:
                 texto = resposta.conteudo.decode(achado.group(1).decode("ascii"), errors="replace")
-            except LookupError:  # charset que o Python não conhece
+            except (LookupError, UnicodeError):
                 pass
             else:
-                return texto.removeprefix("﻿")
+                return texto.removeprefix(_BOM)
     return resposta.texto
 
 
@@ -212,19 +247,27 @@ async def _baixar(s: Servicos, timestamp: str, original: str) -> dict:
     }
 
 
+def _motivo(erro: Exception) -> str:
+    return erro.mensagem if isinstance(erro, ErroNo) else f"{type(erro).__name__}: {erro}"
+
+
 class WaybackSnapshotNo(NoBase):
     """Fonte da página quando não há captura ao vivo utilizável.
 
     Roda se a análise é retroativa, se `modo_contato` é `nenhum`, se a captura não terminou `feito`
     (não há `captura` nas entradas) ou se ela foi bloqueada. Senão: `Pulado("captura ok")`.
-    Busca a página inicial e as subpáginas de regras mais recentes até o `as_of`. A falha de uma
-    subpágina só a tira da saída e vai para `falhas`; a falha da página inicial derruba o nó.
+    Busca a página inicial e as subpáginas de regras mais recentes até o `as_of`.
+
+    Só a falha da página inicial derruba o nó. Tudo o que vem depois dela (a listagem do domínio e
+    cada subpágina, o que inclui erro inesperado ao processar o conteúdo do site) vai para `falhas`
+    e o nó termina `feito` com o que já tem; `url` e `timestamp` são `None` quando a falha é da
+    listagem. `truncado` diz se a listagem de onde saíram as subpáginas estava incompleta.
     """
 
     nome = "wayback_snapshot"
     entradas = ("alvo",)
     opcionais = ("captura",)
-    saidas = ("paginas", "falhas")
+    saidas = ("paginas", "falhas", "truncado")
     as_of = "exato"
 
     async def executar(
@@ -246,13 +289,20 @@ class WaybackSnapshotNo(NoBase):
         # a lista vem em ordem crescente de data; o máximo não depende disso
         paginas = [await _baixar(s, *max(home))]
 
-        falhas = []
+        falhas: list[dict] = []
+        truncado = False
         limite = s.config.captura.max_subpaginas
         if limite > 0:
-            capturas = await _listar_dominio(s, dominio, ctx.as_of)
-            for timestamp, original in _subpaginas(capturas, limite):
-                try:
-                    paginas.append(await _baixar(s, timestamp, original))
-                except ErroNo as erro:
-                    falhas.append({"url": original, "timestamp": timestamp, "motivo": erro.mensagem})
-        return Feito({"paginas": paginas, "falhas": falhas})
+            try:
+                capturas, truncado = await _listar_dominio(s, dominio, ctx.as_of)
+            except ErroNo as erro:
+                falhas.append({"url": None, "timestamp": None, "motivo": erro.mensagem})
+            else:
+                for timestamp, original in _subpaginas(capturas, limite):
+                    try:
+                        paginas.append(await _baixar(s, timestamp, original))
+                    except Exception as erro:  # o HTML é do site investigado: nada dele derruba o nó
+                        falhas.append(
+                            {"url": original, "timestamp": timestamp, "motivo": _motivo(erro)}
+                        )
+        return Feito({"paginas": paginas, "falhas": falhas, "truncado": truncado})

@@ -755,7 +755,7 @@ async def test_nucleo_ponta_a_ponta_em_modo_atual(respx_mock, tmp_path):
     assert ex.saidas["rdap"]["cnpj_titular"] == "33000167000101"
     assert ex.saidas["dns"]["MX"] == ["20 petrobras-com-br.mail.protection.outlook.com."]
     assert ex.saidas["ct"]["total"] == 10
-    assert ex.saidas["wayback_indice"]["total"] == 24
+    assert ex.saidas["wayback_indice"]["total"] == 22
     # 1 RDAP + 5 DoH + 1 crt.sh + 1 CDX do Wayback na custódia, e a cadeia confere
     assert len(log_custodia(ctx.pasta)) == 8
     assert verificar(ctx.pasta) == []

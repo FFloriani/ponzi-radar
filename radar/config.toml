@@ -5,6 +5,7 @@
 ##
 ## O merge é raso por seção: [rede] com só "tentativas" mantém o resto da seção.
 ## Já [rede.limites] substitui o dicionário inteiro (o "*" volta a 1.0 se faltar).
+## [rede.timeouts] soma ao padrão: listar outro host não tira o do Wayback.
 
 ## Onde ficam as execuções. Caminho relativo vale a partir da pasta radar/.
 # casos_dir = "../casos"
@@ -22,6 +23,11 @@
 # "web.archive.org" = 2.0
 # "archive.org" = 2.0
 # "crt.sh" = 3.0
+
+## Timeout, em segundos, por host. O host que não está aqui usa timeout_s.
+## O Wayback é lento: a listagem do CDX de um domínio grande passa de 70 s.
+# [rede.timeouts]
+# "web.archive.org" = 120.0
 
 [captura]
 # max_subpaginas = 10

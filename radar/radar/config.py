@@ -27,6 +27,11 @@ class _Secao(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+def _timeouts_padrao() -> dict[str, float]:
+    # a listagem do CDX de um domínio grande leva mais de 70 s
+    return {"web.archive.org": 120.0}
+
+
 class RedeConfig(_Secao):
     proxy: str | None = None
     ua_navegador: str = UA_NAVEGADOR
@@ -35,11 +40,19 @@ class RedeConfig(_Secao):
     tentativas: int = 4
     # segundos mínimos entre requisições por host; "*" vale para os hosts não listados
     limites: dict[str, float] = Field(default_factory=_limites_padrao)
+    # timeout por host, em segundos; o host que não está aqui usa `timeout_s`
+    timeouts: dict[str, float] = Field(default_factory=_timeouts_padrao)
 
     @field_validator("limites")
     @classmethod
     def _exige_curinga(cls, limites: dict[str, float]) -> dict[str, float]:
         return limites if "*" in limites else {"*": 1.0, **limites}
+
+    @field_validator("timeouts")
+    @classmethod
+    def _soma_ao_padrao(cls, timeouts: dict[str, float]) -> dict[str, float]:
+        # configurar outro host não pode tirar o timeout do Wayback; o valor dele ainda pode ser trocado
+        return {**_timeouts_padrao(), **timeouts}
 
 
 class CapturaConfig(_Secao):
