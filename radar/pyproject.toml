@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "radar-piramides"
+version = "0.1.0"
+description = "Radar de pirâmides financeiras: pipeline de análise passiva de sites e servidor MCP"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx[socks]>=0.28",
+    "playwright>=1.63",
+    "mcp>=2.3,<3",
+    "pydantic>=2.13",
+    "jinja2>=3.1",
+    "pyyaml>=6",
+    "tldextract>=5.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9",
+    "pytest-asyncio>=1.4",
+    "respx>=0.23",
+]
+
+[project.scripts]
+radar = "radar.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["radar*"]
+
+[tool.setuptools.package-data]
+radar = ["matriz.yaml", "dossie/*.j2"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "rede: acessa a internet de verdade (só roda com -m rede)",
+]
+addopts = "-m 'not rede'"

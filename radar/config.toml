@@ -1,0 +1,33 @@
+## Configuração do radar. Tudo aqui está comentado: são os padrões do código.
+## Para mudar um valor, tire o "# " da linha (ou ponha o valor em config.local.toml,
+## que não vai para o repositório e vale por cima deste arquivo).
+## Linhas "## ..." são texto; linhas "# chave = valor" são os padrões.
+##
+## O merge é raso por seção: [rede] com só "tentativas" mantém o resto da seção.
+## Já [rede.limites] substitui o dicionário inteiro (o "*" volta a 1.0 se faltar).
+
+## Onde ficam as execuções. Caminho relativo vale a partir da pasta radar/.
+# casos_dir = "../casos"
+
+[rede]
+## proxy: vazio por padrão. Exemplo (Tor): proxy = "socks5://127.0.0.1:9050"
+# ua_navegador = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+# ua_api = "radar-piramides/0.1 (pesquisa; github.com/FFloriani/piramide-pentest)"
+# timeout_s = 30.0
+# tentativas = 4
+
+## Segundos mínimos entre requisições por host. "*" vale para os hosts não listados.
+# [rede.limites]
+# "*" = 1.0
+# "web.archive.org" = 2.0
+# "archive.org" = 2.0
+# "crt.sh" = 3.0
+
+[captura]
+# max_subpaginas = 10
+# timeout_pagina_s = 30.0
+# networkidle_s = 10.0
+
+[indices]
+## Validade, em horas, dos índices baixados (CVM, BCB).
+# ttl_horas = 24
