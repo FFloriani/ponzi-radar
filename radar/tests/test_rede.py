@@ -1,0 +1,401 @@
+"""Rede (ponto único de saída HTTP) e utilitários de texto (Tarefa 4)."""
+
+from __future__ import annotations
+
+import asyncio
+
+import httpx
+import pytest
+
+import radar.rede as modulo_rede
+from radar.config import RedeConfig
+from radar.rede import ErroRede, Rede, RespostaRede
+from radar.texto import normalizar, texto_de_html
+
+
+def cfg(**kw) -> RedeConfig:
+    return RedeConfig(**kw)
+
+
+async def registrar(esperas: list[float], s: float) -> None:
+    esperas.append(s)
+
+
+async def _nao_dormir(s: float) -> None:
+    return None
+
+
+def rede_sem_espera(**kw) -> Rede:
+    kw.setdefault("limites", {"*": 0})
+    return Rede(cfg(**kw), dormir=_nao_dormir)
+
+
+class Relogio:
+    """Relógio manual: só anda quando o teste manda."""
+
+    def __init__(self, t: float = 100.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+
+# ---------------------------------------------------------------- retry / erros
+
+
+async def test_retry_429_depois_sucesso(respx_mock):
+    rota = respx_mock.get("https://api.x/a").mock(side_effect=[httpx.Response(429), httpx.Response(429), httpx.Response(200, json={"ok": 1})])
+    esperas = []; rede = Rede(cfg(limites={"*": 0}), dormir=lambda s: registrar(esperas, s))
+    assert await rede.get_json("https://api.x/a") == {"ok": 1}
+    assert rota.call_count == 3 and esperas == [1.0, 2.0]
+
+
+async def test_desiste_apos_4_tentativas(respx_mock):
+    rota = respx_mock.get("https://api.x/b").mock(return_value=httpx.Response(503))
+    with pytest.raises(ErroRede) as e: await rede_sem_espera().get("https://api.x/b")
+    assert e.value.permanente is False and rota.call_count == 4
+
+
+async def test_404_permanente(respx_mock):
+    rota = respx_mock.get("https://api.x/c").mock(return_value=httpx.Response(404))
+    with pytest.raises(ErroRede) as e: await rede_sem_espera().get("https://api.x/c")
+    assert e.value.permanente is True and rota.call_count == 1
+
+
+async def test_limite_por_host(respx_mock):  # relógio parado: 2ª requisição espera o limite inteiro
+    respx_mock.get(url__startswith="https://lento.x/").mock(return_value=httpx.Response(200))
+    esperas = []; rede = Rede(cfg(limites={"*": 0, "lento.x": 2.0}), dormir=lambda s: registrar(esperas, s), relogio=lambda: 100.0)
+    await rede.get("https://lento.x/1"); await rede.get("https://lento.x/2")
+    assert esperas == [2.0]
+
+
+async def test_cache(respx_mock):
+    rota = respx_mock.get("https://api.x/d").mock(return_value=httpx.Response(200, text="x"))
+    r = rede_sem_espera(); await r.get("https://api.x/d"); r2 = await r.get("https://api.x/d")
+    assert rota.call_count == 1 and r2.de_cache is True
+
+
+async def test_user_agent_por_tipo(respx_mock):
+    rota = respx_mock.get("https://site.x/").mock(return_value=httpx.Response(200))
+    c = cfg(); await Rede(c).get("https://site.x/", tipo="navegador")
+    assert rota.calls[0].request.headers["user-agent"] == c.ua_navegador
+
+
+def test_normalizar():
+    assert normalizar("  “Rendimento”\n  GARANTIDO, sem riscos ") == normalizar('"rendimento" garantido, sem riscos')
+
+
+def test_texto_de_html_descarta_script():
+    assert texto_de_html("<p>Olá</p><script>var x='lucro'</script><p>mundo</p>").split() == ["Olá", "mundo"]
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 410, 418, 451])
+async def test_status_4xx_e_permanente_sem_nova_tentativa(respx_mock, status):
+    rota = respx_mock.get("https://api.x/p").mock(return_value=httpx.Response(status))
+    with pytest.raises(ErroRede) as e:
+        await rede_sem_espera().get("https://api.x/p")
+    assert e.value.permanente is True and e.value.status == status and rota.call_count == 1
+
+
+async def test_5xx_esgotado_espera_backoff_1_2_4(respx_mock):
+    rota = respx_mock.get("https://api.x/q").mock(return_value=httpx.Response(500))
+    esperas = []; rede = Rede(cfg(limites={"*": 0}), dormir=lambda s: registrar(esperas, s))
+    with pytest.raises(ErroRede) as e:
+        await rede.get("https://api.x/q")
+    assert rota.call_count == 4 and esperas == [1.0, 2.0, 4.0]
+    assert e.value.permanente is False and e.value.status == 500
+
+
+async def test_respeita_numero_de_tentativas_da_config(respx_mock):
+    rota = respx_mock.get("https://api.x/t").mock(return_value=httpx.Response(502))
+    with pytest.raises(ErroRede):
+        await rede_sem_espera(tentativas=2).get("https://api.x/t")
+    assert rota.call_count == 2
+
+
+async def test_retry_after_numerico_tem_prioridade(respx_mock):
+    respx_mock.get("https://api.x/r").mock(side_effect=[httpx.Response(429, headers={"Retry-After": "7"}), httpx.Response(200)])
+    esperas = []; rede = Rede(cfg(limites={"*": 0}), dormir=lambda s: registrar(esperas, s))
+    assert (await rede.get("https://api.x/r")).status == 200
+    assert esperas == [7.0]
+
+
+async def test_retry_after_tem_teto_de_60s(respx_mock):
+    respx_mock.get("https://api.x/r2").mock(side_effect=[httpx.Response(503, headers={"Retry-After": "3600"}), httpx.Response(200)])
+    esperas = []; rede = Rede(cfg(limites={"*": 0}), dormir=lambda s: registrar(esperas, s))
+    await rede.get("https://api.x/r2")
+    assert esperas == [60.0]
+
+
+@pytest.mark.parametrize("valor", ["Wed, 21 Oct 2026 07:28:00 GMT", "abc", "nan", "-5", ""])
+async def test_retry_after_nao_numerico_ou_invalido_cai_no_backoff(respx_mock, valor):
+    respx_mock.get("https://api.x/r3").mock(side_effect=[httpx.Response(429, headers={"Retry-After": valor}), httpx.Response(200)])
+    esperas = []; rede = Rede(cfg(limites={"*": 0}), dormir=lambda s: registrar(esperas, s))
+    await rede.get("https://api.x/r3")
+    assert esperas == [1.0]
+
+
+async def test_erro_de_transporte_tem_nova_tentativa(respx_mock):
+    rota = respx_mock.get("https://api.x/u").mock(side_effect=[httpx.ConnectError("recusou"), httpx.ReadTimeout("lento"), httpx.Response(200, text="ok")])
+    esperas = []; rede = Rede(cfg(limites={"*": 0}), dormir=lambda s: registrar(esperas, s))
+    assert (await rede.get("https://api.x/u")).texto == "ok"
+    assert rota.call_count == 3 and esperas == [1.0, 2.0]
+
+
+async def test_timeout_esgotado_e_transitorio_e_diz_o_motivo(respx_mock):
+    rota = respx_mock.get("https://api.x/v").mock(side_effect=httpx.ReadTimeout("lento"))
+    with pytest.raises(ErroRede) as e:
+        await rede_sem_espera().get("https://api.x/v")
+    assert rota.call_count == 4
+    assert e.value.permanente is False and e.value.status is None
+    assert e.value.url == "https://api.x/v"
+    assert "https://api.x/v" in str(e.value) and "ReadTimeout" in str(e.value)
+
+
+async def test_mensagem_do_erro_traz_url_e_status(respx_mock):
+    respx_mock.get("https://api.x/w").mock(return_value=httpx.Response(403))
+    with pytest.raises(ErroRede) as e:
+        await rede_sem_espera().get("https://api.x/w", params={"q": "1"})
+    assert e.value.url == "https://api.x/w?q=1"
+    assert "https://api.x/w?q=1" in str(e.value) and "403" in str(e.value)
+
+
+async def test_url_sem_protocolo_e_permanente_sem_nova_tentativa():
+    rede = rede_sem_espera()
+    with pytest.raises(ErroRede) as e:
+        await rede.get("site.x/sem-esquema")
+    assert e.value.permanente is True and e.value.status is None
+    await rede.fechar()
+
+
+async def test_get_json_com_corpo_invalido_vira_erro_rede(respx_mock):
+    respx_mock.get("https://api.x/j").mock(return_value=httpx.Response(200, text="<html>nao e json</html>"))
+    with pytest.raises(ErroRede) as e:
+        await rede_sem_espera().get_json("https://api.x/j")
+    assert e.value.permanente is True and e.value.status == 200 and "https://api.x/j" in str(e.value)
+
+
+# ---------------------------------------------------------------- limite por host
+
+
+async def test_limite_desconta_o_tempo_decorrido_desde_o_fim_da_anterior(respx_mock):
+    respx_mock.get(url__startswith="https://lento.x/").mock(return_value=httpx.Response(200))
+    relogio = Relogio(100.0)
+    esperas = []; rede = Rede(cfg(limites={"*": 0, "lento.x": 2.0}), dormir=lambda s: registrar(esperas, s), relogio=relogio)
+    await rede.get("https://lento.x/1")
+    relogio.t = 100.5
+    await rede.get("https://lento.x/2")
+    relogio.t = 103.0  # passou mais que o limite: não espera
+    await rede.get("https://lento.x/3")
+    assert esperas == [1.5]
+
+
+async def test_limite_e_independente_por_host_e_usa_curinga(respx_mock):
+    respx_mock.get(url__regex=r"https://(a|b)\.x/.*").mock(return_value=httpx.Response(200))
+    esperas = []; rede = Rede(cfg(limites={"*": 5.0, "b.x": 0}), dormir=lambda s: registrar(esperas, s), relogio=lambda: 100.0)
+    await rede.get("https://a.x/1")
+    await rede.get("https://b.x/1")  # outro host: não espera pelo a.x
+    await rede.get("https://b.x/2")  # b.x tem limite 0
+    assert esperas == []
+    await rede.get("https://a.x/2")  # a.x cai no "*" de 5 s
+    assert esperas == [5.0]
+
+
+async def test_limite_tambem_vale_entre_tentativas_do_mesmo_host(respx_mock):
+    respx_mock.get("https://api.x/l").mock(side_effect=[httpx.Response(503), httpx.Response(200)])
+    esperas = []; rede = Rede(cfg(limites={"*": 3.0}), dormir=lambda s: registrar(esperas, s), relogio=lambda: 100.0)
+    await rede.get("https://api.x/l")
+    # relógio parado: o backoff (1 s) vem primeiro e a 2ª tentativa ainda espera o limite inteiro do host
+    assert esperas == [1.0, 3.0]
+
+
+async def test_requisicoes_concorrentes_ao_mesmo_host_sao_serializadas(respx_mock):
+    respx_mock.get(url__startswith="https://lento.x/").mock(return_value=httpx.Response(200))
+    esperas = []; rede = Rede(cfg(limites={"*": 0, "lento.x": 2.0}), dormir=lambda s: registrar(esperas, s), relogio=lambda: 100.0)
+    await asyncio.gather(*(rede.get(f"https://lento.x/{i}") for i in range(3)))
+    assert esperas == [2.0, 2.0]  # sem a trava por host, as três saíam juntas e ninguém esperava
+
+
+# ---------------------------------------------------------------- cache
+
+
+async def test_cache_por_params_ordenados(respx_mock):
+    rota = respx_mock.get("https://api.x/e").mock(return_value=httpx.Response(200, text="x"))
+    r = rede_sem_espera()
+    a = await r.get("https://api.x/e", params={"a": "1", "b": "2"})
+    b = await r.get("https://api.x/e", params={"b": "2", "a": "1"})
+    assert rota.call_count == 1 and a.de_cache is False and b.de_cache is True
+    await r.get("https://api.x/e", params={"a": "9"})
+    assert rota.call_count == 2
+
+
+async def test_cache_nunca_guarda_erro(respx_mock):
+    rota = respx_mock.get("https://api.x/f").mock(side_effect=[httpx.Response(503), httpx.Response(200, text="voltou")])
+    r = rede_sem_espera(tentativas=1)
+    with pytest.raises(ErroRede):
+        await r.get("https://api.x/f")
+    resposta = await r.get("https://api.x/f")
+    assert resposta.texto == "voltou" and resposta.de_cache is False and rota.call_count == 2
+
+
+async def test_cache_e_por_instancia(respx_mock):
+    rota = respx_mock.get("https://api.x/g").mock(return_value=httpx.Response(200))
+    await rede_sem_espera().get("https://api.x/g")
+    await rede_sem_espera().get("https://api.x/g")
+    assert rota.call_count == 2
+
+
+async def test_cache_distingue_tipo_e_redirect(respx_mock):
+    rota = respx_mock.get("https://site.x/h").mock(return_value=httpx.Response(200))
+    r = rede_sem_espera()
+    await r.get("https://site.x/h")
+    await r.get("https://site.x/h", tipo="navegador")
+    await r.get("https://site.x/h", seguir_redirect=False)
+    assert rota.call_count == 3
+    assert (await r.get("https://site.x/h", tipo="navegador")).de_cache is True
+
+
+# ---------------------------------------------------------------- requisição
+
+
+async def test_headers_do_chamador_vao_junto_e_ua_api_e_o_padrao(respx_mock):
+    rota = respx_mock.get("https://api.x/i").mock(return_value=httpx.Response(200))
+    c = cfg(limites={"*": 0})
+    await Rede(c).get("https://api.x/i", headers={"Accept": "application/json"})
+    enviados = rota.calls[0].request.headers
+    assert enviados["accept"] == "application/json" and enviados["user-agent"] == c.ua_api
+
+
+async def test_params_vao_na_query(respx_mock):
+    rota = respx_mock.get("https://api.x/k").mock(return_value=httpx.Response(200))
+    await rede_sem_espera().get("https://api.x/k", params={"q": "a b", "n": 2})
+    assert rota.calls[0].request.url.params["q"] == "a b" and rota.calls[0].request.url.params["n"] == "2"
+
+
+async def test_segue_redirect_por_padrao(respx_mock):
+    respx_mock.get("https://api.x/o").mock(return_value=httpx.Response(301, headers={"Location": "https://api.x/novo"}))
+    respx_mock.get("https://api.x/novo").mock(return_value=httpx.Response(200, text="fim"))
+    r = await rede_sem_espera().get("https://api.x/o")
+    assert r.status == 200 and r.url == "https://api.x/novo" and r.texto == "fim"
+
+
+async def test_nao_segue_redirect_quando_pedido(respx_mock):
+    respx_mock.get("https://api.x/o2").mock(return_value=httpx.Response(301, headers={"Location": "https://api.x/novo2"}))
+    r = await rede_sem_espera().get("https://api.x/o2", seguir_redirect=False)
+    assert r.status == 301 and r.headers["location"] == "https://api.x/novo2"
+
+
+async def test_tipo_desconhecido_e_erro_de_programacao():
+    rede = rede_sem_espera()
+    with pytest.raises(ValueError, match="Navegador"):
+        await rede.get("https://site.x/", tipo="Navegador")
+    await rede.fechar()
+
+
+async def test_proxy_e_timeout_vao_para_o_cliente_httpx(monkeypatch):
+    recebidos = {}
+    original = httpx.AsyncClient
+
+    def espiao(*args, **kwargs):
+        recebidos.update(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(modulo_rede.httpx, "AsyncClient", espiao)
+    rede = Rede(cfg(proxy="socks5://127.0.0.1:9050", timeout_s=12.0))
+    assert recebidos["proxy"] == "socks5://127.0.0.1:9050" and recebidos["timeout"] == 12.0
+    await rede.fechar()
+
+
+async def test_sem_proxy_nao_configura_proxy(monkeypatch):
+    recebidos = {}
+    original = httpx.AsyncClient
+
+    def espiao(*args, **kwargs):
+        recebidos.update(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(modulo_rede.httpx, "AsyncClient", espiao)
+    await Rede(cfg()).fechar()
+    assert recebidos.get("proxy") is None
+
+
+# ---------------------------------------------------------------- RespostaRede
+
+
+def _resp(conteudo: bytes, content_type: str | None = None) -> RespostaRede:
+    headers = {} if content_type is None else {"content-type": content_type}
+    return RespostaRede(status=200, url="https://x/", conteudo=conteudo, headers=headers, de_cache=False)
+
+
+def test_texto_usa_o_charset_do_content_type():
+    assert _resp("ação".encode("latin-1"), "text/html; charset=ISO-8859-1").texto == "ação"
+    assert _resp("ação".encode("utf-16"), 'text/plain; charset="utf-16"').texto == "ação"
+
+
+def test_texto_sem_charset_e_utf8_com_replace():
+    assert _resp("ação".encode("utf-8")).texto == "ação"
+    assert _resp(b"ok \xff fim", "text/html").texto == "ok � fim"
+
+
+def test_texto_com_charset_desconhecido_cai_em_utf8():
+    assert _resp("ação".encode("utf-8"), "text/html; charset=nao-existe").texto == "ação"
+
+
+def test_texto_acha_content_type_em_qualquer_caixa():
+    r = RespostaRede(status=200, url="u", conteudo="ação".encode("latin-1"), headers={"Content-Type": "text/html; charset=latin-1"}, de_cache=False)
+    assert r.texto == "ação"
+
+
+def test_json_da_resposta():
+    assert _resp(b'{"a": [1, 2]}', "application/json").json() == {"a": [1, 2]}
+    assert _resp(b"\xef\xbb\xbf" + b'{"a": 1}').json() == {"a": 1}  # BOM
+
+
+async def test_resposta_expoe_status_url_headers_minusculos(respx_mock):
+    respx_mock.get("https://api.x/m").mock(return_value=httpx.Response(200, text="oi", headers={"X-Teste": "1", "Content-Type": "text/plain; charset=utf-8"}))
+    r = await rede_sem_espera().get("https://api.x/m")
+    assert (r.status, r.url, r.conteudo, r.de_cache) == (200, "https://api.x/m", b"oi", False)
+    assert r.headers["x-teste"] == "1" and isinstance(r.headers, dict)
+
+
+# ---------------------------------------------------------------- texto.py
+
+
+def test_normalizar_tira_acento_caixa_e_espaco():
+    assert normalizar("  AÇÃO   Lucrativa \tgarantida\n") == "acao lucrativa garantida"
+
+
+def test_normalizar_aspas_tipograficas():
+    assert normalizar("‘a’ “b” „c“") == "'a' \"b\" \"c\""
+    assert normalizar("D’Água") == "d'agua"
+
+
+def test_normalizar_vazio_e_so_espaco():
+    assert normalizar("") == "" and normalizar(" \n\t ") == ""
+
+
+def test_normalizar_nfkd_e_idempotente():
+    assert normalizar("ﬁnanças ①") == "financas 1"
+    assert normalizar(normalizar("  “Ação”  ")) == normalizar("  “Ação”  ")
+
+
+def test_texto_de_html_blocos_viram_linhas_e_inline_continua_na_linha():
+    html = "<h1>Título</h1><p>Ganhe <b>10%</b> ao dia!</p><ul><li>um</li><li>dois</li></ul>linha<br>quebrada"
+    assert texto_de_html(html) == "Título\nGanhe 10% ao dia!\num\ndois\nlinha\nquebrada"
+
+
+def test_texto_de_html_descarta_style_noscript_template_e_comentarios():
+    html = (
+        "<style>.a{color:red}</style><noscript>ative o JS</noscript><template><p>molde</p></template>"
+        "<!-- escondido --><p>visível</p><script>if (a < b) { x = '</p>'; }</script>"
+    )
+    assert texto_de_html(html) == "visível"
+
+
+def test_texto_de_html_entidades_e_espacos():
+    assert texto_de_html("<p>  R$ 1.000 &amp;\n  mais&nbsp;tudo  </p>") == "R$ 1.000 & mais tudo"
+
+
+def test_texto_de_html_tolera_html_quebrado_e_vazio():
+    assert texto_de_html("") == ""
+    assert texto_de_html("<div><p>aberto<div>outro") == "aberto\noutro"
