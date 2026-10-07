@@ -1,0 +1,9 @@
+[["timestamp", "original"],
+["20020120142510", "http://example.com:80/"],
+["20190520193341", "http://www.example.com/"],
+["20190605231754", "https://www.example.com/"],
+["20190606142504", "http://www.example.com/"],
+["20190606180019", "http://example.com/"],
+["20190606205643", "http://Emily@example.com/"],
+["20190606212959", "http://www.example.com:80/"],
+["20190606235936", "http://www.example.com/"]]

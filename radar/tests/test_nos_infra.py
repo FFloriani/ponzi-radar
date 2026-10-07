@@ -30,12 +30,14 @@ from radar.nos.alvo import AlvoNo, normalizar_alvo
 from radar.nos.ct import CtNo
 from radar.nos.dns import DnsNo
 from radar.nos.rdap import RdapNo
+from radar.nos.wayback import WaybackIndiceNo
 from radar.rede import Rede
 
 FIXTURES = Path(__file__).parent / "fixtures" / "api"
 URL_RDAP_BR = "https://rdap.registro.br/domain/petrobras.com.br"
 URL_DOH = "https://cloudflare-dns.com/dns-query"
 URL_CRTSH = "https://crt.sh/"
+URL_CDX = "https://web.archive.org/cdx/search/cdx"
 AGORA = datetime(2026, 10, 7, 12, 0, 0)
 
 
@@ -701,12 +703,17 @@ async def test_carregar_execucao_aponta_para_a_pasta_atual(tmp_path):
 
 def test_nos_do_nucleo():
     nos = nos_do_nucleo()
-    assert [type(n) for n in nos] == [AlvoNo, RdapNo, DnsNo, CtNo]
-    assert [n.nome for n in nos] == ["alvo", "rdap", "dns", "ct"]
+    assert [type(n) for n in nos] == [AlvoNo, RdapNo, DnsNo, CtNo, WaybackIndiceNo]
+    assert [n.nome for n in nos] == ["alvo", "rdap", "dns", "ct", "wayback_indice"]
     assert nos is not nos_do_nucleo()  # lista nova a cada chamada
 
 
+def _mocar_wayback(respx_mock) -> None:
+    respx_mock.get(URL_CDX).mock(return_value=httpx.Response(200, json=fixture("cdx_dominio")))
+
+
 def _mocar_apis(respx_mock, *, com_dns: bool) -> None:
+    _mocar_wayback(respx_mock)
     respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(200, json=fixture("rdap_registrobr_petrobras")))
     respx_mock.get(URL_CRTSH, params={"q": "petrobras.com.br", "output": "json"}).mock(
         return_value=httpx.Response(200, json=fixture("crtsh"))
@@ -739,37 +746,46 @@ async def _rodar_nucleo(tmp_path, as_of: date | None) -> tuple[Contexto, Motor]:
 async def test_nucleo_ponta_a_ponta_em_modo_atual(respx_mock, tmp_path):
     _mocar_apis(respx_mock, com_dns=True)
     ctx, motor = await _rodar_nucleo(tmp_path, None)
-    assert motor.status() == {"alvo": "feito", "rdap": "feito", "dns": "feito", "ct": "feito"}
+    assert motor.status() == {
+        "alvo": "feito", "rdap": "feito", "dns": "feito", "ct": "feito", "wayback_indice": "feito"
+    }
 
     ex = carregar_execucao(ctx.pasta)
     assert ex.saidas["alvo"]["dominio"] == "petrobras.com.br"
     assert ex.saidas["rdap"]["cnpj_titular"] == "33000167000101"
     assert ex.saidas["dns"]["MX"] == ["20 petrobras-com-br.mail.protection.outlook.com."]
     assert ex.saidas["ct"]["total"] == 10
-    # 1 RDAP + 5 DoH + 1 crt.sh na custódia, e a cadeia confere
-    assert len(log_custodia(ctx.pasta)) == 7
+    assert ex.saidas["wayback_indice"]["total"] == 24
+    # 1 RDAP + 5 DoH + 1 crt.sh + 1 CDX do Wayback na custódia, e a cadeia confere
+    assert len(log_custodia(ctx.pasta)) == 8
     assert verificar(ctx.pasta) == []
 
 
 async def test_nucleo_retroativo_pula_dns_e_esconde_o_titular(respx_mock, tmp_path):
     _mocar_apis(respx_mock, com_dns=False)
     ctx, motor = await _rodar_nucleo(tmp_path, date(2019, 6, 6))
-    assert motor.status() == {"alvo": "feito", "rdap": "feito", "dns": "pulado", "ct": "feito"}
+    assert motor.status() == {
+        "alvo": "feito", "rdap": "feito", "dns": "pulado", "ct": "feito", "wayback_indice": "feito"
+    }
 
     ex = carregar_execucao(ctx.pasta)
     assert ex.status["dns"] == {"status": "pulado", "motivo": "só atual"}
     assert ex.saidas["rdap"]["cnpj_titular"] is None
     assert ex.saidas["rdap"]["vazamento_temporal"] == ["cnpj_titular"]
     assert ex.saidas["ct"]["total"] == 6
+    assert ex.saidas["wayback_indice"]["primeiro"] == "2002-01-20"
     assert "dns" not in ex.saidas
 
 
 async def test_nucleo_dns_servfail_deixa_o_no_em_erro_e_sem_saidas(respx_mock, tmp_path):
     respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(200, json=fixture("rdap_registrobr_petrobras")))
     respx_mock.get(URL_CRTSH).mock(return_value=httpx.Response(200, json=fixture("crtsh")))
+    _mocar_wayback(respx_mock)
     _rota_doh(respx_mock, dict.fromkeys(("A", "AAAA", "MX", "NS", "TXT"), _doh(2, 1)))
     ctx, motor = await _rodar_nucleo(tmp_path, None)
-    assert motor.status() == {"alvo": "feito", "rdap": "feito", "dns": "erro", "ct": "feito"}
+    assert motor.status() == {
+        "alvo": "feito", "rdap": "feito", "dns": "erro", "ct": "feito", "wayback_indice": "feito"
+    }
     ex = carregar_execucao(ctx.pasta)
     assert "Status 2 (SERVFAIL)" in ex.status["dns"]["motivo"]
     assert "dns" not in ex.saidas  # nada de `nxdomain=False` com cara de dado coletado
@@ -778,9 +794,12 @@ async def test_nucleo_dns_servfail_deixa_o_no_em_erro_e_sem_saidas(respx_mock, t
 async def test_nucleo_rdap_em_erro_nao_derruba_dns_e_ct(respx_mock, tmp_path):
     respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(404))
     respx_mock.get(URL_CRTSH).mock(return_value=httpx.Response(200, json=fixture("crtsh")))
+    _mocar_wayback(respx_mock)
     _rota_doh(respx_mock, dict.fromkeys(("A", "AAAA", "MX", "NS", "TXT"), fixture("doh_nxdomain")))
     ctx, motor = await _rodar_nucleo(tmp_path, None)
-    assert motor.status() == {"alvo": "feito", "rdap": "erro", "dns": "feito", "ct": "feito"}
+    assert motor.status() == {
+        "alvo": "feito", "rdap": "erro", "dns": "feito", "ct": "feito", "wayback_indice": "feito"
+    }
     ex = carregar_execucao(ctx.pasta)
     assert "404" in ex.status["rdap"]["motivo"]
     assert ex.saidas["dns"]["nxdomain"] is True
