@@ -1,0 +1,107 @@
+{
+  "objectClassName": "domain",
+  "handle": "petrobras.com.br",
+  "ldhName": "petrobras.com.br",
+  "nameservers": [
+    {
+      "objectClassName": "nameserver",
+      "ldhName": "ns-187.awsdns-23.com"
+    },
+    {
+      "objectClassName": "nameserver",
+      "ldhName": "ns-1611.awsdns-09.co.uk"
+    },
+    {
+      "objectClassName": "nameserver",
+      "ldhName": "ns-1151.awsdns-15.org"
+    },
+    {
+      "objectClassName": "nameserver",
+      "ldhName": "ns-828.awsdns-39.net"
+    }
+  ],
+  "entities": [
+    {
+      "objectClassName": "entity",
+      "handle": "33000167000101",
+      "vcardArray": [
+        "vcard",
+        [
+          [
+            "version",
+            {},
+            "text",
+            "4.0"
+          ],
+          [
+            "kind",
+            {},
+            "text",
+            "org"
+          ],
+          [
+            "fn",
+            {},
+            "text",
+            "PETROLEO BRASILEIRO S.A. - PETROBRAS"
+          ],
+          [
+            "adr",
+            {},
+            "text",
+            [
+              "",
+              "",
+              "",
+              "",
+              "",
+              "",
+              "BR"
+            ]
+          ]
+        ]
+      ],
+      "roles": [
+        "registrant"
+      ],
+      "publicIds": [
+        {
+          "type": "cnpj",
+          "identifier": "33.000.167/0001-01"
+        }
+      ],
+      "events": [
+        {
+          "eventAction": "registration",
+          "eventDate": "1998-01-12T12:00:00Z"
+        },
+        {
+          "eventAction": "last changed",
+          "eventDate": "2025-09-15T17:59:49Z"
+        }
+      ]
+    }
+  ],
+  "events": [
+    {
+      "eventAction": "registration",
+      "eventDate": "1996-06-14T12:00:00Z"
+    },
+    {
+      "eventAction": "last changed",
+      "eventDate": "2025-07-11T14:35:30Z"
+    },
+    {
+      "eventAction": "expiration",
+      "eventDate": "2030-06-14T12:00:00Z"
+    }
+  ],
+  "status": [
+    "active"
+  ],
+  "rdapConformance": [
+    "rdap_level_0",
+    "nicbr_level_0"
+  ],
+  "port43": "whois.registro.br"
+}

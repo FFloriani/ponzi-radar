@@ -1,0 +1,22 @@
+{
+  "Status": 0,
+  "TC": false,
+  "RD": true,
+  "RA": true,
+  "AD": true,
+  "CD": false,
+  "Question": [
+    {
+      "name": "petrobras.com.br",
+      "type": 15
+    }
+  ],
+  "Answer": [
+    {
+      "name": "petrobras.com.br",
+      "type": 15,
+      "TTL": 516,
+      "data": "20 petrobras-com-br.mail.protection.outlook.com."
+    }
+  ]
+}

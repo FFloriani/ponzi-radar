@@ -1,0 +1,22 @@
+{
+  "Status": 3,
+  "TC": false,
+  "RD": true,
+  "RA": true,
+  "AD": false,
+  "CD": false,
+  "Question": [
+    {
+      "name": "radar-inexistente-9f3a1c7e.com.br",
+      "type": 1
+    }
+  ],
+  "Authority": [
+    {
+      "name": "com.br",
+      "type": 6,
+      "TTL": 900,
+      "data": "a.dns.br. hostmaster.registro.br. 2026280490 1800 900 604800 900"
+    }
+  ]
+}

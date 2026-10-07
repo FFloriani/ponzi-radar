@@ -1,0 +1,112 @@
+[
+  {
+    "issuer_ca_id": 39,
+    "issuer_name": "O=VeriSign Trust Network, OU=\"VeriSign, Inc.\", OU=VeriSign International Server CA - Class 3, OU=www.verisign.com/CPS Incorp.by Ref. LIABILITY LTD.(c)97 VeriSign",
+    "common_name": "cotacoes.petrobras.com.br",
+    "name_value": "cotacoes.petrobras.com.br",
+    "id": 33477939,
+    "not_before": "2004-02-17T00:00:00",
+    "not_after": "2005-02-16T23:59:59",
+    "serial_number": "66596b5cf71048a93875ea27dd9291be",
+    "result_count": 1
+  },
+  {
+    "issuer_ca_id": 1254,
+    "issuer_name": "C=BR, O=Serasa, OU=Serasa Autoridade Certificadora Global, CN=SerasaACGlobal",
+    "common_name": "www2.petrobras.com.br",
+    "name_value": "www2.petrobras.com.br",
+    "id": 2370653152,
+    "not_before": "2006-09-28T14:19:19",
+    "not_after": "2007-09-28T14:19:19",
+    "serial_number": "08a1abf7040574c9",
+    "result_count": 1
+  },
+  {
+    "issuer_ca_id": 1254,
+    "issuer_name": "C=BR, O=Serasa, OU=Serasa Autoridade Certificadora Global, CN=SerasaACGlobal",
+    "common_name": "www2.petrobras.com.br",
+    "name_value": "www2.petrobras.com.br",
+    "id": 2370650276,
+    "not_before": "2006-09-28T14:23:17",
+    "not_after": "2007-09-28T14:23:17",
+    "serial_number": "39cdc6e79613f2b5",
+    "result_count": 1
+  },
+  {
+    "issuer_ca_id": 904,
+    "issuer_name": "C=US, ST=Arizona, L=Scottsdale, O=\"GoDaddy.com, Inc.\", OU=http://certs.godaddy.com/repository/, CN=Go Daddy Secure Certificate Authority - G2",
+    "common_name": "comunidadecientifica.petrobras.com.br",
+    "name_value": "comunidadecientifica.petrobras.com.br\nwww.comunidadecientifica.petrobras.com.br",
+    "id": 1090627174,
+    "not_before": "2019-01-08T01:48:11",
+    "not_after": "2020-01-08T01:48:11",
+    "serial_number": "0812edf3a1e6781b",
+    "result_count": 3
+  },
+  {
+    "issuer_ca_id": 1191,
+    "issuer_name": "C=US, O=DigiCert Inc, CN=DigiCert SHA2 Secure Server CA",
+    "common_name": "vc.petrobras.com.br",
+    "name_value": "cma-mobile.petrobras.com.br\nrpad.petrobras.com.br\nvc.petrobras.com.br",
+    "id": 1316417246,
+    "not_before": "2019-03-25T00:00:00",
+    "not_after": "2020-03-25T12:00:00",
+    "serial_number": "0b77ed9e86d7554019e484f0d4ebeae0",
+    "result_count": 4
+  },
+  {
+    "issuer_ca_id": 1191,
+    "issuer_name": "C=US, O=DigiCert Inc, CN=DigiCert SHA2 Secure Server CA",
+    "common_name": "panm.petrobras.com.br",
+    "name_value": "panm-dsv.petrobras.com.br\npanm.petrobras.com.br",
+    "id": 1548422327,
+    "not_before": "2019-06-06T00:00:00",
+    "not_after": "2020-06-06T12:00:00",
+    "serial_number": "076dd07c75d15d655af1f16fceef1509",
+    "result_count": 3
+  },
+  {
+    "issuer_ca_id": 183267,
+    "issuer_name": "C=US, O=Let's Encrypt, CN=R3",
+    "common_name": "*.petrobras.com.br",
+    "name_value": "*.petrobras.com.br",
+    "id": 9613031640,
+    "not_before": "2023-06-09T20:05:00",
+    "not_after": "2023-09-07T20:04:59",
+    "serial_number": "0443694a585521355bca976a4cb2d5a5d701",
+    "result_count": 2
+  },
+  {
+    "issuer_ca_id": 179900,
+    "issuer_name": "C=BE, O=GlobalSign nv-sa, CN=GlobalSign GCC R3 DV TLS CA 2020",
+    "common_name": "*.petrobras.com.br",
+    "name_value": "*.petrobras.com.br\npetrobras.com.br",
+    "id": 10947610287,
+    "not_before": "2023-10-30T18:33:42",
+    "not_after": "2024-11-30T18:33:41",
+    "serial_number": "6c8efdf16b617171294d7b26",
+    "result_count": 3
+  },
+  {
+    "issuer_ca_id": 62137,
+    "issuer_name": "C=US, O=DigiCert Inc, OU=www.digicert.com, CN=RapidSSL TLS RSA CA G1",
+    "common_name": "*.petrobras.com.br",
+    "name_value": "*.petrobras.com.br\npetrobras.com.br",
+    "id": 15421870940,
+    "not_before": "2024-11-19T00:00:00",
+    "not_after": "2025-11-18T23:59:59",
+    "serial_number": "0a4b88ef9e8c5d6b868c38e7b993900d",
+    "result_count": 3
+  },
+  {
+    "issuer_ca_id": 295815,
+    "issuer_name": "C=US, O=Let's Encrypt, CN=R11",
+    "common_name": "aprendi.petrobras.com.br",
+    "name_value": "aprendi.petrobras.com.br",
+    "id": 15930980412,
+    "not_before": "2024-12-29T18:26:29",
+    "not_after": "2025-03-29T18:26:28",
+    "serial_number": "040a8b763dea4b440073f15184e73ce40c55",
+    "result_count": 2
+  }
+]
