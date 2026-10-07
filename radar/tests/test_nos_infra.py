@@ -27,10 +27,11 @@ from radar.modelos import Aguardando, Contexto, ErroNo, Evidencia, Feito, Penden
 from radar.motor import Motor, NoBase, Servicos
 from radar.nos import nos_do_nucleo
 from radar.nos.alvo import AlvoNo, normalizar_alvo
+from radar.nos.captura import CapturaNo
 from radar.nos.ct import CtNo
 from radar.nos.dns import DnsNo
 from radar.nos.rdap import RdapNo
-from radar.nos.wayback import WaybackIndiceNo
+from radar.nos.wayback import WaybackIndiceNo, WaybackSnapshotNo
 from radar.rede import Rede
 
 FIXTURES = Path(__file__).parent / "fixtures" / "api"
@@ -38,6 +39,7 @@ URL_RDAP_BR = "https://rdap.registro.br/domain/petrobras.com.br"
 URL_DOH = "https://cloudflare-dns.com/dns-query"
 URL_CRTSH = "https://crt.sh/"
 URL_CDX = "https://web.archive.org/cdx/search/cdx"
+URL_SNAPSHOTS = "https://web.archive.org/web/"
 AGORA = datetime(2026, 10, 7, 12, 0, 0)
 
 
@@ -703,13 +705,26 @@ async def test_carregar_execucao_aponta_para_a_pasta_atual(tmp_path):
 
 def test_nos_do_nucleo():
     nos = nos_do_nucleo()
-    assert [type(n) for n in nos] == [AlvoNo, RdapNo, DnsNo, CtNo, WaybackIndiceNo]
-    assert [n.nome for n in nos] == ["alvo", "rdap", "dns", "ct", "wayback_indice"]
+    assert [type(n) for n in nos] == [AlvoNo, RdapNo, DnsNo, CtNo, WaybackIndiceNo, CapturaNo, WaybackSnapshotNo]
+    assert [n.nome for n in nos] == [
+        "alvo", "rdap", "dns", "ct", "wayback_indice", "captura", "wayback_snapshot"
+    ]
     assert nos is not nos_do_nucleo()  # lista nova a cada chamada
 
 
+def _cdx(request: httpx.Request) -> httpx.Response:
+    # a listagem do domínio (índice e subpáginas) tem `matchType`; a consulta da home não
+    corpo = fixture("cdx_dominio" if "matchType" in request.url.params else "cdx_home")
+    return httpx.Response(200, json=corpo)
+
+
 def _mocar_wayback(respx_mock) -> None:
-    respx_mock.get(URL_CDX).mock(return_value=httpx.Response(200, json=fixture("cdx_dominio")))
+    respx_mock.get(URL_CDX).mock(side_effect=_cdx)
+    respx_mock.get(url__startswith=URL_SNAPSHOTS).mock(
+        return_value=httpx.Response(
+            200, content=(FIXTURES / "snapshot_home.html").read_bytes(), headers={"content-type": "text/html; charset=UTF-8"}
+        )
+    )
 
 
 def _mocar_apis(respx_mock, *, com_dns: bool) -> None:
@@ -732,7 +747,8 @@ def _mocar_apis(respx_mock, *, com_dns: bool) -> None:
 
 
 async def _rodar_nucleo(tmp_path, as_of: date | None) -> tuple[Contexto, Motor]:
-    ctx = criar_contexto("https://www.petrobras.com.br/", as_of, "captura", False, tmp_path, AGORA)
+    # modo_contato="nenhum": a `captura` fica pulada e o teste nunca abre o navegador
+    ctx = criar_contexto("https://www.petrobras.com.br/", as_of, "nenhum", False, tmp_path, AGORA)
     config = Config(rede=RedeConfig(limites={"*": 0}))
     rede = Rede(config.rede, dormir=_nao_dormir)
     try:
@@ -747,17 +763,22 @@ async def test_nucleo_ponta_a_ponta_em_modo_atual(respx_mock, tmp_path):
     _mocar_apis(respx_mock, com_dns=True)
     ctx, motor = await _rodar_nucleo(tmp_path, None)
     assert motor.status() == {
-        "alvo": "feito", "rdap": "feito", "dns": "feito", "ct": "feito", "wayback_indice": "feito"
+        "alvo": "feito", "rdap": "feito", "dns": "feito", "ct": "feito", "wayback_indice": "feito",
+        "captura": "pulado", "wayback_snapshot": "feito",
     }
 
     ex = carregar_execucao(ctx.pasta)
+    assert ex.status["captura"] == {"status": "pulado", "motivo": "modo_contato=nenhum"}
+    assert "captura" not in ex.saidas
+    # sem captura ao vivo, a página vem do Wayback (a home do CDX mockado)
+    assert [p["url"] for p in ex.saidas["wayback_snapshot"]["paginas"]] == ["http://www.example.com/"]
     assert ex.saidas["alvo"]["dominio"] == "petrobras.com.br"
     assert ex.saidas["rdap"]["cnpj_titular"] == "33000167000101"
     assert ex.saidas["dns"]["MX"] == ["20 petrobras-com-br.mail.protection.outlook.com."]
     assert ex.saidas["ct"]["total"] == 10
     assert ex.saidas["wayback_indice"]["total"] == 22
-    # 1 RDAP + 5 DoH + 1 crt.sh + 1 CDX do Wayback na custódia, e a cadeia confere
-    assert len(log_custodia(ctx.pasta)) == 8
+    # 1 RDAP + 5 DoH + 1 crt.sh + 2 CDX do Wayback (domínio e home) + snapshot da home (HTML e texto)
+    assert len(log_custodia(ctx.pasta)) == 12
     assert verificar(ctx.pasta) == []
 
 
@@ -765,11 +786,13 @@ async def test_nucleo_retroativo_pula_dns_e_esconde_o_titular(respx_mock, tmp_pa
     _mocar_apis(respx_mock, com_dns=False)
     ctx, motor = await _rodar_nucleo(tmp_path, date(2019, 6, 6))
     assert motor.status() == {
-        "alvo": "feito", "rdap": "feito", "dns": "pulado", "ct": "feito", "wayback_indice": "feito"
+        "alvo": "feito", "rdap": "feito", "dns": "pulado", "ct": "feito", "wayback_indice": "feito",
+        "captura": "pulado", "wayback_snapshot": "feito",
     }
 
     ex = carregar_execucao(ctx.pasta)
     assert ex.status["dns"] == {"status": "pulado", "motivo": "só atual"}
+    assert ex.status["captura"] == {"status": "pulado", "motivo": "só atual"}
     assert ex.saidas["rdap"]["cnpj_titular"] is None
     assert ex.saidas["rdap"]["vazamento_temporal"] == ["cnpj_titular"]
     assert ex.saidas["ct"]["total"] == 6
@@ -784,7 +807,8 @@ async def test_nucleo_dns_servfail_deixa_o_no_em_erro_e_sem_saidas(respx_mock, t
     _rota_doh(respx_mock, dict.fromkeys(("A", "AAAA", "MX", "NS", "TXT"), _doh(2, 1)))
     ctx, motor = await _rodar_nucleo(tmp_path, None)
     assert motor.status() == {
-        "alvo": "feito", "rdap": "feito", "dns": "erro", "ct": "feito", "wayback_indice": "feito"
+        "alvo": "feito", "rdap": "feito", "dns": "erro", "ct": "feito", "wayback_indice": "feito",
+        "captura": "pulado", "wayback_snapshot": "feito",
     }
     ex = carregar_execucao(ctx.pasta)
     assert "Status 2 (SERVFAIL)" in ex.status["dns"]["motivo"]
@@ -798,7 +822,8 @@ async def test_nucleo_rdap_em_erro_nao_derruba_dns_e_ct(respx_mock, tmp_path):
     _rota_doh(respx_mock, dict.fromkeys(("A", "AAAA", "MX", "NS", "TXT"), fixture("doh_nxdomain")))
     ctx, motor = await _rodar_nucleo(tmp_path, None)
     assert motor.status() == {
-        "alvo": "feito", "rdap": "erro", "dns": "feito", "ct": "feito", "wayback_indice": "feito"
+        "alvo": "feito", "rdap": "erro", "dns": "feito", "ct": "feito", "wayback_indice": "feito",
+        "captura": "pulado", "wayback_snapshot": "feito",
     }
     ex = carregar_execucao(ctx.pasta)
     assert "404" in ex.status["rdap"]["motivo"]

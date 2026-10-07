@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <title>InvestMax App</title>
+</head>
+<body>
+  <div id="app"></div>
+  <script>
+    // o texto da página só existe depois deste fetch: o HTML cru não o contém
+    fetch("spa.json")
+      .then(function (resposta) { return resposta.json(); })
+      .then(function (dados) { document.getElementById("app").textContent = dados.texto; });
+  </script>
+</body>
+</html>

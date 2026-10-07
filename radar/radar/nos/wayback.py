@@ -6,18 +6,21 @@ import re
 from collections import Counter
 from datetime import date
 from typing import Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode
 
 from radar.modelos import Contexto, ErroNo, Feito, Pulado
 from radar.motor import NoBase, Servicos
 from radar.nos._api import buscar_json
+# a definição de PRIORIDADE mora em _paginas (a captura usa a mesma política); daqui ela continua importável
+from radar.nos._paginas import (  # noqa: F401
+    PRIORIDADE,
+    Chave,
+    casa_prioridade,
+    chave_da_pagina,
+    ordenar_paginas,
+)
 from radar.rede import ErroRede, RespostaRede
 from radar.texto import texto_de_html
-
-# páginas de regras (termos, planos, saque, indicação...): a Tarefa 8 também importa esta constante
-PRIORIDADE = re.compile(
-    r"termos|contrato|plano|faq|como-funciona|saque|indica|rentab|sobre|quem-somos", re.IGNORECASE
-)
 
 _BASE = "https://web.archive.org"
 _CDX = f"{_BASE}/cdx/search/cdx"
@@ -153,22 +156,6 @@ class WaybackIndiceNo(NoBase):
         )
 
 
-def _chave(original: str) -> tuple[str, str, str] | None:
-    """`(host, caminho, query)` que identifica a página.
-
-    Esquema, `www.`, porta, usuário e `/` final não distinguem: `http://x.com:80/faq`,
-    `https://www.x.com/faq/` e `http://x.com/faq` são a mesma página.
-    """
-    try:
-        partes = urlsplit(original)
-    except ValueError:
-        return None
-    host = (partes.hostname or "").removeprefix("www.")
-    if not host:
-        return None
-    return host, partes.path.rstrip("/"), partes.query
-
-
 def _parece_pagina(caminho: str) -> bool:
     _, ponto, extensao = caminho.rpartition("/")[2].rpartition(".")
     return not ponto or extensao.lower() in _EXTENSOES_DE_PAGINA
@@ -177,38 +164,21 @@ def _parece_pagina(caminho: str) -> bool:
 def _subpaginas(capturas: list[tuple[str, str]], limite: int) -> list[tuple[str, str]]:
     """Até `limite` páginas de regras do domínio, cada uma pelo snapshot mais recente da lista.
 
-    A home fica de fora (é buscada à parte). `PRIORIDADE` olha o caminho e a query, nunca o
-    domínio: em `planofacil.com.br` toda URL casaria com "plano".
-
-    Ordem, que decide quem entra quando há mais candidatas que `limite`: primeiro as páginas sem
-    query (`/termos`, `/faq`), das mais rasas e curtas para as mais fundas; as que dependem de query
-    ficam depois. Dessas, no máximo 1 por caminho (a de captura mais recente): rastreadores de
-    indicação geram uma URL por indicador (`/?indicacao=user1`, `user2`...), todas a mesma página.
+    A home fica de fora (é buscada à parte), assim como o que não é página e o que não casa com
+    `PRIORIDADE`. A ordem de leitura e o corte de variantes de query são os de `ordenar_paginas`;
+    entre variantes iguais vale a de captura mais recente.
     """
-    recentes: dict[tuple[str, str, str], tuple[str, str]] = {}
+    recentes: dict[Chave, tuple[str, str]] = {}
     for captura in capturas:
-        chave = _chave(captura[1])
+        chave = chave_da_pagina(captura[1])
         if chave is None:
             continue
         _, caminho, query = chave
-        if not (caminho or query) or not _parece_pagina(caminho):
-            continue
-        if not PRIORIDADE.search(f"{caminho}?{query}" if query else caminho):
+        if not (caminho or query) or not _parece_pagina(caminho) or not casa_prioridade(chave):
             continue
         if chave not in recentes or captura > recentes[chave]:
             recentes[chave] = captura
-
-    por_caminho: dict[tuple[str, str], tuple[str, str, str]] = {}  # host+caminho -> variante de query
-    candidatas = []
-    for chave, captura in recentes.items():
-        host, caminho, query = chave
-        if not query:
-            candidatas.append(chave)
-        elif (host, caminho) not in por_caminho or captura > recentes[por_caminho[(host, caminho)]]:
-            por_caminho[(host, caminho)] = chave
-    candidatas.extend(por_caminho.values())
-
-    ordem = sorted(candidatas, key=lambda c: (bool(c[2]), c[1].count("/"), len(c[1]), *c))
+    ordem = ordenar_paginas(recentes, desempate=lambda captura: captura)
     return [recentes[chave] for chave in ordem[: max(0, limite)]]
 
 

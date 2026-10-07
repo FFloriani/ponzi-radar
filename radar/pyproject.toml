@@ -38,5 +38,6 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "rede: acessa a internet de verdade (só roda com -m rede)",
+    "lento: abre o Chromium de verdade, só contra localhost (roda na suíte padrão; pule com -m 'not rede and not lento')",
 ]
 addopts = "-m 'not rede'"

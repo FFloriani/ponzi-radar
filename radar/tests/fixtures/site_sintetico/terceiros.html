@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <title>Página com rastreador</title>
+</head>
+<body>
+  <p>Página que carrega um recurso de outro domínio.</p>
+  <script>
+    // "localhost" é outro host que "127.0.0.1", e a porta vem da própria URL da página
+    var pixel = new Image();
+    pixel.src = "http://localhost:" + location.port + "/pixel.gif";
+  </script>
+</body>
+</html>

@@ -4,13 +4,22 @@ from __future__ import annotations
 
 from radar.motor import NoBase
 from radar.nos.alvo import AlvoNo
+from radar.nos.captura import CapturaNo
 from radar.nos.ct import CtNo
 from radar.nos.dns import DnsNo
 from radar.nos.rdap import RdapNo
-from radar.nos.wayback import WaybackIndiceNo
+from radar.nos.wayback import WaybackIndiceNo, WaybackSnapshotNo
 
 
-# `WaybackSnapshotNo` não entra aqui: declara `captura` como opcional e o motor recusa dependência
-# inexistente. Ele entra na Tarefa 8, junto com a `CapturaNo`.
+# `WaybackSnapshotNo` declara `captura` como opcional e o motor recusa dependência inexistente: os
+# dois entram juntos, a captura antes do snapshot.
 def nos_do_nucleo() -> list[NoBase]:
-    return [AlvoNo(), RdapNo(), DnsNo(), CtNo(), WaybackIndiceNo()]
+    return [
+        AlvoNo(),
+        RdapNo(),
+        DnsNo(),
+        CtNo(),
+        WaybackIndiceNo(),
+        CapturaNo(),
+        WaybackSnapshotNo(),
+    ]

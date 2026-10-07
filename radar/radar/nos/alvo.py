@@ -19,6 +19,15 @@ _ROTULO = r"[a-z0-9_](?:[a-z0-9_-]*[a-z0-9_])?"
 _DOMINIO = re.compile(rf"(?:{_ROTULO}\.)+{_ROTULO}")
 
 
+def dominio_registravel(host: str) -> str:
+    """Domínio registrável de `host` (`cdn.exemplo.com.br` → `exemplo.com.br`), em minúsculas.
+
+    Usa a lista de sufixos embutida, sem rede. IP, `localhost` e sufixo desconhecido não têm
+    domínio registrável: devolve `""`.
+    """
+    return _PSL(host).top_domain_under_public_suffix.lower()
+
+
 def _invalido(entrada: str, motivo: str) -> ErroNo:
     return ErroNo(f"alvo inválido ({motivo}): {entrada!r}", permanente=True)
 
@@ -51,7 +60,7 @@ def normalizar_alvo(entrada: str) -> tuple[str, str, str]:
         host = host.encode("idna").decode("ascii")
     except UnicodeError as e:
         raise _invalido(entrada, f"host inválido: {e}") from e
-    dominio = _PSL(host).top_domain_under_public_suffix.lower()
+    dominio = dominio_registravel(host)
     if not _DOMINIO.fullmatch(dominio):
         raise _invalido(entrada, "sem domínio registrável")
     return dominio, dominio.replace(".", "-"), urlunsplit(partes._replace(fragment=""))

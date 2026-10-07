@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <title>Painel ao vivo</title>
+</head>
+<body>
+  <p>Cotações atualizadas a cada instante, a rede nunca fica ociosa nesta página.</p>
+  <script>
+    // uma requisição a cada 100 ms: o "networkidle" (500 ms sem rede) nunca chega
+    setInterval(function () { fetch("spa.json?t=" + Date.now()); }, 100);
+  </script>
+</body>
+</html>
