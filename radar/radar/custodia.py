@@ -45,6 +45,18 @@ def _ler_linhas(log: Path) -> list[str]:
         return [linha.removesuffix("\n") for linha in f]
 
 
+def _entrada_da_linha(linha: str, posicao: int, para: str) -> str:
+    """O campo `entrada` da linha do log. A linha que não é um objeto JSON com `entrada` em texto levanta
+    `ValueError`."""
+    try:
+        entrada = json.loads(linha)["entrada"]
+        if not isinstance(entrada, str):
+            raise TypeError("entrada não é texto")
+    except (ValueError, KeyError, TypeError) as e:
+        raise ValueError(f"custodia.log ilegível na linha {posicao}: não dá para {para}") from e
+    return entrada
+
+
 def _arquivos_do_hash(artefatos: Path, hex_: str) -> list[Path]:
     # o nome é `<hex>.<ext>`; temporários da gravação começam com "." e não casam
     return sorted(artefatos.glob(f"{hex_}.*"))
@@ -136,16 +148,7 @@ class Custodia:
         linhas = _ler_linhas(self._log)
         if not linhas:
             return 0, _ZEROS
-        try:
-            ultima = json.loads(linhas[-1])
-            prev = ultima["entrada"]
-            if not isinstance(prev, str):
-                raise TypeError("entrada não é texto")
-        except (ValueError, KeyError, TypeError) as e:
-            raise ValueError(
-                f"custodia.log ilegível na linha {len(linhas) - 1}: não dá para continuar a cadeia"
-            ) from e
-        return len(linhas), prev
+        return len(linhas), _entrada_da_linha(linhas[-1], len(linhas) - 1, "continuar a cadeia")
 
 
 def _registro_integro(registro: Any, posicao: int, prev_esperado: str | None) -> bool:
@@ -209,3 +212,35 @@ def verificar(pasta: Path) -> list[str]:
             if problema:
                 problemas.append(problema)
     return problemas
+
+
+def hash_final(pasta: Path) -> str | None:
+    """O hash que fecha a cadeia: a `entrada` da última linha do `custodia.log`.
+
+    `None` se o log não existe ou está vazio. A última linha ilegível levanta `ValueError`, como `guardar`: sem ela
+    não há hash final para afirmar.
+    """
+    log = Path(pasta) / "custodia.log"
+    if not log.exists():
+        return None
+    linhas = _ler_linhas(log)
+    if not linhas:
+        return None
+    return _entrada_da_linha(linhas[-1], len(linhas) - 1, "ler o hash final")
+
+
+def registros(pasta: Path) -> list[dict[str, Any]]:
+    """Os registros do `custodia.log` que são objetos JSON, na ordem do log. A linha ilegível é ignorada: quem a
+    acusa é `verificar`."""
+    log = Path(pasta) / "custodia.log"
+    if not log.exists():
+        return []
+    achados: list[dict[str, Any]] = []
+    for linha in _ler_linhas(log):
+        try:
+            registro = json.loads(linha)
+        except ValueError:
+            continue
+        if isinstance(registro, dict):
+            achados.append(registro)
+    return achados

@@ -1,0 +1,233 @@
+# Dossiê de risco: {{ cab.alvo|md }}
+
+## 1. Identificação
+
+- **Alvo:** {{ cab.alvo|md }} ({{ cab.url_inicial|cod }})
+- **Execução:** {{ cab.data_execucao }} ({{ cab.run_id|cod }})
+- **as_of:** {{ cab.as_of }}{{ " (execução retroativa: o que o site e as fontes mostravam nessa data)" if cab.retroativo else "" }}
+- **Modo de contato:** {{ cab.modo_contato }}
+- **Modo cego:** {{ cab.modo_cego }}
+- **Matriz:** versão {{ cab.matriz_versao|md }}, hash {{ cab.matriz_hash|cod }}
+- **Hash final da custódia:** {{ cab.hash_custodia|cod if cab.hash_custodia else "sem registros na custódia" }}
+
+## 2. Veredito
+
+> Heurística não validada: os pesos ainda não foram calibrados.
+
+{% if v.forcadas %}
+> ⚠ Dossiê gerado com pendências abertas (forçado): {{ v.forcadas|map("md")|join(", ") }}. Os itens delas valem como não verificados.
+
+{% endif %}
+### Eixo 1: probabilidade de pirâmide ou Ponzi
+
+- **Escore:** {{ v.intervalo }}. É um intervalo: o item não verificado entra com 0 no mínimo e com o máximo dele no máximo.
+- **Classe:** {{ v.classe|md }}
+- **Regras de corte disparadas:** {{ v.regras_disparadas|map("md")|join("; ") if v.regras_disparadas else "nenhuma" }}
+{% for regra in v.regras_pendentes %}
+- **Regra pendente:** {{ regra|md }}
+{% endfor %}
+
+### Eixo 2: estágio do ciclo de vida
+
+{% if v.estagio %}
+- **Estágio:** {{ v.estagio|md }}
+- **Sinal que o define:** {{ v.sinal.tipo|md }}, {{ v.sinal.data }}, fonte {{ v.sinal.tipo_fonte|md }}{{ (" " ~ (v.sinal.fonte|cod)) if v.sinal.fonte else "" }}
+- **Janela observada:** {{ v.janela|md }}
+{% else %}
+- **Estágio:** sem estágio (nenhum sinal confirmado)
+{% endif %}
+{% if v.modificadores %}
+- **Modificadores:**
+{% for m in v.modificadores %}
+  - {{ m.id|md }}: {{ m.direcao }} (origem {{ m.origem|md }}){{ (" — " ~ (m.fonte|cod)) if m.fonte else "" }}
+{% endfor %}
+{% else %}
+- **Modificadores:** nenhum
+{% endif %}
+
+Não há previsão numérica de tempo até a calibração (subprojeto 3). A janela descreve o que se observou em casos anteriores; não é uma previsão para este.
+
+## 3. Itens da matriz
+
+O item `não verificado` ou `inconclusivo` aparece como intervalo de pontos (de 0 ao máximo dele) e nunca como zero. Só o item confirmado traz evidências. A coluna Hash mostra o começo do hash do artefato; o hash inteiro está no anexo (seção 9).
+
+| Item | Estado | Pontos | Origem | Marcas | Trecho | Fonte | Hash | Nota |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+{% for l in itens %}
+| {{ l.item|md }} | {{ l.estado }} | {{ l.pontos }} | {{ l.origem }} | {{ l.marcas|map("cod")|join(", ") if l.marcas else l.sem_marcas }} | {{ l.trecho|md(160) }} | {{ (l.meta|md ~ " — " ~ (l.fonte|cod)) if l.fonte else "" }} | {{ l.hash|cod }} | {{ l.nota|md }} |
+{% endfor %}
+
+## 4. Linha do tempo
+
+{% if tempo %}
+| Data | Evento | Fonte |
+| --- | --- | --- |
+{% for e in tempo %}
+| {{ e.data }} | {{ e.evento|md }} | {{ e.fonte|md }}{{ (" " ~ (e.url|cod)) if e.url else "" }} |
+{% endfor %}
+{% else %}
+Nenhum evento datado.
+{% endif %}
+
+## 5. Empresa e pessoas
+
+{% if emp.situacao == "ok" %}
+{% for c in emp.campos %}
+- **{{ c.rotulo }}:** {{ c.valor|md }}{{ " (dado de hoje)" if c.hoje else "" }}
+{% endfor %}
+
+**Sócios (quadro da Receita)**{{ " (dado de hoje)" if emp.socios_hoje else "" }}
+
+{% if emp.socios %}
+| Nome | Qualificação | Entrada |
+| --- | --- | --- |
+{% for s in emp.socios %}
+| {{ s.nome|md }} | {{ s.qualificacao|md }} | {{ s.entrada|md }} |
+{% endfor %}
+{% else %}
+Quadro de sócios vazio ou não informado.
+{% endif %}
+{% elif emp.situacao == "sem_cnpj" %}
+CNPJ não identificado{{ (": " ~ (emp.motivo|md)) if emp.motivo else "" }}.
+{% else %}
+Dados da empresa indisponíveis: {{ emp.motivo|md }}.
+{% endif %}
+
+{% if pessoas %}
+**Pessoas ligadas a esquemas (P-D1)**
+
+{% for p in pessoas %}
+- {{ p.nome|md }}: {{ p.vinculo|md }}
+{% endfor %}
+
+{% endif %}
+**Registros oficiais**
+
+{% if oficiais.motivo %}
+- {{ oficiais.motivo|md }}
+{% else %}
+{% for r in oficiais.linhas %}
+- **{{ r.rotulo }}:** {{ r.valor|md }}{{ " (dado de hoje)" if r.hoje else "" }}
+{% endfor %}
+{% if oficiais.nota %}
+- {{ oficiais.nota|md }}
+{% endif %}
+{% endif %}
+
+## 6. Infraestrutura
+
+### Domínio (RDAP)
+
+{% if infra.rdap %}
+- **Registro:** {{ (infra.rdap.get("registro") or "—")|md }}
+- **Expiração:** {{ (infra.rdap.get("expiracao") or "—")|md }}
+- **Registrador:** {{ infra.rdap.get("registrador")|md or "—" }}
+{% else %}
+- {{ infra.rdap_falta|md }}
+{% endif %}
+
+### DNS e hospedagem
+
+{% if infra.dns %}
+- **Hospedagem (A e AAAA):** {{ infra.hospedagem|join(", ")|md or "—" }}
+- **MX:** {{ infra.mx|join("; ")|md or "—" }}
+- **NS:** {{ infra.ns|join(", ")|md or "—" }}
+- **Domínio inexistente (NXDOMAIN):** {{ "sim" if infra.dns.get("nxdomain") else "não" }}
+{% else %}
+- {{ infra.dns_falta|md }}
+{% endif %}
+
+### Certificados (crt.sh)
+
+{% if infra.ct %}
+- **Primeiro certificado:** {{ (infra.ct.get("primeiro_certificado") or "—")|md }}
+- **Certificados até o as_of:** {{ infra.ct.get("total", 0)|md }}
+- **Nomes nos certificados:** {{ infra.sans|join(", ")|md or "—" }}{{ (" (+" ~ infra.sans_a_mais ~ " outros)") if infra.sans_a_mais else "" }}
+{% else %}
+- {{ infra.ct_falta|md }}
+{% endif %}
+
+### Wayback
+
+{% if infra.wayback %}
+- **Primeiro snapshot:** {{ (infra.wayback.get("primeiro") or "—")|md }}
+- **Último snapshot:** {{ (infra.wayback.get("ultimo") or "—")|md }}
+- **Capturas HTML:** {{ infra.wayback.get("total", 0)|md }}{{ " (listagem truncada)" if infra.wayback.get("truncado") else "" }}
+- **Meses com captura:** {{ infra.meses.quantidade }}{{ (" (de " ~ (infra.meses.primeiro|md) ~ " a " ~ (infra.meses.ultimo|md) ~ ")") if infra.meses.quantidade else "" }}
+{% else %}
+- {{ infra.wayback_falta|md }}
+{% endif %}
+
+### Captura do site
+
+{% if infra.captura %}
+- **Bloqueada por verificação anti-bot:** {{ "sim" if infra.captura.get("bloqueada") else "não" }}
+- **Páginas capturadas:** {{ infra.paginas|length + infra.paginas_a_mais }}
+{% for p in infra.paginas %}
+  - {{ p.url|cod }} (HTTP {{ p.status|md }})
+{% endfor %}
+{% if infra.paginas_a_mais %}
+  - (+{{ infra.paginas_a_mais }} outras)
+{% endif %}
+- **Domínios de terceiros carregados:** {{ infra.terceiros|join(", ")|md or "nenhum" }}{{ (" (+" ~ infra.terceiros_a_mais ~ " outros)") if infra.terceiros_a_mais else "" }}
+{% else %}
+- {{ infra.captura_falta|md }}
+{% endif %}
+
+## 7. Lacunas
+
+O que não pôde ser verificado nunca vale zero: abre o intervalo do escore (seção 2).
+
+**Nós sem resultado**
+
+{% if lacunas.nos %}
+{% for n in lacunas.nos %}
+- `{{ n.no }}` — {{ n.status|md }}{{ (": " ~ (n.motivo|md)) if n.motivo else "" }}
+{% endfor %}
+{% else %}
+Todos os nós terminaram.
+{% endif %}
+
+**Itens em aberto**
+
+{% if lacunas.itens %}
+{% for i in lacunas.itens %}
+- {{ i.id|md }} — {{ i.estado }}{{ (": " ~ (i.nota|md)) if i.nota else "" }}{{ (" (para resolver: " ~ (i.resolve|md) ~ ")") if i.resolve else "" }}
+{% endfor %}
+{% else %}
+Nenhum.
+{% endif %}
+{% if lacunas.fontes %}
+
+**Cobertura das fontes**
+
+{% for f in lacunas.fontes %}
+- {{ f|md }}
+{% endfor %}
+{% endif %}
+
+## 8. Mudanças desde a execução anterior
+
+{% if mud.anterior %}
+Comparado com a execução anterior {{ mud.anterior|cod }} (as_of {{ mud.as_of }}). As duas foram pontuadas de novo com a matriz atual, a partir dos julgamentos guardados.
+
+{{ mud.texto|trim }}
+{% else %}
+{{ mud.motivo }}
+{% endif %}
+
+## 9. Anexo: artefatos e verificação
+
+Hash final da cadeia: {{ cab.hash_custodia|cod if cab.hash_custodia else "sem registros na custódia" }}
+
+{% if artefatos %}
+| Seq | Tipo | Origem | Hash |
+| --- | --- | --- | --- |
+{% for a in artefatos %}
+| {{ a.seq }} | {{ a.tipos|md }} | {{ a.origem|cod }}{{ (" (+" ~ a.outras ~ " origens)") if a.outras else "" }} | {{ a.hash|cod }} |
+{% endfor %}
+{% else %}
+Nenhum artefato registrado na custódia.
+{% endif %}
+
+Para refazer a cadeia e conferir o hash de cada arquivo: {{ ("radar verificar " ~ cab.run_id)|cod }}

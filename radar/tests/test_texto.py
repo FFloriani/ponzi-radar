@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from radar import texto as modulo
-from radar.texto import decodificar, normalizar, texto_de_pdf
+from radar.texto import codigo_md, decodificar, escapar_md, normalizar, texto_de_pdf
 
 FIXTURES_CVM = Path(__file__).parent / "fixtures" / "cvm"
 PDF_509 = (FIXTURES_CVM / "deli509.pdf").read_bytes()
@@ -121,3 +121,50 @@ def test_texto_de_pdf_sanea_substituto_solto(monkeypatch):
     texto.encode("utf-8")  # não levanta UnicodeEncodeError
     assert "substituto solto" in texto
     assert "\ud800" not in texto
+
+
+# --- escapar_md e codigo_md (T15: o dossiê em Markdown) ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "entrada,saida",
+    [
+        ("a | b", r"a \| b"),
+        ("linha 1\nlinha 2\r\nlinha 3\N{LINE SEPARATOR}linha 4", "linha 1 linha 2 linha 3 linha 4"),
+        ("  muitos   espaços\t aqui ", "muitos espaços aqui"),
+        ("<b>x</b> & y", r"\<b\>x\</b\> \& y"),
+        ("[a](http://x)", r"\[a\](http://x)"),
+        ("*a* _b_ `c` ~d~ # e", r"\*a\* \_b\_ \`c\` \~d\~ \# e"),
+        # o sublinhado entre letras ou dígitos é de identificador e fica; o solto vira texto
+        ("atraso_pagamento a_b_c ação_x 1_2", "atraso_pagamento a_b_c ação_x 1_2"),
+        ("_x x_ __y__ (_z)", r"\_x x\_ \_\_y\_\_ (\_z)"),
+        ("barra \\ invertida", "barra \\\\ invertida"),
+        ("CPF 123.456.789-09 e CNPJ 12.345.678/0001-95", "CPF (CPF omitido) e CNPJ 12.345.678/0001-95"),
+        ("cpf: 12345678909 e fone 11987654321", "(CPF omitido) e fone 11987654321"),
+        (
+            "sem\x00controle\x07 e\N{RIGHT-TO-LEFT OVERRIDE}bidi\N{LEFT-TO-RIGHT ISOLATE} e\N{ZERO WIDTH SPACE}sp",
+            "semcontrole ebidi esp",
+        ),
+        (None, ""),
+        (3, "3"),
+    ],
+)
+def test_escapar_md(entrada, saida):
+    assert escapar_md(entrada) == saida
+
+
+def test_escapar_md_corta_depois_de_mascarar_o_cpf():
+    assert escapar_md("x" * 300, 160) == "x" * 159 + "…"
+    assert escapar_md("curto", 160) == "curto"
+    # o CPF que cairia no corte não sobra pela metade
+    texto = "a" * 150 + " CPF 123.456.789-09"
+    assert "123." not in escapar_md(texto, 160) and "(CPF omitido)" in escapar_md(texto, 200)
+
+
+def test_codigo_md_para_celula_de_tabela():
+    assert codigo_md("https://x.example/a_b*c") == "`https://x.example/a_b*c`"
+    assert codigo_md("a|b") == "`a\\|b`"
+    assert codigo_md("com `crase`") == "`` com `crase` ``"
+    assert codigo_md("duas ``crases`` aqui") == "```duas ``crases`` aqui```"
+    assert codigo_md("a\nb\N{LINE SEPARATOR}c") == "`a b c`"
+    assert codigo_md("") == "" and codigo_md(None) == ""

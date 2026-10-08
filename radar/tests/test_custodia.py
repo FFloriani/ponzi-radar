@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from radar.custodia import Custodia, verificar
+from radar.custodia import Custodia, hash_final, registros, verificar
 
 ABC = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 ZEROS = "0" * 64
@@ -303,3 +303,48 @@ def test_tipos_ignora_linha_ilegivel(tmp_path):
 def test_tipos_recusa_ref_invalida(tmp_path):
     with pytest.raises(ValueError):
         Custodia(tmp_path).tipos("../etc/passwd")
+
+
+# ---------------------------------------------------------------------------- hash_final e registros (Tarefa 15)
+
+
+def test_hash_final_e_a_entrada_da_ultima_linha(tmp_path):
+    c = Custodia(tmp_path)
+    c.guardar(b"abc", "txt", "pagina", "a")
+    c.guardar(b"x", "txt", "pagina", "b")
+    ultima = json.loads(_linhas(tmp_path)[-1])
+    assert hash_final(tmp_path) == ultima["entrada"]
+    assert hash_final(tmp_path) != json.loads(_linhas(tmp_path)[0])["entrada"]
+
+
+def test_hash_final_sem_log_ou_com_log_vazio_e_none(tmp_path):
+    assert hash_final(tmp_path / "nada") is None
+    assert hash_final(tmp_path) is None
+    (tmp_path / "custodia.log").write_bytes(b"")
+    assert hash_final(tmp_path) is None
+
+
+def test_hash_final_com_separador_unicode_no_registro(tmp_path):
+    """U+2028 e U+0085 crus na última linha não podem parti-la: só o LF separa registros."""
+    c = Custodia(tmp_path)
+    c.guardar(b"abc", "txt", "pagina", "a")
+    c.guardar(b"x", "txt", "pagina", "titulo\N{LINE SEPARATOR}com\u0085separadores")
+    assert hash_final(tmp_path) == json.loads(_linhas(tmp_path)[-1])["entrada"]
+
+
+def test_hash_final_recusa_ultima_linha_ilegivel(tmp_path):
+    Custodia(tmp_path).guardar(b"abc", "txt", "pagina", "a")
+    with (tmp_path / "custodia.log").open("a", encoding="utf-8", newline="\n") as f:
+        f.write("isto nao e json\n")
+    with pytest.raises(ValueError, match="custodia.log"):
+        hash_final(tmp_path)
+
+
+def test_registros_na_ordem_do_log_sem_as_linhas_ilegiveis(tmp_path):
+    c = Custodia(tmp_path)
+    c.guardar(b"abc", "txt", "pagina", "a\N{LINE SEPARATOR}b")
+    with (tmp_path / "custodia.log").open("a", encoding="utf-8", newline="\n") as f:
+        f.write("isto nao e json\n[1, 2]\n")
+    registros_ = registros(tmp_path)
+    assert [(r["seq"], r["tipo"], r["origem"], r["sha256"]) for r in registros_] == [(0, "pagina", "a\N{LINE SEPARATOR}b", ABC)]
+    assert registros(tmp_path / "nada") == []

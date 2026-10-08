@@ -1,4 +1,5 @@
-"""Texto visível de HTML, normalização para comparar trechos e nomes, decodificação de bytes e texto de PDF."""
+"""Texto visível de HTML, normalização para comparar trechos e nomes, decodificação de bytes, texto de PDF e escape
+para Markdown."""
 
 from __future__ import annotations
 
@@ -127,3 +128,56 @@ def texto_de_pdf(dados: bytes) -> str:
         return ""
     texto = "\n\n".join(parte for parte in partes if parte).encode("utf-8", "replace").decode("utf-8")
     return texto if len(" ".join(texto.split())) >= _MIN_CARACTERES_PDF else ""
+
+
+# ---------------------------------------------------------------------------- Markdown
+
+# caracteres que o Markdown lê como formatação, link, HTML ou título: com `\` antes, valem como texto
+_ESPECIAIS_MD = re.compile(r"([\\|`*\[\]<>&#~])")
+# o sublinhado entre letras ou dígitos (`atraso_pagamento`, `a_b.html`) não vira ênfase: fica como está
+_SUBLINHADO_SOLTO = re.compile(r"(?<![^\W_])_|_(?![^\W_])")
+# controles (a quebra de linha e o tab viram espaço), marcas de direção e largura zero: um trecho do site não
+# reordena nem esconde texto no dossiê
+_INVISIVEIS_MD = dict.fromkeys(
+    (*range(0x00, 0x09), *range(0x0E, 0x1C), 0x7F, *range(0x200B, 0x2010), *range(0x202A, 0x202F),
+     *range(0x2066, 0x206A), 0xFEFF)
+)  # fmt: skip
+# CPF formatado, ou 11 dígitos logo depois do rótulo "CPF": nenhuma saída do radar grava CPF
+_CPF = re.compile(
+    r"(?<!\d)\d{3}\.\d{3}\.\d{3}\s?-\s?\d{2}(?!\d)|\bCPF\b[^\d\n]{0,4}\d{11}(?!\d)", re.IGNORECASE
+)
+_SEQUENCIA_DE_CRASES = re.compile(r"`+")
+_CPF_OMITIDO = "(CPF omitido)"
+
+
+def _em_uma_linha(valor: object) -> str:
+    """O texto sem invisíveis, com qualquer quebra ou espaço repetido virando um espaço e o CPF mascarado."""
+    texto = "" if valor is None else str(valor)
+    return _CPF.sub(_CPF_OMITIDO, " ".join(texto.translate(_INVISIVEIS_MD).split()))
+
+
+def escapar_md(valor: object, limite: int | None = None) -> str:
+    """`valor` como texto literal numa linha ou célula de Markdown.
+
+    Sem quebra de linha, com `\\` antes de cada caractere de formatação (o `|` não abre célula, `<script>` e
+    `[a](url)` não viram HTML nem link) e sem CPF. `limite`: o máximo de caracteres do texto, cortado com `…`
+    (depois de mascarar o CPF, antes do escape). `None` vira `""`.
+    """
+    texto = _em_uma_linha(valor)
+    if limite is not None and len(texto) > limite:
+        texto = texto[: limite - 1].rstrip() + "…"
+    return _SUBLINHADO_SOLTO.sub(r"\\_", _ESPECIAIS_MD.sub(r"\\\1", texto))
+
+
+def codigo_md(valor: object) -> str:
+    """`valor` como trecho de código numa célula de tabela: URLs e hashes ficam sem escape e sem link.
+
+    O `|` leva `\\` (a tabela o remove) e a cerca é mais longa que qualquer sequência de crases do texto.
+    Texto vazio dá `""`.
+    """
+    texto = _em_uma_linha(valor).replace("|", "\\|")
+    if not texto:
+        return ""
+    cerca = "`" * (max((len(m) for m in _SEQUENCIA_DE_CRASES.findall(texto)), default=0) + 1)
+    margem = " " if texto.startswith("`") or texto.endswith("`") else ""
+    return f"{cerca}{margem}{texto}{margem}{cerca}"
