@@ -242,6 +242,15 @@ def listar_casos(casos_dir: Path) -> dict[str, list[str]]:
     return casos
 
 
+def _alvo_gravado(pasta: Path) -> str | None:
+    """O `contexto.alvo` do `estado.json` da execução. Ausente ou ilegível → `None`."""
+    try:
+        alvo = ler_json(pasta / "estado.json")["contexto"]["alvo"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return alvo if isinstance(alvo, str) else None
+
+
 def em_modo_atual(pasta: Path) -> bool:
     """O `as_of` do `estado.json` é o dia da execução. Estado ausente ou ilegível → não."""
     try:
@@ -257,13 +266,15 @@ def em_modo_atual(pasta: Path) -> bool:
 def execucao_anterior(pasta: Path) -> Path | None:
     """A execução mais recente do mesmo alvo que veio antes de `pasta` e foi feita em modo atual.
 
-    Execuções retroativas e pastas sem `estado.json` legível não servem de base de comparação.
+    O mesmo alvo é o mesmo `contexto.alvo`, não só a mesma pasta: `exemplo-com.br` e `exemplo.com.br` dividem o
+    slug. Execuções retroativas e pastas sem `estado.json` legível não servem de base de comparação; sem o
+    `estado.json` legível de `pasta`, o alvo dela não é conhecido e não há anterior.
     """
     pasta = Path(pasta)
-    if not pasta.parent.is_dir():
+    if not pasta.parent.is_dir() or (alvo := _alvo_gravado(pasta)) is None:
         return None
     for irma in reversed(_execucoes(pasta.parent)):
-        if irma.name < pasta.name and em_modo_atual(irma):
+        if irma.name < pasta.name and em_modo_atual(irma) and _alvo_gravado(irma) == alvo:
             return irma
     return None
 
@@ -287,14 +298,17 @@ def escolher_execucoes(casos_dir: Path, alvo: str, a: str | None, b: str | None)
     nem `b`: as duas últimas em modo atual; só `b`: a anterior a ela em modo atual; só `a`: a última em modo atual
     depois dela. Levanta `ErroComparacao` se o alvo é inválido ou não tem execução, se a execução pedida não existe,
     se não há par para comparar ou se alguma das duas foi feita no modo cego (o diff não passa pela máscara).
+
+    O par é sempre do mesmo `contexto.alvo` (dois domínios podem dividir o slug): pelo domínio, valem as execuções
+    dele; pelo slug, as do alvo da execução mais nova em modo atual; `a` e `b` de alvos diferentes são recusados.
     """
     casos = listar_casos(casos_dir)
     try:
-        slug = normalizar_alvo(alvo)[1]
+        dominio, slug, _ = normalizar_alvo(alvo)
     except ErroNo:
         if alvo not in casos:  # o slug, como `listar_casos` mostra, também vale
             raise ErroComparacao("alvo inválido") from None
-        slug = alvo
+        dominio, slug = None, alvo
     if PADRAO_SLUG_CEGO.fullmatch(slug):
         raise ErroComparacao("indisponível no modo cego")
     if slug not in casos:
@@ -309,30 +323,45 @@ def escolher_execucoes(casos_dir: Path, alvo: str, a: str | None, b: str | None)
         if not _TIMESTAMP.fullmatch(carimbo) or carimbo not in carimbos:
             raise ErroComparacao(f"execução não encontrada: {valor}")
         escolhidas.append(carimbo)
-    anterior, atual = _par(Path(casos_dir) / slug, carimbos, *escolhidas)
+    anterior, atual = _par(Path(casos_dir) / slug, carimbos, dominio, *escolhidas)
     if execucao_cega(Path(casos_dir) / slug / anterior) or execucao_cega(Path(casos_dir) / slug / atual):
         raise ErroComparacao("indisponível no modo cego")
     return f"{slug}/{anterior}", f"{slug}/{atual}"
 
 
-def _par(pasta_do_alvo: Path, carimbos: list[str], a: str | None, b: str | None) -> tuple[str, str]:
-    """Os dois carimbos a comparar, o mais antigo primeiro (ver `escolher_execucoes`)."""
+def _par(
+    pasta_do_alvo: Path, carimbos: list[str], dominio: str | None, a: str | None, b: str | None
+) -> tuple[str, str]:
+    """Os dois carimbos a comparar, o mais antigo primeiro (ver `escolher_execucoes`). `dominio`: o alvo pedido
+    (`None` quando veio o slug)."""
     slug = pasta_do_alvo.name
+
+    def alvo(carimbo: str) -> str | None:
+        return _alvo_gravado(pasta_do_alvo / carimbo)
+
     if a is None and b is None:
         atuais = [c for c in carimbos if em_modo_atual(pasta_do_alvo / c)]
+        if dominio is None and atuais:
+            dominio = alvo(atuais[-1])
+        atuais = [c for c in atuais if alvo(c) == dominio]
         if len(atuais) < 2:
             raise ErroComparacao("são necessárias duas execuções em modo atual deste alvo para comparar")
         return atuais[-2], atuais[-1]
+    for carimbo in (a, b):
+        if carimbo is not None and dominio is not None and alvo(carimbo) != dominio:
+            raise ErroComparacao(f"{slug}/{carimbo} é de outro alvo com o mesmo slug: alvos diferentes")
     if a is None:
         anterior = execucao_anterior(pasta_do_alvo / b)
         if anterior is None:
             raise ErroComparacao(f"não há execução anterior a {slug}/{b} em modo atual")
         return anterior.name, b
     if b is None:
-        depois = [c for c in carimbos if c > a and em_modo_atual(pasta_do_alvo / c)]
+        depois = [c for c in carimbos if c > a and em_modo_atual(pasta_do_alvo / c) and alvo(c) == alvo(a)]
         if not depois:
             raise ErroComparacao(f"não há execução em modo atual depois de {slug}/{a}")
         return a, depois[-1]
     if a == b:
         raise ErroComparacao("a e b são a mesma execução")
+    if alvo(a) != alvo(b):
+        raise ErroComparacao(f"{slug}/{a} e {slug}/{b} são de alvos diferentes com o mesmo slug")
     return (a, b) if a < b else (b, a)

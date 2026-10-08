@@ -480,6 +480,22 @@ async def test_alertas_sem_cnpj_casa_so_por_dominio(respx_mock, tmp_path, serv):
     assert outro.saidas == {"correspondencias": [], "cobertura": {"com_texto_integral": 7, "so_resumo": 0}}
 
 
+@pytest.mark.parametrize("plataforma", ["instagram.com", "youtube.com"])
+async def test_alertas_nao_casam_dominio_de_plataforma(respx_mock, tmp_path, serv, plataforma):
+    # a 905 real (SantoTrader) cita www.instagram.com/oliversantotrader e www.youtube.com/@SANTOTRADER: o domínio
+    # de uma plataforma não identifica o esquema, e um perfil dela não pode herdar o alerta de outro golpe (C1)
+    mocar_deliberacoes(respx_mock)
+    ctx = contexto(tmp_path, alvo=plataforma)
+    r = await CvmAlertasNo().executar(ctx, entrada_alvo(plataforma), {}, serv)
+    assert r.saidas["correspondencias"] == []
+
+
+def test_casar_deliberacoes_ignora_dominio_de_plataforma():
+    d = delib(13, "divulgação em https://www.instagram.com/golpe e em https://golpe-invest.com/")
+    assert casar_deliberacoes([d], None, "instagram.com", [], HOJE) == []
+    assert tipos(casar_deliberacoes([d], None, "golpe-invest.com", [], HOJE)) == [("dominio", 13)]
+
+
 async def test_alertas_filtra_pela_data_do_ato(respx_mock, tmp_path, serv):
     mocar_deliberacoes(respx_mock)
     entradas = {**entrada_alvo("santotrader.com"), **entrada_cnpj(SANTO_TRADER)}

@@ -22,11 +22,13 @@ from radar.config import Config, RedeConfig
 from radar.custodia import Custodia, verificar
 from radar.execucao import (
     PADRAO_SLUG_CEGO,
+    ErroComparacao,
     ExecucaoSalva,
     carregar_execucao,
     criar_contexto,
     criar_servicos,
     em_modo_atual,
+    escolher_execucoes,
     execucao_anterior,
     listar_casos,
     segredo_cego,
@@ -36,7 +38,7 @@ from radar.indices import Indices
 from radar.modelos import Aguardando, Contexto, ErroNo, Evidencia, Feito, Pendencia, Resposta
 from radar.motor import Motor, NoBase, Servicos
 from radar.nos import nos_do_nucleo
-from radar.nos.alvo import AlvoNo, normalizar_alvo
+from radar.nos.alvo import PLATAFORMAS, AlvoNo, dominio_registravel, normalizar_alvo
 from radar.nos.captura import CapturaNo
 from radar.nos.cnpj import CnpjNo
 from radar.nos.ct import CtNo
@@ -155,6 +157,65 @@ def test_normalizar_alvo_url_inicial(entrada, url_inicial):
 def test_normalizar_alvo_invalido():
     with pytest.raises(ErroNo):
         normalizar_alvo("isso não é url")
+
+
+@pytest.mark.parametrize(
+    "entrada,dominio",
+    [
+        # sufixos privados da PSL: o site do esquema é o subdomínio, não a plataforma (C1 da revisão final)
+        ("piramide.github.io", "piramide.github.io"),
+        ("https://piramide.vercel.app/x", "piramide.vercel.app"),
+        ("piramide.blogspot.com", "piramide.blogspot.com"),
+        ("piramide.netlify.app", "piramide.netlify.app"),
+        ("piramide.web.app", "piramide.web.app"),
+        ("fulano.wixsite.com/invest", "fulano.wixsite.com"),
+        ("bitcoin.br.com", "bitcoin.br.com"),
+        ("www.piramide.github.io", "piramide.github.io"),
+    ],
+)
+def test_normalizar_alvo_em_sufixo_privado_e_o_proprio_site(entrada, dominio):
+    assert normalizar_alvo(entrada)[:2] == (dominio, dominio.replace(".", "-"))
+
+
+@pytest.mark.parametrize(
+    "entrada,plataforma",
+    [
+        ("https://sites.google.com/view/piramide", "google.com"),
+        ("https://www.instagram.com/piramide.invest/", "instagram.com"),
+        ("facebook.com/piramide", "facebook.com"),
+        ("fb.com/piramide", "fb.com"),
+        ("https://youtube.com/@piramide", "youtube.com"),
+        ("youtu.be/abc", "youtu.be"),
+        ("tiktok.com/@piramide", "tiktok.com"),
+        ("x.com/piramide", "x.com"),
+        ("twitter.com/piramide", "twitter.com"),
+        ("t.me/piramide", "t.me"),
+        ("telegram.org", "telegram.org"),
+        ("wa.me/5511999999999", "wa.me"),
+        ("chat.whatsapp.com/abc", "whatsapp.com"),
+        ("linktr.ee/piramide", "linktr.ee"),
+        ("linkedin.com/company/piramide", "linkedin.com"),
+        ("kwai.com/@piramide", "kwai.com"),
+    ],
+)
+def test_normalizar_alvo_recusa_plataforma(entrada, plataforma):
+    with pytest.raises(ErroNo) as e:
+        normalizar_alvo(entrada)
+    assert e.value.permanente is True
+    assert e.value.mensagem == f"alvo é uma plataforma ({plataforma}); analise o site próprio do esquema"
+
+
+def test_plataformas_tem_a_lista_minima():
+    assert {
+        "instagram.com", "facebook.com", "fb.com", "youtube.com", "youtu.be", "tiktok.com", "x.com", "twitter.com",
+        "t.me", "telegram.org", "wa.me", "whatsapp.com", "linktr.ee", "google.com", "linkedin.com", "kwai.com",
+    } <= PLATAFORMAS  # fmt: skip
+
+
+def test_dominio_registravel_com_sufixo_privado():
+    assert dominio_registravel("cdn.piramide.github.io") == "piramide.github.io"
+    assert dominio_registravel("github.io") == ""  # o sufixo sozinho não tem dono
+    assert dominio_registravel("app.exemplo.com.br") == "exemplo.com.br"
 
 
 @pytest.mark.parametrize(
@@ -723,6 +784,49 @@ def test_execucao_anterior(tmp_path):
     assert execucao_anterior(r5.pasta) == r1.pasta
     (r4.pasta / "estado.json").write_text("{}", encoding="utf-8")
     assert execucao_anterior(r5.pasta) == r1.pasta
+
+
+def test_execucao_anterior_so_do_mesmo_alvo_quando_o_slug_colide(tmp_path):
+    # "exemplo-com.br" e "exemplo.com.br" dão o mesmo slug: a anterior tem de ser do mesmo alvo
+    def nova(dia: int, alvo: str) -> Contexto:
+        ctx = criar_contexto(alvo, None, "captura", False, tmp_path, datetime(2026, 10, dia, 10, 0, 0))
+        _gravar_estado(ctx)
+        return ctx
+
+    r1 = nova(1, "exemplo.com.br")
+    outro = nova(2, "exemplo-com.br")
+    r3 = nova(3, "exemplo.com.br")
+    assert r1.slug == outro.slug == r3.slug
+    assert execucao_anterior(r3.pasta) == r1.pasta
+    assert execucao_anterior(outro.pasta) is None
+    # sem estado legível da própria execução, o alvo dela não é conhecido: não há anterior
+    (r3.pasta / "estado.json").unlink()
+    assert execucao_anterior(r3.pasta) is None
+
+
+def test_escolher_execucoes_nao_compara_alvos_diferentes_com_o_mesmo_slug(tmp_path):
+    def nova(dia: int, alvo: str) -> Contexto:
+        ctx = criar_contexto(alvo, None, "captura", False, tmp_path, datetime(2026, 10, dia, 10, 0, 0))
+        _gravar_estado(ctx)
+        return ctx
+
+    r1, r2, r3 = nova(1, "exemplo.com.br"), nova(2, "exemplo-com.br"), nova(3, "exemplo.com.br")
+    r4 = nova(4, "exemplo-com.br")
+    assert escolher_execucoes(tmp_path, "exemplo.com.br", None, None) == (r1.run_id, r3.run_id)
+    assert escolher_execucoes(tmp_path, "https://exemplo-com.br/", None, None) == (r2.run_id, r4.run_id)
+    # pelo slug, vale o alvo da execução mais nova
+    assert escolher_execucoes(tmp_path, "exemplo-com-br", None, None) == (r2.run_id, r4.run_id)
+    # só b ou só a: o par é do mesmo alvo
+    assert escolher_execucoes(tmp_path, "exemplo-com-br", None, r3.run_id) == (r1.run_id, r3.run_id)
+    assert escolher_execucoes(tmp_path, "exemplo-com-br", r2.run_id, None) == (r2.run_id, r4.run_id)
+    with pytest.raises(ErroComparacao, match="alvos diferentes"):
+        escolher_execucoes(tmp_path, "exemplo-com-br", r2.run_id, r3.run_id)
+    with pytest.raises(ErroComparacao, match="alvos diferentes"):
+        escolher_execucoes(tmp_path, "exemplo.com.br", r2.run_id, r3.run_id)
+    nova(5, "exemplo.com.br")
+    (tmp_path / r4.run_id / "estado.json").unlink()
+    with pytest.raises(ErroComparacao, match="duas execuções"):
+        escolher_execucoes(tmp_path, "exemplo-com.br", None, None)
 
 
 def test_carregar_execucao_sem_estado(tmp_path):

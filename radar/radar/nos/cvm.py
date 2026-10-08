@@ -16,6 +16,7 @@ from radar.cnpj_util import cnpj_valido, normalizar_cnpj
 from radar.indices import Deliberacao, Indices, RegistroCVM
 from radar.modelos import Contexto, ErroNo, Feito
 from radar.motor import NoBase, Servicos
+from radar.nos.alvo import e_plataforma
 from radar.texto import normalizar
 
 # situações do cadastro de crowdfunding sem registro concedido: não têm DT_REG, e a data ausente não pode
@@ -250,13 +251,16 @@ def casar_deliberacoes(
 
     - `cnpj`: formatado ou só os caracteres (com espaço ou quebra de linha depois dos separadores, como o PDF deixa),
       sem colar em outro número;
-    - `dominio`: sem diferenciar maiúsculas, como domínio inteiro (subdomínio vale);
+    - `dominio`: sem diferenciar maiúsculas, como domínio inteiro (subdomínio vale). O de uma plataforma de conteúdo
+      (`alvo.PLATAFORMAS`) não casa: a deliberação que cita instagram.com fala de um perfil, não do alvo;
     - `nome`: o nome sem acento, caixa nem pontuação, de 8 ou mais caracteres, como palavras inteiras;
     - só entram deliberações com `data <= as_of` (sem data não dá para saber se já existia).
     """
     cnpj = normalizar_cnpj(cnpj) if cnpj else None
     padrao_cnpj = _padrao_cnpj(cnpj) if cnpj else None
     dominio = dominio.strip().lower() if dominio else None
+    if dominio and e_plataforma(dominio):
+        dominio = None
     padrao_dominio = _padrao_dominio(dominio) if dominio else None
     padroes_nomes: dict[str, re.Pattern[str]] = {}
     for nome in nomes:

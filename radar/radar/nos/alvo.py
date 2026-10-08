@@ -10,8 +10,18 @@ import tldextract
 from radar.modelos import Contexto, ErroNo, Feito
 from radar.motor import NoBase, Servicos
 
-# lista de sufixos embutida no pacote: nenhuma consulta de rede para descobrir o domínio registrável
-_PSL = tldextract.TLDExtract(suffix_list_urls=())
+# lista de sufixos embutida no pacote: nenhuma consulta de rede para descobrir o domínio registrável. Com os sufixos
+# privados da PSL (github.io, vercel.app, blogspot.com, br.com...): o site do esquema é `piramide.github.io`, não a
+# plataforma inteira, que juntaria golpes diferentes no mesmo alvo (C1 da revisão final)
+_PSL = tldextract.TLDExtract(suffix_list_urls=(), include_psl_private_domains=True)
+# Plataformas de conteúdo fora da PSL: quem está nelas é um perfil, e o domínio é da plataforma, não do esquema. Não
+# servem de alvo nem de chave de correspondência (uma deliberação que cita instagram.com fala de outro perfil).
+PLATAFORMAS = frozenset(
+    {
+        "instagram.com", "facebook.com", "fb.com", "youtube.com", "youtu.be", "tiktok.com", "x.com", "twitter.com",
+        "t.me", "telegram.org", "wa.me", "whatsapp.com", "linktr.ee", "google.com", "linkedin.com", "kwai.com",
+    }
+)  # fmt: skip
 _ESQUEMA = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://")
 # o slug vira nome de pasta: só letras, dígitos, "_" e "-" (nada de "\" ou ".." vindo da entrada),
 # com hífen apenas no meio de cada rótulo
@@ -20,12 +30,18 @@ _DOMINIO = re.compile(rf"(?:{_ROTULO}\.)+{_ROTULO}")
 
 
 def dominio_registravel(host: str) -> str:
-    """Domínio registrável de `host` (`cdn.exemplo.com.br` → `exemplo.com.br`), em minúsculas.
+    """Domínio registrável de `host` (`cdn.exemplo.com.br` → `exemplo.com.br`, `cdn.piramide.github.io` →
+    `piramide.github.io`), em minúsculas.
 
-    Usa a lista de sufixos embutida, sem rede. IP, `localhost` e sufixo desconhecido não têm
-    domínio registrável: devolve `""`.
+    Usa a lista de sufixos embutida, com os privados, sem rede. IP, `localhost`, sufixo desconhecido e o sufixo
+    sozinho (`github.io`) não têm domínio registrável: devolve `""`.
     """
     return _PSL(host).top_domain_under_public_suffix.lower()
+
+
+def e_plataforma(dominio: str) -> bool:
+    """`dominio` (registrável) é de uma plataforma de conteúdo de `PLATAFORMAS`."""
+    return dominio.strip().lower().rstrip(".") in PLATAFORMAS
 
 
 def _invalido(entrada: str, motivo: str) -> ErroNo:
@@ -37,7 +53,8 @@ def normalizar_alvo(entrada: str) -> tuple[str, str, str]:
 
     `dominio` é o registrável (`app.Exemplo.com.br.` → `exemplo.com.br`; IDN em punycode), `slug`
     troca os pontos por hífen e `url_inicial` é a URL dada, com `https://` se faltar o esquema e
-    sem fragmento. Entrada que não é URL http(s) de um domínio registrável → `ErroNo` permanente.
+    sem fragmento. Entrada que não é URL http(s) de um domínio registrável → `ErroNo` permanente; perfil numa
+    plataforma de conteúdo (`PLATAFORMAS`) também, com a mensagem que manda analisar o site próprio do esquema.
     """
     bruta = entrada.strip()
     if not bruta or any(c.isspace() for c in bruta):
@@ -63,6 +80,8 @@ def normalizar_alvo(entrada: str) -> tuple[str, str, str]:
     dominio = dominio_registravel(host)
     if not _DOMINIO.fullmatch(dominio):
         raise _invalido(entrada, "sem domínio registrável")
+    if e_plataforma(dominio):
+        raise ErroNo(f"alvo é uma plataforma ({dominio}); analise o site próprio do esquema", permanente=True)
     return dominio, dominio.replace(".", "-"), urlunsplit(partes._replace(fragment=""))
 
 

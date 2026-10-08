@@ -286,7 +286,8 @@ def test_terceiros_sao_dominios_registraveis_sem_repeticao_e_em_ordem():
         ),
         "exemplo.com.br",
     )
-    assert saida == ["doubleclick.net", "facebook.com", "googleapis.com", "googletagmanager.com"]
+    # googleapis.com é sufixo privado da PSL: o domínio do terceiro é fonts.googleapis.com (C1 da revisão final)
+    assert saida == ["doubleclick.net", "facebook.com", "fonts.googleapis.com", "googletagmanager.com"]
 
 
 def test_terceiros_ip_e_nome_sem_sufixo_valem_pelo_proprio_host():
