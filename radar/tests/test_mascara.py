@@ -169,6 +169,39 @@ def test_palavra_generica_da_razao_social_nao_vira_empresa(titulo, razao, marca)
     assert termos_da_empresa(mascara) == {razao, marca}
 
 
+@pytest.mark.parametrize(
+    ("dominio", "razao", "generico"),
+    [
+        ("exemploinvestimentos.com.br", "EXEMPLO INVESTIMENTOS LTDA", "Investimentos"),
+        ("exemplo-investimentos.com.br", "EXEMPLO INVESTIMENTOS LTDA", "Investimentos"),
+        ("exemploparticipacoes.com.br", "EXEMPLO PARTICIPACOES LTDA", "Participações"),
+        ("exemploservicosdigitais.com.br", "EXEMPLO SERVICOS DIGITAIS LTDA", "Serviços Digitais"),
+    ],
+)
+def test_palavra_do_setor_dentro_do_rotulo_do_dominio_nao_vira_empresa(dominio, razao, generico):
+    # o domínio concatena a marca e a palavra do setor: "investimentos" está dentro do rótulo, mas não é o nome
+    titulo = f"{generico} - Exemplo Invest"
+    mascara = com_titulo(titulo, alvo={"dominio": dominio}, cnpj={"razao_social": razao})
+    assert termos_da_empresa(mascara) == {razao, "Exemplo Invest"}
+    # sem CNPJ só o rótulo do domínio decide, e a parte genérica continua de fora
+    assert generico not in termos_da_empresa(com_titulo(titulo, alvo={"dominio": dominio}, cnpj={}))
+
+
+def test_parte_generica_so_entra_quando_e_o_proprio_rotulo():
+    # o domínio é a palavra genérica: aí ela é o nome do site
+    site = {"alvo": {"dominio": "investimentos.com.br"}, "cnpj": {}}
+    assert termos_da_empresa(com_titulo("Investimentos | Home", **site)) == {"Investimentos"}
+    mais = {"alvo": {"dominio": "mais-investimentos.com.br"}, "cnpj": {}}
+    assert termos_da_empresa(com_titulo("Mais Investimentos", **mais)) == {"Mais Investimentos"}
+    # contém o rótulo inteiro, ou está dentro dele, mas só tem palavras genéricas e não é ele: fica de fora
+    assert termos_da_empresa(com_titulo("Investimentos Brasil | Home", **site)) == set()
+    maior = {"alvo": {"dominio": "investimentosbrasil.com.br"}, "cnpj": {}}
+    assert termos_da_empresa(com_titulo("Investimentos", **maior)) == set()
+    # palavra de menos de 4 caracteres também não é marca: "BR" não faz de "Investimentos BR" o nome do site
+    br = {"alvo": {"dominio": "exemploinvestimentosbr.com.br"}, "cnpj": {}}
+    assert termos_da_empresa(com_titulo("Investimentos BR - Exemplo", **br)) == {"Exemplo"}
+
+
 GENERICOS = """
     Ltda Eireli Sociedade Anônima Companhia Company Grupo Holding Investimento Investimentos Participação
     Participações Serviço Serviços Digital Digitais Consultoria Assessoria Gestão Negócios Capital Financeira
@@ -267,9 +300,32 @@ def test_parte_que_esta_dentro_do_rotulo_ou_que_o_contem_entra():
     assert termos_da_empresa(contem) == {"Exemplo Invest Brasil Oficial"}  # contém o rótulo inteiro
 
 
-def test_rotulo_curto_nao_puxa_titulo_nenhum():
-    # "ab" está dentro de "Abacate": um rótulo de menos de 4 caracteres não vale como "contido na parte"
+@pytest.mark.parametrize(
+    ("titulo", "dominio", "marca"),
+    [
+        ("XP Investimentos", "xp.com.br", "XP Investimentos"),
+        ("BTG Pactual | Home", "btg.com.br", "BTG Pactual"),
+        ("MMM Global", "mmm.com.br", "MMM Global"),
+        ("Invest-XP", "xp.com.br", "Invest-XP"),
+        ("B3 Investimentos", "b3.com.br", "B3 Investimentos"),
+    ],
+)
+def test_rotulo_curto_vale_quando_e_uma_palavra_inteira_da_parte(titulo, dominio, marca):
+    # com 3 caracteres ou menos o rótulo só vale como palavra inteira; aí as outras palavras podem ser genéricas
+    assert termos_da_empresa(com_titulo(titulo, alvo={"dominio": dominio}, cnpj={})) == {marca}
+
+
+def test_rotulo_curto_dentro_de_uma_palavra_nao_vale():
+    # "ab" está dentro de "Abacate", mas não é uma palavra da parte
     assert termos_da_empresa(com_titulo("Abacate Verde", alvo={"dominio": "ab.com.br"}, cnpj={})) == set()
+    assert termos_da_empresa(com_titulo("Expert Invest", alvo={"dominio": "xp.com.br"}, cnpj={})) == set()
+    # a promessa continua de fora, mesmo com o rótulo como palavra
+    assert termos_da_empresa(com_titulo("XP rende 1% ao dia", alvo={"dominio": "xp.com.br"}, cnpj={})) == set()
+
+
+def test_rotulo_curto_dos_sans_tambem_vale():
+    ct = {"sans": ["www.xp.com.br", "app.xp.com.br"]}
+    assert termos_da_empresa(com_titulo("XP Investimentos", alvo={}, ct=ct, cnpj={})) == {"XP Investimentos"}
 
 
 def test_rotulo_do_dominio_vem_do_registravel_e_dos_sans_sem_o_sufixo():

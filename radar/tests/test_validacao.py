@@ -1208,10 +1208,12 @@ async def test_mascarar_roda_fora_do_loop(ctx_cego, serv, monkeypatch):
 # --- título: a máscara não apaga a promessa nem atribui a outra empresa ------------------------------------
 
 
-def mascara_do_site(serv: Servicos, titulo: str, razao: str = "Exemplo Invest Ltda") -> dict[str, str]:
+def mascara_do_site(
+    serv: Servicos, titulo: str, razao: str = "Exemplo Invest Ltda", dominio: str = "exemplo.com.br"
+) -> dict[str, str]:
     html = f"<html><head><title>{titulo}</title></head><body><p>oi</p></body></html>"
     saidas = {
-        "alvo": {"dominio": "exemplo.com.br"},
+        "alvo": {"dominio": dominio},
         "cnpj": {"razao_social": razao},
         "captura": {"paginas": [{"html": guardar(serv, html)}]},
     }
@@ -1259,6 +1261,29 @@ async def test_palavra_do_setor_na_razao_social_nao_atribui_a_fala_a_outra_empre
     assert v == Validacao(False, "trecho não encontrado na fonte", "evidencias[0].trecho", [])
     # a empresa de verdade continua podendo ser citada pelo marcador
     ref = guardar(serv, f"<p>{marca} não possui registro na CVM</p>")
+    verdadeira = confirmado(ev(ref, "[EMPRESA] não possui registro na CVM"))
+    assert (await validar(verdadeira, pend(ctx_cego), ctx_cego, serv, mascara)).aceita
+
+
+@pytest.mark.parametrize(
+    ("dominio", "razao", "generico"),
+    [
+        ("exemploinvestimentos.com.br", "EXEMPLO INVESTIMENTOS LTDA", "Investimentos"),
+        ("exemplo-investimentos.com.br", "EXEMPLO INVESTIMENTOS LTDA", "Investimentos"),
+        ("exemploparticipacoes.com.br", "EXEMPLO PARTICIPACOES LTDA", "Participações"),
+        ("exemploservicosdigitais.com.br", "EXEMPLO SERVICOS DIGITAIS LTDA", "Serviços Digitais"),
+    ],
+)
+async def test_palavra_do_setor_no_dominio_nao_atribui_a_fala_a_outra_empresa(
+    ctx_cego, serv, dominio, razao, generico
+):
+    # o domínio traz a palavra do setor colada à marca: ela não pode virar [EMPRESA] pelo rótulo do domínio
+    mascara = mascara_do_site(serv, f"{generico} - Exemplo Invest", razao, dominio)
+    ref = guardar(serv, f"<p>Outra Empresa {generico} não possui registro na CVM</p>")
+    falsa = confirmado(ev(ref, "[EMPRESA] não possui registro na CVM"))
+    v = await validar(falsa, pend(ctx_cego), ctx_cego, serv, mascara)
+    assert v == Validacao(False, "trecho não encontrado na fonte", "evidencias[0].trecho", [])
+    ref = guardar(serv, "<p>Exemplo Invest não possui registro na CVM</p>")
     verdadeira = confirmado(ev(ref, "[EMPRESA] não possui registro na CVM"))
     assert (await validar(verdadeira, pend(ctx_cego), ctx_cego, serv, mascara)).aceita
 

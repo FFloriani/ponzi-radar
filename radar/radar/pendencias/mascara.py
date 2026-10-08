@@ -32,9 +32,10 @@ _SEPARADORES_DO_TITULO = re.compile(r"\s*[|–—·:]\s*|\s+-\s+")
 _CNPJ = re.compile(r"[0-9a-z]{12}[0-9]{2}")
 # os marcadores que `montar_mascara` produz
 MARCADOR = re.compile(r"\[(?:alvo|empresa|cnpj|pessoa_\d+)\]", re.IGNORECASE)
-# Palavras (dobradas) de forma jurídica, de setor e de vitrine: a razão social e o `og:site_name` as trazem, mas
-# elas não identificam uma marca. Uma parte do título que só tem essas palavras em comum com eles não é o nome
-# do site ("Investimentos" em "EXEMPLO INVESTIMENTOS LTDA"). `invest` fica de fora: é parte de marca comum.
+# Palavras (dobradas) de forma jurídica, de setor e de vitrine: a razão social, o `og:site_name` e o domínio as
+# trazem, mas elas não identificam uma marca. Uma parte do título que só tem essas palavras em comum com eles não é
+# o nome do site ("Investimentos" em "EXEMPLO INVESTIMENTOS LTDA" ou em exemploinvestimentos.com.br). `invest` fica
+# de fora: é parte de marca comum.
 _TERMOS_GENERICOS = frozenset(
     """
     ltda eireli epp sociedade anonima companhia company grupo holding investimento investimentos
@@ -84,11 +85,16 @@ def _identidade_da_pagina(html: str) -> tuple[list[str], str | None]:
     return partes, identidade.site_name
 
 
+def _tokens(texto: str) -> list[str]:
+    """As palavras do texto dobrado (sem acento nem caixa), de qualquer tamanho."""
+    return re.findall(r"[^\W_]+", normalizar(texto))
+
+
 def _palavras(texto: Any) -> set[str]:
     """As palavras do texto dobrado (sem acento nem caixa) com 4 caracteres ou mais."""
     if not isinstance(texto, str):
         return set()
-    return {p for p in re.findall(r"[^\W_]+", normalizar(texto)) if len(p) >= _MINIMO_DE_CARACTERES}
+    return {p for p in _tokens(texto) if len(p) >= _MINIMO_DE_CARACTERES}
 
 
 def _palavras_de_marca(texto: Any) -> set[str]:
@@ -98,24 +104,41 @@ def _palavras_de_marca(texto: Any) -> set[str]:
 
 def _colado(texto: str) -> str:
     """O texto dobrado só com letras e dígitos: sem espaço, hífen nem outra pontuação."""
-    return "".join(re.findall(r"[^\W_]+", normalizar(texto)))
+    return "".join(_tokens(texto))
+
+
+def _e_o_rotulo(parte: str, rotulos: set[str]) -> bool:
+    """A regra A de `_parte_do_titulo_vale`: a parte é o rótulo de um domínio do site."""
+    palavras = _tokens(parte)
+    colada = "".join(palavras)
+    # "Investimentos" está dentro de exemploinvestimentos.com.br, mas não é marca: a parte só de palavras genéricas
+    # ou curtas só vale se for o rótulo inteiro ("Investimentos" em investimentos.com.br)
+    so_genericas = all(p in _TERMOS_GENERICOS or len(p) < _MINIMO_DE_CARACTERES for p in palavras)
+    for rotulo in rotulos:
+        if len(rotulo) < _MINIMO_DE_CARACTERES:
+            if rotulo in palavras:  # "xp" é uma palavra de "XP Investimentos"; "ab" não é de "Abacate"
+                return True
+        elif colada == rotulo:
+            return True
+        elif not so_genericas and (colada in rotulo or rotulo in colada):  # a palavra de marca já tem 4 ou mais
+            return True
+    return False
 
 
 def _parte_do_titulo_vale(parte: str, rotulos: set[str], referencias: set[str]) -> bool:
     """Uma parte do título só vira `[EMPRESA]` se não tem "%" (uma promessa) e:
 
-    - (A) é o rótulo do domínio: a parte colada (4 caracteres ou mais) está dentro de um rótulo, ou contém um
-      rótulo inteiro (de 4 caracteres ou mais). Vale com dígitos ("Invest4U" em invest4u.com). É o que pega a marca
-      que o domínio concatena ("Exemplo Invest" em exemploinvest.com.br), sem CNPJ nem `og:site_name`; ou
+    - (A) é o rótulo do domínio. A parte colada é igual a um rótulo de 4 caracteres ou mais; ou, se a parte tem
+      alguma palavra de marca (fora de `_TERMOS_GENERICOS`, 4 caracteres ou mais), a parte colada está dentro de um
+      rótulo ou contém um rótulo inteiro de 4 caracteres ou mais; ou um rótulo de até 3 caracteres é uma palavra
+      inteira da parte ("XP Investimentos" em xp.com.br). Vale com dígitos ("Invest4U" em invest4u.com). É o que pega
+      a marca que o domínio concatena ("Exemplo Invest" em exemploinvest.com.br), sem CNPJ nem `og:site_name`; ou
     - (B) não tem dígitos e divide com o `og:site_name`, o nome fantasia ou a razão social uma palavra de marca
       (4 caracteres ou mais, fora de `_TERMOS_GENERICOS`).
     """
     if "%" in parte:
         return False
-    colada = _colado(parte)
-    if len(colada) >= _MINIMO_DE_CARACTERES and any(
-        colada in rotulo or (len(rotulo) >= _MINIMO_DE_CARACTERES and rotulo in colada) for rotulo in rotulos
-    ):
+    if _e_o_rotulo(parte, rotulos):
         return True
     if any(c.isdigit() for c in parte):
         return False
