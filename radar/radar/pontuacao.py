@@ -66,8 +66,10 @@ ERROS_DE_ALCANCE = frozenset(
 _HTTP_DA_CAPTURA = re.compile(r"HTTP (\d{3})")
 _HTTP_SITE_SUMIU = frozenset({404, 410})  # além dos 5xx
 _ERRO_DO_CHROMIUM = re.compile(r"net::(ERR_[A-Z0-9_]+)")
-# o timeout de navegação: "timeout" na forma nova; "Page.goto: Timeout 30000ms exceeded." nas execuções antigas
-_TIMEOUT_DE_NAVEGACAO = re.compile(r"timeout|Page\.goto: Timeout \d+ms exceeded", re.IGNORECASE)
+# o timeout de navegação: "navegação: timeout" na forma nova; "Page.goto: Timeout 30000ms exceeded." nas execuções
+# antigas. O timeout de outra etapa (o navegador que não sobe, a screenshot) não diz nada do site
+_TIMEOUT_NOVO = "navegação: timeout"
+_TIMEOUT_ANTIGO = re.compile(r"Page\.goto: Timeout \d+ms exceeded")
 
 _SEM_PONTOS = frozenset({"nao_se_aplica", "nao_encontrado"})
 _EM_ABERTO = frozenset({"nao_verificado", "inconclusivo"})
@@ -788,7 +790,7 @@ def site_nao_respondeu(ex: ExecucaoSalva) -> bool:
         return 500 <= codigo <= 599 or codigo in _HTTP_SITE_SUMIU
     if (erro := _ERRO_DO_CHROMIUM.search(resto)) is not None:
         return erro.group(1) in ERROS_DE_ALCANCE
-    return _TIMEOUT_DE_NAVEGACAO.search(resto) is not None
+    return resto == _TIMEOUT_NOVO or _TIMEOUT_ANTIGO.match(resto) is not None
 
 
 def _site_fora_do_ar(ex: ExecucaoSalva, matriz: Matriz, anterior: ExecucaoSalva | None) -> Sinal | None:

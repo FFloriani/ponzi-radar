@@ -405,20 +405,20 @@ class _Radar:
         servicos = criar_servicos(self.config, pasta, self.rede.sessao(), self.indices, self.matriz)
         try:
             aberta = _Execucao(Motor.carregar(pasta, self._nos(), servicos), servicos)
+            if aberta.cega:
+                salva = ler_json(pasta / NOME_DA_MASCARA, {})
+                if isinstance(salva, dict):
+                    aberta.mascara.update({str(termo): str(marcador) for termo, marcador in salva.items()})
+                self._atualizar_mascara(aberta)
+            recusas = ler_json(pasta / NOME_DAS_RECUSAS, [])
+            if isinstance(recusas, list):
+                aberta.recusas_tardias.extend(recusa for recusa in recusas if isinstance(recusa, dict))
         except BaseException:
             # a sessão criada para esta execução não serve: fecha em segundo plano (aqui não há await)
             tarefa = asyncio.get_running_loop().create_task(servicos.rede.fechar())
             self._tarefas.add(tarefa)
             tarefa.add_done_callback(self._tarefas.discard)
             raise
-        if aberta.cega:
-            salva = ler_json(pasta / NOME_DA_MASCARA, {})
-            if isinstance(salva, dict):
-                aberta.mascara.update({str(termo): str(marcador) for termo, marcador in salva.items()})
-            self._atualizar_mascara(aberta)
-        recusas = ler_json(pasta / NOME_DAS_RECUSAS, [])
-        if isinstance(recusas, list):
-            aberta.recusas_tardias.extend(recusa for recusa in recusas if isinstance(recusa, dict))
         self._execucoes[run_id] = aberta
         return aberta
 

@@ -113,14 +113,15 @@ def _processo_vivo(pid: int) -> bool:
     return True
 
 
-def _dono(caminho: Path) -> tuple[bytes, int | None, float | None]:
+def _dono(caminho: Path) -> tuple[bytes | None, int | None, float | None]:
     """O conteúdo do lockfile e o `pid` e o instante (epoch) gravados nele; os dois `None` se ilegível (o processo
-    pode ter morrido entre criar e escrever). O instante, sem conteúdo legível, é o da última escrita do arquivo."""
+    pode ter morrido entre criar e escrever). O instante, sem conteúdo legível, é o da última escrita do arquivo.
+    Lockfile que não existe mais: `(None, None, None)`."""
     try:
         conteudo = caminho.read_bytes()
         alterado = caminho.stat().st_mtime
     except OSError:
-        return b"", None, None
+        return None, None, None
     try:
         pid, instante = conteudo.decode("ascii").split()
         return conteudo, int(pid), float(instante)
@@ -128,20 +129,43 @@ def _dono(caminho: Path) -> tuple[bytes, int | None, float | None]:
         return conteudo, None, alterado
 
 
-def _quebrar_se_orfa(caminho: Path) -> bool:
-    """Apaga o lockfile de um processo que não existe mais ou de mais de 10 minutos, com aviso no log. `True` se
-    apagou. Relê o arquivo antes de apagar: se outro processo acabou de pegar a trava, não é a mesma."""
-    conteudo, pid, instante = _dono(caminho)
+def _quebrar_se_orfa(caminho: Path, dono: tuple[bytes | None, int | None, float | None] | None = None) -> bool:
+    """Quebra o lockfile de um processo que não existe mais ou de mais de 10 minutos, com aviso no log. `True`: vale
+    tentar de novo (a órfã foi quebrada, o lockfile sumiu ou a trava mudou de dono no meio); `False`: o dono está vivo.
+    `dono` é o que o chamador acabou de ler do lockfile (`_dono`); sem ele, o lockfile é lido aqui.
+
+    A quebra troca o nome do lockfile por um único antes de apagar: entre dois processos que veem a mesma órfã, só
+    um consegue. O renomeado é conferido; se não é a órfã (outro processo pegou a trava entre a leitura e a troca),
+    volta ao nome de antes.
+    """
+    conteudo, pid, instante = dono if dono is not None else _dono(caminho)
+    if conteudo is None:
+        return True  # sumiu entre o estouro do tempo e a leitura: a trava está livre
     idade = time.time() - instante if instante is not None else None
     morto = pid is not None and not _processo_vivo(pid)
     if not (morto or (idade is not None and idade > _TRAVA_ORFA_S)):
         return False
+    unico = caminho.with_name(f"{caminho.name}.orfa-{uuid.uuid4().hex}")
     try:
-        if caminho.read_bytes() != conteudo:
-            return False
-        caminho.unlink()
+        os.rename(caminho, unico)
+    except FileNotFoundError:
+        return True  # outro processo quebrou antes
+    except PermissionError:
+        # no Windows, outro processo lendo ou trocando o mesmo arquivo nesse instante: tenta de novo
+        return sys.platform == "win32"
     except OSError:
         return False
+    try:
+        if unico.read_bytes() != conteudo:
+            try:
+                os.rename(unico, caminho)  # é a trava nova de outro processo: devolve
+            except OSError:
+                _log.warning("trava %s: não deu para devolver a trava de outro processo (%s)", caminho, unico)
+            return True
+        unico.unlink()
+    except OSError:
+        _log.warning("trava %s: a órfã renomeada ficou em %s", caminho, unico)
+        return True  # o nome da trava já está livre
     motivo = f"o processo {pid} não existe mais" if morto else f"tem {idade / 60:.0f} minutos"
     _log.warning("trava órfã quebrada: %s (%s)", caminho, motivo)
     return True
@@ -165,28 +189,41 @@ def trava(caminho: Path, timeout: float = 10.0) -> Iterator[None]:
     Tenta a cada 50 ms. Passado `timeout` segundos, uma trava órfã (o processo que a pegou não existe mais, ou ela
     tem mais de 10 minutos) é quebrada com aviso no log e a espera recomeça (I8: um servidor MCP morto com a trava na
     mão não pode impedir a retomada); senão levanta `TimeoutError`, que nomeia o arquivo e diz como liberar, sem mexer
-    no lockfile de quem a segura.
+    no lockfile de quem a segura. O prazo conta o tempo com o mesmo dono: se a trava trocou de dono durante a espera
+    (a fila andou), a espera recomeça em vez de estourar. A liberação só apaga o lockfile se ele ainda é o desta
+    trava, e uma falha ao escrevê-lo não deixa o lockfile vazio para trás.
     """
     caminho = Path(caminho)
     limite = time.monotonic() + timeout
+    dono_no_inicio: bytes | None = None
     while True:
         try:
-            descritor = os.open(caminho, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            # O_BINARY: no Windows o modo texto gravaria \r\n, e a liberação compara o conteúdo byte a byte
+            descritor = os.open(caminho, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0))
         except FileExistsError:
-            pass
+            if dono_no_inicio is None:
+                dono_no_inicio = _dono(caminho)[0]
         except PermissionError:
             # no Windows, um lockfile que acabou de ser apagado ainda dá "acesso negado"
             # até o sistema concluir a remoção: é só ocupado, tenta de novo
             if sys.platform != "win32":
                 raise
         else:
+            # o instante com microssegundos também distingue esta trava de outra do mesmo processo na liberação
+            meu = f"{os.getpid()} {time.time():.6f}\n".encode("ascii")
             try:
-                os.write(descritor, f"{os.getpid()} {time.time():.3f}\n".encode("ascii"))
-            finally:
+                os.write(descritor, meu)
+            except BaseException:
                 os.close(descritor)
+                caminho.unlink(missing_ok=True)
+                raise
+            os.close(descritor)
             break
         if time.monotonic() >= limite:
-            if not _quebrar_se_orfa(caminho):
+            atual = _dono(caminho)
+            if atual[0] is not None and atual[0] != dono_no_inicio:
+                dono_no_inicio = atual[0]  # outro processo pegou e soltou no meio: não é o mesmo dono há `timeout`
+            elif not _quebrar_se_orfa(caminho, atual):
                 raise _ocupada(caminho, timeout)
             limite = time.monotonic() + timeout
             continue
@@ -194,4 +231,10 @@ def trava(caminho: Path, timeout: float = 10.0) -> Iterator[None]:
     try:
         yield
     finally:
-        caminho.unlink(missing_ok=True)
+        try:
+            if caminho.read_bytes() == meu:
+                caminho.unlink()
+            else:
+                _log.warning("trava %s já é de outro processo: não apago", caminho)
+        except OSError:
+            pass

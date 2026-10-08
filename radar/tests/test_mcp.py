@@ -32,6 +32,7 @@ from radar.nos.alvo import AlvoNo
 from radar.nos.pendencias import PendNo
 from radar.pendencias.definicoes import CABECALHO_NAO_CONFIAVEL, DEFINICOES, nova_pendencia
 from radar.pontuacao import CLASSES
+from radar.rede import Rede
 
 ALVO = "exemplo.com.br"
 IP_DO_ALVO = "93.184.216.34"
@@ -1452,3 +1453,31 @@ def test_unir_mascara_numera_processo_e_deliberacao_e_mantem_o_token_do_valor():
     assert base == {"905": "[DELIBERACAO_1]", URL_905: "[DELIBERACAO_1]"}
     assert mcp_server._unir_mascara(base, {"509": "[DELIBERACAO_1]"}) is True and base["509"] == "[DELIBERACAO_2]"
     assert mcp_server._unir_mascara(base, {NUP: "[PROCESSO_1]"}) is True and base[NUP] == "[PROCESSO_1]"
+
+
+# ---------------------------------------------------------------------------- sessão fechada quando a execução não abre
+
+
+async def test_sessao_e_fechada_quando_a_mascara_em_disco_esta_quebrada(abrir, tmp_path, monkeypatch):
+    srv = await abrir()
+    run_id = await iniciar(srv, modo_cego=True)
+    (pasta(tmp_path, run_id) / "mascara.json").write_text("{quebrado", encoding="utf-8")
+    criadas, fechadas = [], []
+    sessao_original, fechar_original = Rede.sessao, Rede.fechar
+
+    def sessao(self):
+        nova = sessao_original(self)
+        criadas.append(nova)
+        return nova
+
+    async def fechar(self):
+        fechadas.append(self)
+        await fechar_original(self)
+
+    monkeypatch.setattr(Rede, "sessao", sessao)
+    monkeypatch.setattr(Rede, "fechar", fechar)
+    outro = await abrir()  # outro servidor: a execução vem do disco
+    for _ in range(2):
+        assert await chamar(outro, "ver_pendencia", run_id=run_id, id="P-A1") == {"erro": "falha interna: JSONDecodeError"}
+    await asyncio.sleep(0.05)  # o fechamento roda em segundo plano
+    assert len(criadas) == 2 and all(sessao in fechadas for sessao in criadas)

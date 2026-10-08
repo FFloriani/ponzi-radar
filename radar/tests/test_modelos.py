@@ -501,3 +501,87 @@ def test_trava_de_processo_vivo_estoura_dizendo_como_liberar(tmp_path):
                 pass
     mensagem = str(e.value)
     assert str(lock) in mensagem and f"pid {os.getpid()}" in mensagem and "apague o arquivo" in mensagem
+
+
+# --- trava: corridas (resíduos da revisão final) -----------------------------------------------------------
+
+
+def test_lockfile_que_some_no_estouro_e_tentado_de_novo(tmp_path, monkeypatch):
+    # a trava viva some entre o estouro do tempo e a leitura do dono: está livre, tenta de novo em vez de estourar
+    lock = tmp_path / "x.lock"
+    lock.write_text(f"{os.getpid()} {time.time():.3f}\n", encoding="ascii")
+    original = arquivos._dono
+
+    def dono_que_some(caminho):
+        caminho.unlink(missing_ok=True)
+        return original(caminho)
+
+    monkeypatch.setattr(arquivos, "_dono", dono_que_some)
+    with trava(lock, timeout=0.1):
+        assert lock.read_text(encoding="ascii").split()[0] == str(os.getpid())
+
+
+def test_quebra_da_orfa_nao_apaga_a_trava_nova_de_outro_processo(tmp_path, monkeypatch):
+    # dois processos veem a mesma órfã; um deles já a trocou pela dele quando o outro vai quebrá-la
+    lock = tmp_path / "x.lock"
+    lock.write_text(f"999999999 {time.time() - 3600:.3f}\n", encoding="ascii")  # órfã: pid que não existe
+    nova = f"{os.getpid()} {time.time():.3f}\n"
+    real = os.rename
+    trocou = []
+
+    def rename(origem, destino):
+        if not trocou:  # na hora da quebra, o outro processo já pôs a trava dele
+            trocou.append(1)
+            Path(origem).write_text(nova, encoding="ascii")
+        return real(origem, destino)
+
+    monkeypatch.setattr(arquivos.os, "rename", rename)
+    assert arquivos._quebrar_se_orfa(lock) is True  # tenta de novo, sem apagar a trava do outro
+    assert lock.read_text(encoding="ascii") == nova
+    assert [p.name for p in tmp_path.iterdir()] == ["x.lock"]  # nada de sobra com o nome único
+
+
+def test_quebra_da_orfa_renomeia_e_so_um_vence(tmp_path):
+    lock = tmp_path / "x.lock"
+    lock.write_text(f"999999999 {time.time() - 3600:.3f}\n", encoding="ascii")
+    dentro, maximo, erros = [0], [0], []
+    trava_de_contagem = threading.Lock()
+
+    def entra():
+        try:
+            with trava(lock, timeout=1.0):
+                with trava_de_contagem:
+                    dentro[0] += 1
+                    maximo[0] = max(maximo[0], dentro[0])
+                time.sleep(0.1)
+                with trava_de_contagem:
+                    dentro[0] -= 1
+        except Exception as erro:  # noqa: BLE001 - o teste só conta
+            erros.append(erro)
+
+    threads = [threading.Thread(target=entra) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert erros == [] and maximo[0] == 1
+    assert not lock.exists() and list(tmp_path.iterdir()) == []
+
+
+def test_liberacao_so_apaga_a_trava_que_e_sua(tmp_path):
+    lock = tmp_path / "x.lock"
+    with trava(lock):
+        outra = f"999999999 {time.time():.3f}\n"
+        lock.write_text(outra, encoding="ascii")  # quebrada por idade e pega por outro processo
+    assert lock.read_text(encoding="ascii") == outra
+
+
+def test_falha_ao_escrever_o_lockfile_nao_deixa_trava_vazia(tmp_path, monkeypatch):
+    def falha(descritor, dados):
+        raise OSError(28, "disco cheio")
+
+    monkeypatch.setattr(arquivos.os, "write", falha)
+    with pytest.raises(OSError, match="disco cheio"):
+        with trava(tmp_path / "x.lock"):
+            pass
+    assert not (tmp_path / "x.lock").exists()

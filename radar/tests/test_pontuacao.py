@@ -965,6 +965,11 @@ _FALHAS_DO_ANALISTA = [
     "captura falhou: Page.goto: net::ERR_INTERNET_DISCONNECTED at https://exemplo.com.br/",
     "captura falhou: Page.goto: net::ERR_CERT_AUTHORITY_INVALID at https://exemplo.com.br/",
     "captura falhou: Page.goto: net::ERR_SSL_PROTOCOL_ERROR at https://exemplo.com.br/",
+    # o timeout que não é da navegação (o navegador que não sobe, a screenshot) e o "timeout" solto não contam
+    "captura falhou: BrowserType.launch: Timeout 180000ms exceeded.",
+    "captura falhou: Page.screenshot: Timeout 30000ms exceeded.",
+    "captura falhou: timeout",
+    "captura indisponível: Page.goto: Timeout 30000ms exceeded.",
 ]  # fmt: skip
 _RECUSAS = [
     "captura falhou: HTTP 401", "captura falhou: HTTP 403", "captura falhou: HTTP 407",

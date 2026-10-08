@@ -225,7 +225,7 @@ def test_diff_site_fora_do_ar_por_nxdomain(tmp_path):
 @pytest.mark.parametrize(
     "motivo,fora_do_ar",
     [
-        ("captura falhou: timeout", True),
+        ("captura falhou: navegação: timeout", True),
         ("captura falhou: net::ERR_CONNECTION_REFUSED", True),
         ("captura falhou: HTTP 503", True),
         ("captura falhou: HTTP 521", True),
@@ -245,7 +245,7 @@ def test_diff_site_fora_do_ar_por_captura_que_falhou_so_no_b(tmp_path, motivo, f
 
 def test_diff_site_fora_do_ar_usa_o_criterio_da_pontuacao(tmp_path):
     """Mesma função do E6: o que o E6 chama de "site não respondeu" é o que o diff chama de "fora do ar"."""
-    motivos = ["captura falhou: timeout", "captura falhou: HTTP 403", "erro inesperado: KeyError", "captura falhou: HTTP 502"]
+    motivos = ["captura falhou: navegação: timeout", "captura falhou: HTTP 403", "erro inesperado: KeyError", "captura falhou: HTTP 502"]
     for n, motivo in enumerate(motivos):
         a, b = duas(tmp_path / f"caso{n}", b={"status": {"captura": ("erro", motivo)}})
         assert (comparar(a, b, MATRIZ).infra == ["site fora do ar"]) is site_nao_respondeu(b)
@@ -262,7 +262,7 @@ def test_diff_captura_que_ja_respondia_403_e_agora_cai_e_novidade(tmp_path):
 
 
 def test_diff_captura_que_ja_falhava_nao_e_novidade(tmp_path):
-    falha = {"status": {"captura": ("erro", "captura falhou: timeout")}}
+    falha = {"status": {"captura": ("erro", "captura falhou: navegação: timeout")}}
     a, b = duas(tmp_path, a=falha, b=falha)
     assert "site fora do ar" not in comparar(a, b, MATRIZ).infra
 
