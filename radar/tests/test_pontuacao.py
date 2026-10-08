@@ -1073,9 +1073,24 @@ def test_evidencias_sem_itens_valem_para_todos_os_itens(matriz):
     assert _trechos(item(ex, "B1")) == _trechos(item(ex, "B3")) == [e["trecho"] for e in sem_itens]
 
 
-def test_item_sem_evidencia_propria_usa_todas(matriz):
-    ex = execucao({"pend_b": resp(valor=VALOR_B_POSITIVO, evidencias=[BONUS])})
-    assert _trechos(item(ex, "B3")) == ["bônus de indicação em 3 níveis"]
+def test_evidencia_marcada_para_outro_item_nao_entra_e_a_sem_marca_vale_para_todos(matriz):
+    # R1: o bônus marcado ["B1"] nunca vai para o B3; a carência sem `itens` vale para todos os itens
+    carencia_sem_marca = {k: v for k, v in CARENCIA.items() if k != "itens"}
+    ex = execucao({"pend_b": resp(valor=VALOR_B_POSITIVO, evidencias=[BONUS, carencia_sem_marca])})
+    assert _trechos(item(ex, "B3")) == ["carência de 12 meses e multa de 30% no resgate"]
+    assert _trechos(item(ex, "B1")) == ["bônus de indicação em 3 níveis", "carência de 12 meses e multa de 30% no resgate"]
+    _, mods = sinais_da_execucao(ex, matriz, None)
+    assert next(m for m in mods if m.id == "carencia_longa").evidencia.trecho.startswith("carência")
+    # sem nenhuma evidência para ele (o bônus é só do B1), o B3 confirmado não cita nada
+    so_bonus = execucao({"pend_b": resp(valor=VALOR_B_POSITIVO, evidencias=[BONUS])})
+    assert _trechos(item(so_bonus, "B3")) == []
+
+
+def test_julgamento_antigo_todo_sem_itens_da_todas_a_cada_item(matriz):
+    sem_itens = [{k: v for k, v in e.items() if k != "itens"} for e in (BONUS, CARENCIA)]
+    ex = execucao({"pend_b": resp(valor=VALOR_B_POSITIVO, evidencias=sem_itens)})
+    for item_id in ("B1", "B3"):
+        assert _trechos(item(ex, item_id)) == [e["trecho"] for e in sem_itens], item_id
 
 
 def test_evidencias_da_p_c_por_item(matriz):

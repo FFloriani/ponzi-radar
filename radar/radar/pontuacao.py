@@ -387,12 +387,12 @@ _PELA_PENDENCIA = {
 
 
 def _evidencias_do_item(resposta: Resposta | None, item_id: str) -> list[Evidencia]:
-    """As evidências que sustentam o item (I3): as marcadas com ele em `itens`; sem nenhuma marcada com ele (o
-    julgamento de antes dos `itens`, ou o item que o Claude não marcou), todas as da resposta."""
+    """As evidências que sustentam o item (I3): as marcadas com ele em `itens` e as sem `itens`, que valem para todos
+    os itens da resposta (o julgamento de antes dos `itens` dá todas a cada item). A marcada só para outro item nunca
+    entra."""
     if resposta is None:
         return []
-    proprias = [e for e in resposta.evidencias if e.itens and item_id in e.itens]
-    return proprias or list(resposta.evidencias)
+    return [e for e in resposta.evidencias if not e.itens or item_id in e.itens]
 
 
 def _item_da_pendencia(ex: ExecucaoSalva, item_id: str, matriz: Matriz) -> Item:
