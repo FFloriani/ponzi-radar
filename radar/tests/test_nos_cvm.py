@@ -312,8 +312,8 @@ async def test_sancionador_guarda_na_custodia(respx_mock, tmp_path, serv):
 # ------------------------------------------------------------------------------------ casar_deliberacoes
 
 
-def delib(numero: int, texto: str, data: date | None = date(2025, 1, 10)) -> Deliberacao:
-    return Deliberacao(numero=numero, data=data, url=f"https://cvm.example/deli{numero}.html", texto=texto)
+def delib(numero: int, texto: str, data: date | None = date(2025, 1, 10), integral: bool = True) -> Deliberacao:
+    return Deliberacao(numero=numero, data=data, url=f"https://cvm.example/deli{numero}.html", texto=texto, integral=integral)
 
 
 def tipos(correspondencias: list[dict]) -> list[tuple[str, int]]:
@@ -352,6 +352,8 @@ def test_deliberacao_sem_data_nao_conta():
         "CNPJ: 33000167000101.",
         "(33.000.167/000101)",
         "33.000.16700 01-01 e 33.000.167/0001-01",
+        "CNPJ nº 33.000.167/0001- 01, com o espaço que a extração do PDF deixa depois do hífen",
+        "inscrita no CNPJ 33.000.167/\n0001-01 (quebra de linha no meio)",
         "inscrita sob o 33000167000101",
     ],
 )
@@ -445,7 +447,7 @@ def test_alertas_declaracao():
     assert (no.nome, no.entradas, no.opcionais, no.as_of, no.toca_alvo) == (
         "cvm_alertas", ("alvo",), ("cnpj",), "exato", False
     )
-    assert no.saidas == ("correspondencias",)
+    assert no.saidas == ("correspondencias", "cobertura")
 
 
 async def test_alertas_casa_por_cnpj_dominio_e_nome(respx_mock, tmp_path, serv):
@@ -464,6 +466,7 @@ async def test_alertas_casa_por_cnpj_dominio_e_nome(respx_mock, tmp_path, serv):
     assert "41.557.647/0001-04" in achados[0]["trecho"]
     assert "https://santotrader.com/" in achados[1]["trecho"]
     assert sorted(c["valor"] for c in achados if c["tipo"] == "nome") == ["santo trader", "santo trader treinamento profissionais ltda"]
+    assert r.saidas["cobertura"] == {"com_texto_integral": 7, "so_resumo": 0}
 
 
 async def test_alertas_sem_cnpj_casa_so_por_dominio(respx_mock, tmp_path, serv):
@@ -474,7 +477,7 @@ async def test_alertas_sem_cnpj_casa_so_por_dominio(respx_mock, tmp_path, serv):
     nao_achou = await CvmAlertasNo().executar(ctx, {**entrada_alvo("santotrader.com"), **entrada_cnpj(None)}, {}, serv)
     assert tipos(nao_achou.saidas["correspondencias"]) == [("dominio", 905)]
     outro = await CvmAlertasNo().executar(contexto(tmp_path, alvo="limpo.com.br"), entrada_alvo("limpo.com.br"), {}, serv)
-    assert outro.saidas == {"correspondencias": []}
+    assert outro.saidas == {"correspondencias": [], "cobertura": {"com_texto_integral": 7, "so_resumo": 0}}
 
 
 async def test_alertas_filtra_pela_data_do_ato(respx_mock, tmp_path, serv):
@@ -484,6 +487,40 @@ async def test_alertas_filtra_pela_data_do_ato(respx_mock, tmp_path, serv):
     no_dia = await CvmAlertasNo().executar(contexto(tmp_path, date(2025, 11, 25), "santotrader.com"), entradas, {}, serv)
     assert antes.saidas["correspondencias"] == []
     assert tipos(no_dia.saidas["correspondencias"]) == [("cnpj", 905), ("dominio", 905)]
+    # a cobertura conta só o que existia no as_of: a 905, de 25/11, ainda não
+    assert antes.saidas["cobertura"] == {"com_texto_integral": 6, "so_resumo": 0}
+    assert no_dia.saidas["cobertura"] == {"com_texto_integral": 7, "so_resumo": 0}
+
+
+def _listagem(*numeros: int) -> str:
+    links = "".join(
+        f'<article><h3><a href="/legislacao/deliberacoes/deli{n // 100:02d}00/deli{n}.html">Deliberação CVM {n}</a></h3></article>'
+        for n in numeros
+    )
+    return f"<span>{len(numeros)} resultados encontrados</span>{links}<span>Páginas 1/1</span>"
+
+
+async def test_alertas_cobertura_diz_quantas_so_tem_o_resumo(respx_mock, tmp_path, serv):
+    # sem o PDF (404), a 509 só tem o resumo: "0 correspondências" nela não prova nada sobre CNPJ e domínio
+    reg = mocar_deliberacoes(respx_mock)
+    reg.jsp.mock(return_value=httpx.Response(200, text=_listagem(905, 509)))
+    reg.rota_pdfs.mock(return_value=httpx.Response(404))
+    ctx = contexto(tmp_path, alvo="limpo.com.br")
+    r = await CvmAlertasNo().executar(ctx, entrada_alvo("limpo.com.br"), {}, serv)
+    assert r.saidas == {"correspondencias": [], "cobertura": {"com_texto_integral": 1, "so_resumo": 1}}
+
+
+async def test_alertas_acha_o_cnpj_no_texto_do_pdf_de_uma_deliberacao_antiga(respx_mock, tmp_path, serv):
+    reg = mocar_deliberacoes(respx_mock)
+    reg.jsp.mock(return_value=httpx.Response(200, text=_listagem(905, 586, 509)))
+    ctx = contexto(tmp_path, alvo="fginfocls.com")
+    # o CNPJ da Fidelitas aparece no PDF da 509 como "06.151.776/0001- 99" (o resumo do invólucro não o traz)
+    entradas = {**entrada_alvo("fginfocls.com"), **entrada_cnpj("06151776000199", "FIDELITAS INVESTIMENTOS LTDA.")}
+    r = await CvmAlertasNo().executar(ctx, entradas, {}, serv)
+    assert [(c["tipo"], c["numero"], c["data"]) for c in r.saidas["correspondencias"]] == [
+        ("dominio", 586, "2009-08-11"), ("cnpj", 509, "2006-09-29"), ("nome", 509, "2006-09-29")
+    ]
+    assert r.saidas["cobertura"] == {"com_texto_integral": 3, "so_resumo": 0}
 
 
 async def test_alertas_guarda_na_custodia(respx_mock, tmp_path, serv):
@@ -493,7 +530,12 @@ async def test_alertas_guarda_na_custodia(respx_mock, tmp_path, serv):
     (entrada,) = entradas_custodia(serv)
     assert (entrada["tipo"], entrada["origem"]) == ("indice", "deliberacoes")
     corpo = corpo_da_custodia(serv, entrada)
-    assert corpo["consulta"] == {"dominio": "santotrader.com", "cnpj": None, "as_of": "2026-10-07", "deliberacoes_consultadas": 7}
+    assert corpo["consulta"] == {
+        "dominio": "santotrader.com",
+        "cnpj": None,
+        "as_of": "2026-10-07",
+        "cobertura": {"com_texto_integral": 7, "so_resumo": 0},
+    }
     assert [c["numero"] for c in corpo["correspondencias"]] == [905]
 
 

@@ -205,9 +205,13 @@ class CvmSancionadorNo(NoBase):
 
 
 def _padrao_cnpj(cnpj: str) -> re.Pattern[str]:
-    """O CNPJ com ou sem `.`, `/` e `-`, em qualquer caixa, sem estar colado a outro número ou palavra."""
+    """O CNPJ com ou sem `.`, `/` e `-`, em qualquer caixa, sem estar colado a outro número ou palavra.
+
+    Um espaço ou uma quebra de linha depois de cada separador também vale: a extração de texto de PDF deixa
+    "06.151.776/0001- 99" e quebra a linha no meio do número.
+    """
     raiz, ordem, dv = cnpj[:8], cnpj[8:12], cnpj[12:]
-    corpo = rf"{raiz[:2]}\.?{raiz[2:5]}\.?{raiz[5:]}/?{ordem}-?{dv}"
+    corpo = rf"{raiz[:2]}\.?\s?{raiz[2:5]}\.?\s?{raiz[5:]}/?\s?{ordem}-?\s?{dv}"
     return re.compile(rf"(?<![0-9A-Za-z]){corpo}(?![0-9A-Za-z])", re.IGNORECASE)
 
 
@@ -244,7 +248,8 @@ def casar_deliberacoes(
     Devolve, da mais nova para a mais antiga e dentro de cada deliberação na ordem cnpj, domínio, nomes, uma
     correspondência por (deliberação, tipo, valor): `{"tipo", "valor", "numero", "data", "url", "trecho"}`.
 
-    - `cnpj`: formatado ou só os caracteres, sem colar em outro número;
+    - `cnpj`: formatado ou só os caracteres (com espaço ou quebra de linha depois dos separadores, como o PDF deixa),
+      sem colar em outro número;
     - `dominio`: sem diferenciar maiúsculas, como domínio inteiro (subdomínio vale);
     - `nome`: o nome sem acento, caixa nem pontuação, de 8 ou mais caracteres, como palavras inteiras;
     - só entram deliberações com `data <= as_of` (sem data não dá para saber se já existia).
@@ -283,12 +288,16 @@ class CvmAlertasNo(NoBase):
     Casa por CNPJ e razão social/nome fantasia quando o nó `cnpj` identificou a empresa; sem ele (nó em erro ou
     empresa não achada), só pelo domínio. A pontuação confirma o item C4 sozinha com `cnpj` ou `dominio`; o `nome`
     vai para a pendência P-C4. O ato conta a partir da data dele (`as_of` exato).
+
+    `cobertura` diz em quantas das deliberações consultadas (as de data até o `as_of`) o texto integral foi lido
+    e em quantas só o resumo, que quase nunca traz CNPJ nem domínio: sem correspondência, o resultado só vale
+    como evidência negativa para as `com_texto_integral`.
     """
 
     nome = "cvm_alertas"
     entradas = ("alvo",)
     opcionais = ("cnpj",)
-    saidas = ("correspondencias",)
+    saidas = ("correspondencias", "cobertura")
     as_of = "exato"
 
     async def executar(
@@ -300,11 +309,9 @@ class CvmAlertasNo(NoBase):
         nomes = [empresa.get("razao_social"), empresa.get("nome_fantasia")] if cnpj else []
         delibs = await indices.deliberacoes()
         correspondencias = casar_deliberacoes(delibs, cnpj, ctx.alvo, nomes, ctx.as_of)
-        consulta = {
-            "dominio": ctx.alvo,
-            "cnpj": cnpj,
-            "as_of": ctx.as_of.isoformat(),
-            "deliberacoes_consultadas": len(delibs),
-        }
+        consultadas = [d for d in delibs if d.data is not None and d.data <= ctx.as_of]
+        integrais = sum(d.integral for d in consultadas)
+        cobertura = {"com_texto_integral": integrais, "so_resumo": len(consultadas) - integrais}
+        consulta = {"dominio": ctx.alvo, "cnpj": cnpj, "as_of": ctx.as_of.isoformat(), "cobertura": cobertura}
         _guardar(s, "deliberacoes", consulta, correspondencias)
-        return Feito({"correspondencias": correspondencias})
+        return Feito({"correspondencias": correspondencias, "cobertura": cobertura})

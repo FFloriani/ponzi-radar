@@ -20,7 +20,14 @@ Fontes (conferidas em 07/10/2026):
   e o `Páginas n/N` da resposta diz onde parar. Cada deliberação tem um invólucro `deliNNN.html`: o bloco
   `<article class="contentTextoGeral">` tem o resumo e o carimbo da data (`Tue Nov 25 18:00:00 BRST 2025`). Só as
   mais recentes (de 2024 em diante) trazem o texto integral, com CNPJ e domínios, num `anexos/.../deliNNN.htm`
-  ligado no invólucro; as antigas só têm o resumo no HTML e o texto integral em PDF/DOC, que não é lido aqui.
+  ligado no invólucro; nas outras o texto integral só existe em PDF (`.../anexos/0NNN/deliNNN.pdf`, também ligado
+  no invólucro), que é lido com `pypdf`. `.doc` e `.docx` não são lidos. Sem o texto integral a deliberação fica
+  só com o resumo (`integral=False`), e quem consulta o índice precisa dizer isso: "nenhuma correspondência" numa
+  deliberação só com o resumo não prova nada sobre o CNPJ ou o domínio.
+
+Erros ao montar as deliberações: só o 404 de uma página (do invólucro, do `.htm` ou do PDF) é pulado. Qualquer outro
+erro, o invólucro sem o bloco do texto (layout novo) e a busca que corta a lista (página sem resultado antes do
+total) levantam `ErroNo`, depois de guardar o que já foi baixado, para uma deliberação nova nunca sumir em silêncio.
 """
 
 from __future__ import annotations
@@ -28,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import logging
 import re
 import zipfile
 import zlib
@@ -38,6 +46,7 @@ from typing import Literal, TypeVar
 from urllib.parse import urljoin
 
 from pydantic import BaseModel, ValidationError
+from pypdf import PdfReader
 
 from radar.arquivos import gravar_json_atomico, ler_json
 from radar.cnpj_util import normalizar_cnpj
@@ -92,6 +101,14 @@ _PAGINAS = re.compile(r"P[áa]ginas\s+(\d+)\s*/\s*(\d+)")
 _LINK_DELIBERACAO = re.compile(r"""href\s*=\s*["']([^"']*/deliberacoes/deli\d+/deli(\d+)\.html)["']""", re.IGNORECASE)
 _BLOCO_DO_TEXTO = re.compile(r"<article\b[^>]*\bcontentTextoGeral\b[^>]*>(.*?)</article>", re.IGNORECASE | re.DOTALL)
 _LINK_DO_DOCUMENTO = re.compile(r"""<a\b[^>]*\bhref\s*=\s*["']([^"']*/anexos/[^"']*\.html?)["']""", re.IGNORECASE)
+_LINK_DO_PDF = re.compile(r"""<a\b[^>]*\bhref\s*=\s*["']([^"']*/anexos/[^"']*\.pdf)["']""", re.IGNORECASE)
+# as deliberações têm 1 ou 2 páginas e 40 a 300 KB; o que passar disso não é uma delas
+_MAX_BYTES_PDF = 10_000_000
+_MAX_PAGINAS_PDF = 60
+# o menor texto de PDF real tinha mais de 2 mil caracteres; abaixo disto é PDF de imagem ou lixo
+_MIN_CARACTERES_PDF = 100
+# um anexo pode ser publicado depois do invólucro: o que está só com o resumo é visto de novo por este prazo
+_DIAS_PARA_RELER = 180
 _MESES_EN = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 _CARIMBO = re.compile(
     r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) (" + "|".join(_MESES_EN) + r") (\d{1,2}) \d{2}:\d{2}:\d{2} [A-Z]{2,5} (\d{4})\b"
@@ -109,6 +126,8 @@ _DATA_BR = re.compile(r"(\d{2})/(\d{2})/(\d{4})")
 _RAIZ = re.compile(r"[0-9A-Z]{8}")
 
 _T = TypeVar("_T", bound=BaseModel)
+
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 
 class RegistroCVM(BaseModel):
@@ -146,12 +165,17 @@ class ProcessoCVM(BaseModel):
 
 
 class Deliberacao(BaseModel):
-    """`url` é a do invólucro `deliNNN.html`; `texto` junta o resumo dele e, se houver, o texto integral."""
+    """`url` é a do invólucro `deliNNN.html`; `texto` junta o resumo dele e, se houver, o texto integral.
+
+    `integral` diz se o texto integral (do `.htm` ou do PDF do anexo) foi lido. Sem ele só há o resumo, que
+    quase nunca traz CNPJ nem domínio. O campo é obrigatório: um cache de antes dele não vale e é refeito.
+    """
 
     numero: int
     data: date | None = None
     url: str
     texto: str
+    integral: bool
 
 
 def _texto(valor: object) -> str:
@@ -234,6 +258,21 @@ def _linhas_olinda(resposta: RespostaRede, rotulo: str) -> list[dict]:
 def _raiz(valor: object) -> str | None:
     texto = _texto(valor).upper()
     return texto if _RAIZ.fullmatch(texto) else None
+
+
+def _texto_do_pdf(dados: bytes) -> str:
+    """O texto do PDF (páginas separadas por linha em branco), ou `""` se não é PDF, é grande demais ou não tem
+    texto para extrair (PDF de imagem). O PDF vem do site da CVM, mas qualquer falha do `pypdf` com ele é só
+    "sem texto": a deliberação fica com o resumo em vez de derrubar o índice."""
+    if len(dados) > _MAX_BYTES_PDF:
+        return ""
+    try:
+        paginas = PdfReader(io.BytesIO(dados)).pages
+        partes = [(paginas[i].extract_text() or "").strip() for i in range(min(len(paginas), _MAX_PAGINAS_PDF))]
+    except Exception:  # PdfReadError, EmptyFileError, ValueError, RecursionError...
+        return ""
+    texto = "\n\n".join(parte for parte in partes if parte)
+    return texto if len(" ".join(texto.split())) >= _MIN_CARACTERES_PDF else ""
 
 
 def _bloco_do_texto(html: str) -> str | None:
@@ -360,6 +399,15 @@ class Indices:
         except ErroRede as erro:
             raise ErroNo(f"{rotulo}: {erro}", permanente=erro.permanente) from erro
 
+    async def _get_ou_none(self, url: str, rotulo: str) -> RespostaRede | None:
+        """Como `_get`, mas a página que não existe (404) devolve `None`. Qualquer outro erro continua `ErroNo`."""
+        try:
+            return await self._get(url, rotulo)
+        except ErroNo as erro:
+            if isinstance(erro.__cause__, ErroRede) and erro.__cause__.status == 404:
+                return None
+            raise
+
     # --- CVM: cadastros e processo sancionador -------------------------------------------------
 
     async def _baixar_cadastros(self) -> list[RegistroCVM]:
@@ -445,9 +493,12 @@ class Indices:
     ) -> list[Deliberacao]:
         achadas = await self._listar_deliberacoes()
         guardadas = dict(conhecidas)
+        desde = self._agora().date() - timedelta(days=_DIAS_PARA_RELER)
         try:
             for numero, url in achadas.items():
-                if numero in guardadas:
+                anterior = guardadas.get(numero)
+                # o que já está no disco só volta se tem só o resumo e é recente (ou de data desconhecida)
+                if anterior is not None and (anterior.integral or (anterior.data is not None and anterior.data < desde)):
                     continue
                 if (deliberacao := await self._baixar_deliberacao(numero, url)) is not None:
                     guardadas[numero] = deliberacao
@@ -470,11 +521,12 @@ class Indices:
             html = resposta.texto
             marcador = _PAGINAS.search(html)
             if marcador is None:
-                if pagina > 1 and "Nenhum resultado" in html:
-                    break
-                # sem sessão (ou sem o marcador "Páginas n/N") a lista viria vazia: nunca vira índice vazio
+                # sem sessão, com a lista cortada ("Nenhum resultado" antes da última página) ou com a página mudada:
+                # uma lista parcial nunca vira índice
                 raise ErroNo(
-                    "deliberacoes: a busca não devolveu a lista (sessão perdida ou página mudou)", permanente=False
+                    f"deliberacoes: a busca não devolveu a página {pagina} de {total} "
+                    "(sessão perdida, lista cortada ou página mudou)",
+                    permanente=False,
                 )
             total = int(marcador[2])
             if total > _MAX_PAGINAS:
@@ -485,30 +537,40 @@ class Indices:
         return achadas
 
     async def _baixar_deliberacao(self, numero: int, url: str) -> Deliberacao | None:
-        """A deliberação do invólucro `url`, ou `None` se a página não existe (404) ou perdeu o bloco do texto."""
-        try:
-            html = (await self._get(url, "deliberacoes")).texto
-        except ErroNo as erro:
-            if erro.permanente:
-                return None
-            raise
-        if (bloco := _bloco_do_texto(html)) is None:
+        """A deliberação do invólucro `url`; `None` só se o invólucro não existe (404).
+
+        Invólucro sem o bloco do texto (o layout mudou) ou qualquer outro erro é `ErroNo`: pular a deliberação
+        em silêncio esconderia justamente as novas, que são as únicas com texto integral.
+        """
+        resposta = await self._get_ou_none(url, "deliberacoes")
+        if resposta is None:
             return None
+        if (bloco := _bloco_do_texto(resposta.texto)) is None:
+            raise ErroNo(
+                f"deliberacoes: {url} sem o bloco do texto da deliberação (o layout da página mudou?)", permanente=True
+            )
         resumo = texto_de_html(bloco)
         carimbo = _CARIMBO.search(resumo)
         data = date(int(carimbo[3]), _MESES_EN.index(carimbo[1]) + 1, int(carimbo[2])) if carimbo else None
-        texto = resumo
-        if documento := _LINK_DO_DOCUMENTO.search(bloco):
-            try:
-                integral = texto_de_html((await self._get(urljoin(url, documento[1]), "deliberacoes")).texto)
-            except ErroNo as erro:
-                if not erro.permanente:
-                    raise
-            else:
-                texto = f"{resumo}\n{integral}"
-                # sem carimbo, vale a primeira data do texto integral; a do resumo cita leis e resoluções
-                data = data or _data_por_extenso(integral)
-        return Deliberacao(numero=numero, data=data, url=url, texto=texto)
+        integral = await self._texto_integral(url, bloco)
+        if not integral:
+            return Deliberacao(numero=numero, data=data, url=url, texto=resumo, integral=False)
+        # sem carimbo, vale a primeira data do texto integral; a do resumo cita leis e resoluções
+        return Deliberacao(
+            numero=numero, data=data or _data_por_extenso(integral), url=url, texto=f"{resumo}\n{integral}", integral=True
+        )
+
+    async def _texto_integral(self, url: str, bloco: str) -> str:
+        """O texto do `.htm` do anexo ou, sem ele (ou sem texto nele), o do PDF; `""` se nenhum dos dois serve."""
+        for padrao, extrair in (
+            (_LINK_DO_DOCUMENTO, lambda r: texto_de_html(r.texto).strip()),
+            (_LINK_DO_PDF, lambda r: _texto_do_pdf(r.conteudo)),
+        ):
+            link = padrao.search(bloco)
+            resposta = await self._get_ou_none(urljoin(url, link[1]), "deliberacoes") if link else None
+            if resposta is not None and (texto := extrair(resposta)):
+                return texto
+        return ""
 
 
 def _por_numero(deliberacoes: dict[int, Deliberacao]) -> list[Deliberacao]:

@@ -836,7 +836,7 @@ async def test_nucleo_ponta_a_ponta_em_modo_atual(respx_mock, tmp_path):
     # a Petrobras não está nos cadastros da CVM nem nas sedes do BCB, não é acusada e nenhuma stop order cita o CNPJ dela
     assert (ex.saidas["registros"]["registrado"], ex.saidas["registros"]["motivo"]) == (False, None)
     assert ex.saidas["cvm_sancionador"] == {"processos": [], "motivo": None}
-    assert ex.saidas["cvm_alertas"] == {"correspondencias": []}
+    assert ex.saidas["cvm_alertas"] == {"correspondencias": [], "cobertura": {"com_texto_integral": 7, "so_resumo": 0}}
     assert motor.pendencias_abertas() == []
     # 1 RDAP + 5 DoH + 1 crt.sh + 2 CDX do Wayback (domínio e home) + snapshot da home (HTML e texto) + 1 BrasilAPI
     # + 5 provas de consulta aos índices (cadastros_cvm, instituicoes_bcb, dominios_bcb, sancionador, deliberacoes)

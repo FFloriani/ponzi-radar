@@ -28,6 +28,10 @@ ZIPS_CVM = {
 URL_SANCIONADOR = URL_CVM + "PROCESSO/SANCIONADOR/DADOS/processo_sancionador.zip"
 URL_INVOLUCRO = r"https://conteudo\.cvm\.gov\.br/legislacao/deliberacoes/deli\d+/[Dd]eli(\d+)\.html"
 URL_DOCUMENTO = r"https://conteudo\.cvm\.gov\.br/legislacao/deliberacoes/anexos/\d+/deli(\d+)\.htm"
+URL_PDF = r"https://conteudo\.cvm\.gov\.br/export/sites/cvm/legislacao/deliberacoes/anexos/\d+/deli(\d+)\.pdf"
+# invólucros reais gravados (os outros números ganham um invólucro sintético) e os PDFs reais que existem
+INVOLUCROS_REAIS = {905: "deli905.html", 509: "deli509.html", 586: "deli586.html"}
+PDFS = {509: "deli509.pdf", 586: "deli586.pdf"}
 TOTAL_PAGINAS = 28  # "Páginas 1/28": o que a busca real respondia em 07/10/2026
 SESSAO = "JSESSIONID=SESSAO-DE-TESTE"
 
@@ -96,7 +100,7 @@ def mocar_deliberacoes(respx_mock, *, exigir_sessao: bool = True) -> SimpleNames
     sessão). As páginas 3 a 28 só trazem o marcador "Páginas n/28", sem artigos. `.requisicoes` guarda o que foi
     pedido: `paginas` (searchPage), `involucros` e `documentos` (números).
     """
-    reg = SimpleNamespace(paginas=[], involucros=[], documentos=[], partida=None, jsp=None)
+    reg = SimpleNamespace(paginas=[], involucros=[], documentos=[], pdfs=[], partida=None, jsp=None)
 
     def jsp(request: httpx.Request) -> httpx.Response:
         if exigir_sessao and SESSAO not in request.headers.get("cookie", ""):
@@ -114,7 +118,7 @@ def mocar_deliberacoes(respx_mock, *, exigir_sessao: bool = True) -> SimpleNames
     def involucro(request: httpx.Request) -> httpx.Response:
         numero = int(re.fullmatch(URL_INVOLUCRO, str(request.url)).group(1))
         reg.involucros.append(numero)
-        corpo = fixture_bytes("deli905.html") if numero == 905 else _involucro_sintetico(numero)
+        corpo = fixture_bytes(INVOLUCROS_REAIS[numero]) if numero in INVOLUCROS_REAIS else _involucro_sintetico(numero)
         return httpx.Response(200, content=corpo, headers={"content-type": "text/html;charset=UTF-8"})
 
     def documento(request: httpx.Request) -> httpx.Response:
@@ -123,10 +127,41 @@ def mocar_deliberacoes(respx_mock, *, exigir_sessao: bool = True) -> SimpleNames
         corpo = fixture_bytes("deli905.htm") if numero == 905 else _documento_sintetico(numero)
         return httpx.Response(200, content=corpo, headers={"content-type": "text/html;charset=UTF-8"})
 
+    def pdf(request: httpx.Request) -> httpx.Response:
+        numero = int(re.fullmatch(URL_PDF, str(request.url)).group(1))
+        reg.pdfs.append(numero)
+        if numero not in PDFS:
+            return httpx.Response(404)
+        return httpx.Response(200, content=fixture_bytes(PDFS[numero]), headers={"content-type": "application/pdf"})
+
     reg.partida = respx_mock.get(URL_DELIBERACOES_PARTIDA).mock(
         return_value=httpx.Response(200, text="<html></html>", headers={"set-cookie": f"{SESSAO}; Path=/; HttpOnly"})
     )
     reg.jsp = respx_mock.get(URL_DELIBERACOES_PAGINAS).mock(side_effect=jsp)
     reg.rota_involucros = respx_mock.get(url__regex=URL_INVOLUCRO).mock(side_effect=involucro)
     reg.rota_documentos = respx_mock.get(url__regex=URL_DOCUMENTO).mock(side_effect=documento)
+    reg.rota_pdfs = respx_mock.get(url__regex=URL_PDF).mock(side_effect=pdf)
     return reg
+
+
+def pdf_com_texto(texto: str) -> bytes:
+    """Um PDF válido de uma página com `texto` (só ASCII, sem parênteses nem barras), para os casos que os PDFs reais não têm."""
+    conteudo = f"BT /F1 12 Tf 72 720 Td ({texto}) Tj ET".encode()
+    objetos = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
+        b"<< /Length %d >>\nstream\n" % len(conteudo) + conteudo + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    saida = bytearray(b"%PDF-1.4\n")
+    deslocamentos = []
+    for numero, objeto in enumerate(objetos, 1):
+        deslocamentos.append(len(saida))
+        saida += b"%d 0 obj\n" % numero + objeto + b"\nendobj\n"
+    inicio_xref = len(saida)
+    saida += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objetos) + 1)
+    for deslocamento in deslocamentos:
+        saida += b"%010d 00000 n \n" % deslocamento
+    saida += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objetos) + 1, inicio_xref)
+    return bytes(saida)
