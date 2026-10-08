@@ -133,7 +133,7 @@ def test_titulo_e_og_site_name_da_pagina_inicial():
     [
         ("Exemplo Invest | Exemplo Brasil", {"Exemplo Invest", "Exemplo Brasil"}),
         ("Exemplo Invest – Exemplo Rendimentos", {"Exemplo Invest", "Exemplo Rendimentos"}),
-        ("Exemplo Invest — Invest Brasil", {"Exemplo Invest", "Invest Brasil"}),
+        ("Exemplo Invest — Invest Brasil", {"Exemplo Invest", "Invest Brasil"}),  # "invest" não é genérico
         ("Exemplo Invest - Exemplo", {"Exemplo Invest", "Exemplo"}),
         ("Exemplo Invest · Início", {"Exemplo Invest"}),
         ("Exemplo Invest: o melhor jeito", {"Exemplo Invest"}),
@@ -147,37 +147,90 @@ def test_titulo_e_partido_nos_separadores(titulo, partes):
     assert termos_da_empresa(com_titulo(titulo)) - {"Exemplo Invest Ltda"} == partes
 
 
-def test_parte_do_titulo_sem_palavra_do_site_nao_entra():
-    # a promessa no título não vira [EMPRESA]: "Rendimento de 1,5% ao dia" não tem relação com o site
+def test_parte_do_titulo_com_a_promessa_nao_entra():
+    # a promessa no título não vira [EMPRESA]: ela tem "%" e nenhuma relação com o nome do site
     mascara = com_titulo("Exemplo Invest | Rendimento de 1,5% ao dia")
     assert termos_da_empresa(mascara) == {"Exemplo Invest Ltda", "Exemplo Invest"}
     promessa = "Rendimento de 1,5% ao dia, garantido"
     assert mascarar(promessa, mascara) == promessa
-    # nem o termo genérico, mesmo sem número
-    mascara = com_titulo("Investimentos - Exemplo Invest")
-    assert termos_da_empresa(mascara) == {"Exemplo Invest Ltda", "Exemplo Invest"}
+
+
+@pytest.mark.parametrize(
+    ("titulo", "razao", "marca"),
+    [
+        ("Investimentos - Exemplo Invest", "EXEMPLO INVESTIMENTOS LTDA", "Exemplo Invest"),
+        ("Participações - Exemplo", "EXEMPLO PARTICIPACOES LTDA", "Exemplo"),
+        ("Serviços Digitais | Exemplo", "EXEMPLO SERVICOS DIGITAIS LTDA", "Exemplo"),
+    ],
+)
+def test_palavra_generica_da_razao_social_nao_vira_empresa(titulo, razao, marca):
+    # a razão social realista traz a palavra do setor: ela está na razão, mas não identifica ninguém
+    mascara = com_titulo(titulo, cnpj={"razao_social": razao})
+    assert termos_da_empresa(mascara) == {razao, marca}
+
+
+GENERICOS = """
+    Ltda Eireli Sociedade Anônima Companhia Company Grupo Holding Investimento Investimentos Participação
+    Participações Serviço Serviços Digital Digitais Consultoria Assessoria Gestão Negócios Capital Financeira
+    Finanças Financeiro Tecnologia Tecnologias Comércio Empreendimentos Soluções Brasil Brazil Global
+    Internacional Trade Trading Cripto Crypto Banco Bank Clube Club Plataforma Oficial Site Home Início Página
+    Bem-vindo Bemvindo Ganhe Ganhos Renda Rendimento Rendimentos Lucro Lucros Mais Gente
+""".split()
+
+
+@pytest.mark.parametrize("generico", GENERICOS)
+def test_termo_generico_nao_liga_o_titulo_a_razao_social(generico):
+    cnpj = {"razao_social": f"Exemplo {generico} Ltda"}
+    assert generico not in termos_da_empresa(com_titulo(generico, alvo={"dominio": "outro.com.br"}, cnpj=cnpj))
+
+
+def test_invest_nao_e_generico():
+    cnpj = {"razao_social": "Exemplo Invest Ltda"}
+    assert "Invest" in termos_da_empresa(com_titulo("Invest", alvo={"dominio": "outro.com.br"}, cnpj=cnpj))
+
+
+@pytest.mark.parametrize(
+    ("titulo", "dominio", "marca"),
+    [
+        ("Exemplo Invest | Home", "exemploinvest.com.br", "Exemplo Invest"),
+        ("Brais Company", "braiscompany.com", "Brais Company"),
+        ("Plano Bacana - Início", "planobacana.com.br", "Plano Bacana"),
+        ("Seguro-Bacana!", "seguro-bacana.com.br", "Seguro-Bacana!"),
+    ],
+)
+def test_marca_do_titulo_entra_quando_o_dominio_a_concatena(titulo, dominio, marca):
+    # sem CNPJ nem og:site_name, a única ligação do título com o site é o rótulo do domínio
+    assert termos_da_empresa(com_titulo(titulo, alvo={"dominio": dominio}, cnpj={})) == {marca}
+
+
+def test_digito_so_vale_quando_a_parte_e_o_rotulo_do_dominio():
+    assert termos_da_empresa(com_titulo("Invest4U - Home", alvo={"dominio": "invest4u.com"}, cnpj={})) == {"Invest4U"}
+    assert "Exemplo 2024" in termos_da_empresa(com_titulo("Exemplo 2024 | Exemplo Invest"))  # contém o rótulo
+    # pela razão social, a parte com número não entra
+    cnpj = {"razao_social": "Alfa Beta Ltda"}
+    mascara = com_titulo("Alfa 2024 | Beta", alvo={"dominio": "outro.com"}, cnpj=cnpj)
+    assert termos_da_empresa(mascara) == {"Alfa Beta Ltda", "Beta"}
 
 
 @pytest.mark.parametrize(
     "titulo",
     [
-        "Exemplo 2024 | Exemplo Invest",
         "Exemplo 100% | Exemplo Invest",
-        "Exemplo+ 5 | Exemplo Invest",
         "Exemplo % | Exemplo Invest",
+        "Exemplo+ 5% | Exemplo Invest",
+        "Exemplo% | Exemplo Invest",
     ],
 )
-def test_parte_do_titulo_com_digito_ou_porcento_nunca_entra(titulo):
+def test_parte_do_titulo_com_porcento_nunca_entra(titulo):
+    # nem quando ela contém o rótulo do domínio inteiro
     assert termos_da_empresa(com_titulo(titulo)) == {"Exemplo Invest Ltda", "Exemplo Invest"}
 
 
-def test_palavra_em_comum_com_o_dominio_o_og_site_name_o_nome_fantasia_ou_a_razao_social():
-    # cada uma das quatro referências basta, sozinha
+def test_palavra_em_comum_com_o_og_site_name_o_nome_fantasia_ou_a_razao_social():
+    # cada uma das três referências basta, sozinha
     titulo = "Marca Fantasia"
     razao = {"razao_social": "Nada Haver Ltda"}
     assert termos_da_empresa(com_titulo(titulo, alvo={"dominio": "outro.com"}, cnpj=razao)) == {"Nada Haver Ltda"}
-    por_dominio = com_titulo(titulo, alvo={"dominio": "marca.com.br"}, cnpj=razao)
-    assert "Marca Fantasia" in termos_da_empresa(por_dominio)
     fantasia = {**razao, "nome_fantasia": "Fantasia Real"}
     assert "Marca Fantasia" in termos_da_empresa(com_titulo(titulo, alvo={"dominio": "outro.com"}, cnpj=fantasia))
     outra_razao = {"razao_social": "Marca Registrada Ltda"}
@@ -187,29 +240,58 @@ def test_palavra_em_comum_com_o_dominio_o_og_site_name_o_nome_fantasia_ou_a_raza
     assert set(por_og) == {"Marca Fantasia", "Fantasia Brasil"}
 
 
+def test_palavras_genericas_do_og_site_name_nao_ligam_o_titulo():
+    html = (
+        b"<head><title>Ganhe mais todos os dias</title>"
+        b'<meta property="og:site_name" content="Exemplo - ganhe mais com a gente"></head>'
+    )
+    saidas = {"alvo": {"dominio": "exemplo.com.br"}, "captura": {"paginas": [{"html": "sha256:aa"}]}}
+    mascara = montar_mascara(saidas, {"sha256:aa": html}.__getitem__)
+    assert termos_da_empresa(mascara) == {"Exemplo - ganhe mais com a gente"}
+
+
 def test_palavra_curta_em_comum_nao_basta():
-    # "ltda" tem 4 caracteres e vale; "sa" e "de" (menos de 4) não
+    # "alfa" tem 4 caracteres e vale; "sa" e "de" (menos de 4) não
     cnpj = {"razao_social": "Alfa de Sa Ltda"}
     assert "Banco de Sa" not in termos_da_empresa(com_titulo("Banco de Sa", cnpj=cnpj))
     assert "Alfa Ltda" in termos_da_empresa(com_titulo("Alfa Ltda", cnpj=cnpj))
 
 
-def test_rotulo_do_dominio_vem_do_alvo_e_dos_sans_sem_o_tld():
-    com = com_titulo("Seguro Bacana", alvo={"dominio": "seguro-bacana.com.br"}, cnpj={})
-    assert "Seguro Bacana" in termos_da_empresa(com)
-    # só o rótulo conta, não o sufixo público: "museum" é o TLD de outro.museum
+def test_parte_que_esta_dentro_do_rotulo_ou_que_o_contem_entra():
+    site = {"alvo": {"dominio": "exemploinvest.com.br"}, "cnpj": {}}
+    assert termos_da_empresa(com_titulo("Exemplo | Invest", **site)) == {"Exemplo", "Invest"}  # pedaços do rótulo
+    assert termos_da_empresa(com_titulo("Inv | Exe", **site)) == set()  # menos de 4 caracteres
+    # menos de 4 caracteres colados, mesmo com 5 no total: "a.b.c" está dentro de "abcdef" mas não vale
+    assert termos_da_empresa(com_titulo("A.B.C", alvo={"dominio": "abcdef.com.br"}, cnpj={})) == set()
+    contem = com_titulo("Exemplo Invest Brasil Oficial | Home", alvo={"dominio": "exemploinvest.com.br"}, cnpj={})
+    assert termos_da_empresa(contem) == {"Exemplo Invest Brasil Oficial"}  # contém o rótulo inteiro
+
+
+def test_rotulo_curto_nao_puxa_titulo_nenhum():
+    # "ab" está dentro de "Abacate": um rótulo de menos de 4 caracteres não vale como "contido na parte"
+    assert termos_da_empresa(com_titulo("Abacate Verde", alvo={"dominio": "ab.com.br"}, cnpj={})) == set()
+
+
+def test_rotulo_do_dominio_vem_do_registravel_e_dos_sans_sem_o_sufixo():
+    # o sufixo público não conta: "museum" é o TLD de outro.museum
     sem = com_titulo("Museum Tickets", alvo={"dominio": "outro.museum"}, cnpj={})
-    assert "Museum Tickets" not in termos_da_empresa(sem)
+    assert termos_da_empresa(sem) == set()
     sans = {"sans": ["www.planobacana.com.br", "planobacana.com.br"]}
-    # "planobacana" é uma palavra só: não é a palavra "plano"
-    assert "Plano Bacana" not in termos_da_empresa(com_titulo("Plano Bacana", alvo={}, ct=sans, cnpj={}))
-    assert "Planobacana Premium" in termos_da_empresa(com_titulo("Planobacana Premium", alvo={}, ct=sans, cnpj={}))
+    com_sans = com_titulo("Plano Bacana", alvo={}, ct=sans, cnpj={})
+    assert termos_da_empresa(com_sans) == {"Plano Bacana"}
+    # só o rótulo registrável: "investimentos" em investimentos.outro.com.br é um serviço do site, não o nome
+    subdominio = {"sans": ["investimentos.outro.com.br"]}
+    assert termos_da_empresa(com_titulo("Investimentos", alvo={}, ct=subdominio, cnpj={})) == set()
 
 
 def test_rotulo_do_dominio_idn_vale_nas_duas_grafias():
     titulo = "Investimentoseguro Ação"
     assert titulo in termos_da_empresa(com_titulo(titulo, alvo={"dominio": ALVO_PUNYCODE}, cnpj={}))
     assert titulo in termos_da_empresa(com_titulo(titulo, alvo={}, ct={"sans": ["www." + ALVO_IDN]}, cnpj={}))
+    # sem acento também: o rótulo é comparado dobrado
+    assert "Investimentoseguro Acao" in termos_da_empresa(
+        com_titulo("Investimentoseguro Acao", alvo={"dominio": ALVO_PUNYCODE}, cnpj={})
+    )
 
 
 @pytest.mark.parametrize("atributo", ["property", "name"])
