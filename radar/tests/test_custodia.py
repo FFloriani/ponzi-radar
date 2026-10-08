@@ -348,3 +348,14 @@ def test_registros_na_ordem_do_log_sem_as_linhas_ilegiveis(tmp_path):
     registros_ = registros(tmp_path)
     assert [(r["seq"], r["tipo"], r["origem"], r["sha256"]) for r in registros_] == [(0, "pagina", "a\N{LINE SEPARATOR}b", ABC)]
     assert registros(tmp_path / "nada") == []
+
+
+def test_guardar_em_log_sem_quebra_de_linha_final(tmp_path):
+    # I8: um log cujo fim perdeu o "\n" (editor, cópia, queda) não pode colar a linha nova na anterior
+    c = Custodia(tmp_path)
+    c.guardar(b"um", "txt", tipo="texto", origem="a")
+    log = tmp_path / "custodia.log"
+    log.write_bytes(log.read_bytes().rstrip(b"\n"))
+    c.guardar(b"dois", "txt", tipo="texto", origem="b")
+    assert verificar(tmp_path) == []
+    assert len(log.read_bytes().split(b"\n")) == 3 and log.read_bytes().endswith(b"\n")

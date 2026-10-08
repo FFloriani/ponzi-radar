@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import logging
+import subprocess
 import sys
 import threading
 import time
@@ -430,3 +432,72 @@ def test_trava_trata_acesso_negado_transitorio_do_windows_como_ocupada(tmp_path,
     with trava(tmp_path / "x.lock", timeout=2.0):
         pass
     assert falhas == [1]
+
+
+# --- trava órfã (I8) ------------------------------------------------------
+
+
+def test_trava_grava_pid_e_instante(tmp_path):
+    lock = tmp_path / "x.lock"
+    antes = time.time()
+    with trava(lock):
+        pid, instante = lock.read_text(encoding="ascii").split()
+    assert int(pid) == os.getpid() and antes - 1 <= float(instante) <= time.time() + 1
+
+
+def _segurar_e_morrer(lock: Path) -> int:
+    """Um processo que pega a trava e é morto com ela na mão (o Claude Code reiniciando o servidor MCP)."""
+    codigo = (
+        "import sys, time\n"
+        "from radar.arquivos import trava\n"
+        "with trava(sys.argv[1]):\n"
+        "    print('segurando', flush=True)\n"
+        "    time.sleep(60)\n"
+    )
+    processo = subprocess.Popen([sys.executable, "-c", codigo, str(lock)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert processo.stdout.readline().strip() == "segurando"
+    finally:
+        processo.kill()
+        processo.wait(10)
+        processo.stdout.close()
+    assert lock.exists()  # morreu sem soltar
+    # o pid do lockfile (no Windows, o python do venv é um lançador e o interpretador é outro processo)
+    return int(lock.read_text(encoding="ascii").split()[0])
+
+
+def test_trava_de_processo_morto_e_quebrada_com_aviso(tmp_path, caplog):
+    lock = tmp_path / "motor.lock"
+    pid = _segurar_e_morrer(lock)
+    with caplog.at_level(logging.WARNING, logger="radar.arquivos"):
+        with trava(lock, timeout=0.3):
+            assert lock.read_text(encoding="ascii").split()[0] == str(os.getpid())
+    assert not lock.exists()
+    assert any("trava órfã" in r.getMessage() and str(pid) in r.getMessage() for r in caplog.records)
+
+
+def test_trava_com_mais_de_10_minutos_e_quebrada(tmp_path):
+    lock = tmp_path / "x.lock"
+    lock.write_text(f"{os.getpid()} {time.time() - 11 * 60:.3f}\n", encoding="ascii")  # vivo, mas esquecido
+    with trava(lock, timeout=0.2):
+        pass
+    assert not lock.exists()
+
+
+def test_trava_ilegivel_e_antiga_pelo_relogio_do_arquivo_e_quebrada(tmp_path):
+    lock = tmp_path / "x.lock"
+    lock.write_bytes(b"")  # o processo morreu entre criar e escrever
+    velho = time.time() - 11 * 60
+    os.utime(lock, (velho, velho))
+    with trava(lock, timeout=0.2):
+        pass
+
+
+def test_trava_de_processo_vivo_estoura_dizendo_como_liberar(tmp_path):
+    lock = tmp_path / "x.lock"
+    with trava(lock):
+        with pytest.raises(TimeoutError) as e:
+            with trava(lock, timeout=0.1):
+                pass
+    mensagem = str(e.value)
+    assert str(lock) in mensagem and f"pid {os.getpid()}" in mensagem and "apague o arquivo" in mensagem

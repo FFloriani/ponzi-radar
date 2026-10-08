@@ -57,6 +57,19 @@ def _entrada_da_linha(linha: str, posicao: int, para: str) -> str:
     return entrada
 
 
+def _termina_em_quebra(log: Path) -> bool:
+    """O log vazio, inexistente ou cujo último byte é `\\n`."""
+    try:
+        with log.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            if f.tell() == 0:
+                return True
+            f.seek(-1, os.SEEK_END)
+            return f.read(1) == b"\n"
+    except FileNotFoundError:
+        return True
+
+
 def _arquivos_do_hash(artefatos: Path, hex_: str) -> list[Path]:
     # o nome é `<hex>.<ext>`; temporários da gravação começam com "." e não casam
     return sorted(artefatos.glob(f"{hex_}.*"))
@@ -109,8 +122,10 @@ class Custodia:
             linha = _canonico(registro) + "\n"
             if not _arquivos_do_hash(self._artefatos, hex_):
                 _gravar_artefato(self._artefatos / f"{hex_}.{ext}", dados)
+            separar = not _termina_em_quebra(self._log)
             with self._log.open("a", encoding="utf-8", newline="\n") as f:
-                f.write(linha)
+                # um log cujo fim perdeu o "\n" não pode colar a linha nova na anterior (I8)
+                f.write("\n" + linha if separar else linha)
                 f.flush()
                 os.fsync(f.fileno())
         return f"sha256:{hex_}"
