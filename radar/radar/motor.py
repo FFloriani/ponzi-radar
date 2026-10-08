@@ -34,6 +34,7 @@ from radar.rede import Rede
 _STATUS = frozenset(get_args(StatusNo))
 _TERMINAIS = frozenset({"feito", "pulado", "erro", "bloqueado"})
 _COM_MOTIVO = frozenset({"erro", "bloqueado", "pulado"})
+INVALIDADO_A_MONTANTE = "mudança a montante"
 
 
 @dataclass
@@ -96,6 +97,16 @@ def _dependencias(no: NoBase) -> tuple[str, ...]:
 
 def _canonico(dados: Any) -> str:
     return json.dumps(dados, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _insumos(pendencia: Pendencia) -> str:
+    """O que a resposta julgou: os candidatos e o `conteudo_do_alvo`, em JSON canônico (a guardada volta do disco)."""
+    return _canonico(
+        {
+            "candidatos": [c.model_dump(mode="json") for c in pendencia.candidatos],
+            "conteudo_do_alvo": pendencia.conteudo_do_alvo,
+        }
+    )
 
 
 def _normalizar(saidas: Any) -> dict:
@@ -287,6 +298,8 @@ class Motor:
 
     def _aplicar(self, nome: str, resultado: Any) -> None:
         if isinstance(resultado, Feito):
+            if self._reabrir_se_mudou(nome, resultado.pendencias):
+                return
             try:
                 saidas = _normalizar(resultado.saidas)
             except (TypeError, ValueError) as e:
@@ -306,6 +319,30 @@ class Motor:
             self._registrar_pendencias(nome, resultado.pendencias)
         else:
             self._mudar(nome, "erro", f"resultado inválido: {type(resultado).__name__}")
+
+    def _reabrir_se_mudou(self, nome: str, pendencias: Any) -> bool:
+        """Compara as pendências que o nó refez (`Feito.pendencias`) com as guardadas. As de candidatos ou
+        `conteudo_do_alvo` diferentes perdem a resposta ativa (`ativa=false`, `"invalidado": "mudança a montante"`; o
+        julgamento continua no histórico) e reabrem, com o nó `aguardando`. `True` se o nó não ficou `feito`."""
+        if not isinstance(pendencias, list | tuple) or any(not isinstance(p, Pendencia) for p in pendencias):
+            self._mudar(nome, "erro", "resultado inválido: Feito.pendencias precisa ser lista de Pendencia")
+            return True
+        mudadas = [
+            p
+            for p in pendencias
+            if (guardada := self._pendencias.get(p.id)) is not None
+            and self._dono(p.id) == nome
+            and _insumos(guardada) != _insumos(p)
+        ]
+        if not mudadas:
+            return False
+        for p in mudadas:
+            if (ativo := self._julgamento_ativo(p.id)) is not None:
+                ativo["ativa"] = False
+                ativo["invalidado"] = INVALIDADO_A_MONTANTE
+                self._julgamentos_sujos = True
+        self._registrar_pendencias(nome, list(pendencias))
+        return True
 
     def _registrar_pendencias(self, nome: str, pendencias: Any) -> None:
         if not isinstance(pendencias, list | tuple):

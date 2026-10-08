@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
@@ -103,7 +104,12 @@ class Sinal(BaseModel):
 
 @dataclass(frozen=True)
 class Feito:
+    """`pendencias`: as pendências do nó que já têm resposta, refeitas com os insumos de agora. O motor compara cada
+    uma com a guardada: se os candidatos ou o `conteudo_do_alvo` mudaram (uma correção a montante), a resposta perde
+    o valor e a pendência reabre. Não entram na igualdade: dois `Feito` com as mesmas saídas são o mesmo resultado."""
+
     saidas: dict
+    pendencias: Sequence[Pendencia] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)

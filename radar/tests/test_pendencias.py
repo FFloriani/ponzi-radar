@@ -10,7 +10,8 @@ from pydantic import ValidationError
 
 from radar.config import Config
 from radar.custodia import Custodia
-from radar.execucao import criar_contexto
+from radar.dossie import gerar_dossie
+from radar.execucao import carregar_execucao, criar_contexto
 from radar.modelos import Aguardando, Candidato, Contexto, ErroNo, Evidencia, Feito, Pendencia, Pulado, Resposta
 from radar.motor import Motor, NoBase, Servicos
 from radar.nos import nos_do_nucleo
@@ -35,6 +36,7 @@ from radar.pendencias.esquemas import (
     ValorD4,
     ValorE,
 )
+from radar.pontuacao import itens_da_execucao
 from tests.matriz_spec import MATRIZ_SPEC
 
 AGORA = datetime(2026, 10, 7, 12, 0, 0)
@@ -1068,3 +1070,105 @@ async def test_motor_pend_e_cai_em_erro_sem_matriz(tmp_path):
     assert motor.status()["pend_e"] == "erro"
     assert "P-E" not in _abertas(motor)
     assert motor.status()["pend_b"] == "aguardando"  # um nó em erro não derruba os outros
+
+
+# ---------------------------------------------------------------------------- correção a montante (I1)
+
+EMPRESA_ANTIGA = {
+    "cnpj": PETROBRAS, "razao_social": "EMPRESA ANTIGA LTDA", "nome_fantasia": None,
+    "socios": [{"nome": "FULANO ANTIGO DE TAL", "qualificacao": "Sócio", "entrada": None}],
+}  # fmt: skip
+BANCO_DO_BRASIL = "00000000000191"
+EMPRESA_NOVA = {
+    "cnpj": BANCO_DO_BRASIL, "razao_social": "EMPRESA NOVA S A", "nome_fantasia": None,
+    "socios": [{"nome": "BELTRANA NOVA DE TAL", "qualificacao": "Sócia", "entrada": None}],
+}  # fmt: skip
+
+
+class _CnpjPelaPendencia(NoBase):
+    """O nó `cnpj` reduzido à P-CNPJ: sem resposta, pergunta; com ela, entrega a empresa do CNPJ respondido."""
+
+    nome = "cnpj"
+    entradas = ("extracao",)
+
+    async def executar(self, ctx, entradas, respostas, s):
+        if (r := respostas.get("P-CNPJ")) is None:
+            return Aguardando([nova_pendencia("P-CNPJ", ctx, [], self.nome, s.matriz)])
+        return Feito({PETROBRAS: EMPRESA_ANTIGA, BANCO_DO_BRASIL: EMPRESA_NOVA}[r.valor["cnpj"]])
+
+
+def _motor_com_p_cnpj(tmp_path) -> Motor:
+    ctx = criar_contexto("https://exemplo.com.br/", None, "nenhum", False, tmp_path, AGORA)
+    servicos = Servicos(config=Config(), rede=None, custodia=Custodia(ctx.pasta), matriz=MATRIZ_SPEC)
+    coletores = [no for no in _coletores([]) if no.nome != "cnpj"]
+    return Motor(ctx, [*coletores, _CnpjPelaPendencia(), *nos_de_pendencia()], servicos)
+
+
+def _ativo(motor: Motor, pid: str) -> dict | None:
+    return next((j for j in motor._julgamentos if j["pendencia"] == pid and j["ativa"]), None)
+
+
+async def test_correcao_a_montante_reabre_as_pendencias_cujos_candidatos_mudaram(tmp_path):
+    motor = _motor_com_p_cnpj(tmp_path)
+    await motor.executar()
+    assert "P-CNPJ" in _abertas(motor) and "P-D1" not in _abertas(motor)
+    await motor.responder("P-CNPJ", resposta("confirmado", {"cnpj": PETROBRAS}))
+    d1 = next(p for p in motor.pendencias_abertas() if p.id == "P-D1")
+    assert [c.valor for c in d1.candidatos] == ["FULANO ANTIGO DE TAL"]
+
+    await motor.responder("P-D1", resposta(
+        "confirmado", {"historico_fraude": True, "pessoas": [{"pessoa": "FULANO ANTIGO DE TAL", "vinculo": "réu"}]}
+    ))  # fmt: skip
+    await motor.responder("P-C", resposta(
+        "confirmado",
+        {"contrato_atipico": True, "tipo_contrato": "mútuo", "conta_pf_ou_terceiro": True, "offshore_alegado": False},
+    ))  # fmt: skip
+    await motor.responder("P-C4", resposta("nao_encontrado"))
+    assert motor.status()["pend_d1"] == motor.status()["pend_c"] == motor.status()["pend_c4"] == "feito"
+    await motor.responder("P-B", resposta("nao_encontrado"))  # a P-B não depende do CNPJ
+    b_antes = _ativo(motor, "P-B")
+
+    # a P-CNPJ é corrigida para outra empresa: os sócios e a empresa candidata mudam
+    corrigida = resposta("corrigido", {"cnpj": BANCO_DO_BRASIL})
+    abertas = await motor.responder("P-CNPJ", corrigida.model_copy(update={"substitui": _ativo(motor, "P-CNPJ")["id"]}))
+    assert {"P-C", "P-C4", "P-D1"} <= {p.id for p in abertas}
+    for no, pid in (("pend_c", "P-C"), ("pend_c4", "P-C4"), ("pend_d1", "P-D1")):
+        assert motor.status()[no] == "aguardando", no
+        assert _ativo(motor, pid) is None, pid
+        (invalidado,) = [j for j in motor._julgamentos if j["pendencia"] == pid]
+        assert (invalidado["ativa"], invalidado["invalidado"]) == (False, "mudança a montante")  # histórico mantido
+    d1 = next(p for p in motor.pendencias_abertas() if p.id == "P-D1")
+    assert [c.valor for c in d1.candidatos] == ["BELTRANA NOVA DE TAL"]
+    c4 = next(p for p in motor.pendencias_abertas() if p.id == "P-C4")
+    assert [c.valor for c in c4.candidatos] == [BANCO_DO_BRASIL]
+    assert _ativo(motor, "P-B") == b_antes and motor.status()["pend_b"] == "feito"  # nada mudou nela
+
+    # o que está em disco também: a P-D1 reaberta, sem a resposta sobre a empresa antiga
+    salva = carregar_execucao(motor.ctx.pasta)
+    assert salva.pendencias["P-D1"]["aberta"] is True
+    assert [c["valor"] for c in salva.pendencias["P-D1"]["candidatos"]] == ["BELTRANA NOVA DE TAL"]
+    texto = gerar_dossie(motor.ctx.pasta, MATRIZ_SPEC, forcar=True).read_text(encoding="utf-8")
+    assert "FULANO ANTIGO DE TAL" not in texto and "Pessoas ligadas a esquemas" not in texto
+    itens = itens_da_execucao(salva, MATRIZ_SPEC)
+    assert (itens["D1"].estado, itens["C2"].estado, itens["C4"].estado) == ("nao_verificado",) * 3
+
+
+async def test_reexecucao_sem_mudanca_nos_candidatos_mantem_a_resposta(tmp_path):
+    motor = _motor(tmp_path, [candidato("investimento", "investimento", "faça seu investimento")])
+    await motor.executar()
+    await motor.responder("P-A1", resposta("confirmado", {"pct_mes": 45.0, "taxa_diaria": True, "garantido": True}))
+    await motor.responder("P-A3", resposta("confirmado", {"origem_verificavel": False, "custodiante_independente": False}))
+    a3 = _ativo(motor, "P-A3")
+    # a correção da P-A1 roda a `pend_a3` de novo, com os mesmos candidatos: a resposta continua valendo
+    corrigida = resposta("corrigido", {"pct_mes": 30.0, "taxa_diaria": False, "garantido": True})
+    abertas = await motor.responder("P-A1", corrigida.model_copy(update={"substitui": _ativo(motor, "P-A1")["id"]}))
+    assert "P-A3" not in [p.id for p in abertas]
+    assert motor.status()["pend_a3"] == "feito" and _ativo(motor, "P-A3") == a3
+    assert "invalidado" not in a3
+
+
+async def test_pendno_com_resposta_entrega_a_pendencia_ao_motor(ctx, serv):
+    r = resposta("confirmado", {"pct_mes": 30.0, "taxa_diaria": False, "garantido": False})
+    feito = await PendNo("pend_a1").executar(ctx, entradas_da_extracao(candidato("percentual", "1|dia")), {"P-A1": r}, serv)
+    (pendencia,) = feito.pendencias
+    assert (pendencia.id, [c.valor for c in pendencia.candidatos]) == ("P-A1", ["1|dia"])

@@ -29,6 +29,7 @@ from radar.mcp_server import AVISO_NAO_CONFIAVEL, LIMITE_TEXTO, criar_servidor
 from radar.modelos import Aguardando, Candidato, ErroNo, Feito
 from radar.motor import Motor, NoBase
 from radar.nos.alvo import AlvoNo
+from radar.nos.pendencias import PendNo
 from radar.pendencias.definicoes import CABECALHO_NAO_CONFIAVEL, DEFINICOES, nova_pendencia
 from radar.pontuacao import CLASSES
 
@@ -449,6 +450,66 @@ async def test_responder_devolve_pendencias_novas(abrir, tmp_path):
     r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-A1", resposta=resposta_a1(html))
     assert r["novas_pendencias"] == [{"id": "P-D4", "itens": ["D4"], "pergunta": DEFINICOES["P-D4"].pergunta}]
     assert await abertas(srv, run_id) == ["P-B", "P-D4"]
+
+
+class CnpjPelaResposta(NoBase):
+    """O `cnpj` que entrega a empresa do CNPJ respondido na P-CNPJ (cada uma com o seu sócio)."""
+
+    nome = "cnpj"
+    entradas = ("coleta",)
+    EMPRESAS = {
+        "12345678000195": {"cnpj": "12345678000195", "razao_social": "EXEMPLO PARTICIPACOES LTDA",
+                           "socios": [{"nome": "FULANO BELTRANO"}]},
+        "33000167000101": {"cnpj": "33000167000101", "razao_social": "OUTRA EMPRESA S A",
+                           "socios": [{"nome": "CICLANA DE TAL"}]},
+    }  # fmt: skip
+
+    async def executar(self, ctx, entradas, respostas, s):
+        if (resposta := respostas.get("P-CNPJ")) is None:
+            return Aguardando([nova_pendencia("P-CNPJ", ctx, [], self.nome, s.matriz)])
+        return Feito(self.EMPRESAS[resposta.valor["cnpj"]])
+
+
+class Fixo(NoBase):
+    def __init__(self, nome: str, saidas: dict) -> None:
+        super().__init__(nome=nome)
+        self.saidas_fixas = saidas
+
+    async def executar(self, ctx, entradas, respostas, s):
+        return Feito(self.saidas_fixas)
+
+
+async def test_correcao_da_p_cnpj_devolve_a_p_d1_reaberta(abrir, tmp_path):
+    # I1: a resposta à P-D1 era sobre os sócios da empresa antiga; corrigida a P-CNPJ, ela volta a ser pergunta
+    extracao = Fixo("extracao", {"candidatos": [], "fonte": "captura", "truncado": {}})
+    nos = [AlvoNo(), Coleta(), extracao, CnpjPelaResposta(), Fixo("cvm_sancionador", {"processos": []}),
+           PendNo("pend_d1")]  # fmt: skip
+    srv = await abrir(nos)
+    run_id = await iniciar(srv)
+    html = artefatos(tmp_path, run_id)["html"]
+
+    def com_evidencia(valor: dict, trecho: str, substitui: str | None = None) -> dict:
+        evidencia = {"fonte": html, "trecho": trecho, "data_fonte": "2026-10-01", "tipo_fonte": "operador"}
+        return {"status": "confirmado", "valor": valor, "evidencias": [evidencia], "substitui": substitui}
+
+    rodape = "Exemplo Participacoes Ltda - CNPJ 12.345.678/0001-95"
+    r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-CNPJ",
+                     resposta=com_evidencia({"cnpj": "12345678000195"}, rodape))  # fmt: skip
+    assert [p["id"] for p in r["novas_pendencias"]] == ["P-D1"]
+    d1 = {"historico_fraude": True, "pessoas": [{"pessoa": "FULANO BELTRANO", "vinculo": "réu"}]}
+    r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-D1",
+                     resposta=com_evidencia(d1, "socio Fulano Beltrano"))  # fmt: skip
+    assert r["aceita"] is True and await abertas(srv, run_id) == []
+
+    r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-CNPJ",
+                     resposta=com_evidencia({"cnpj": "33000167000101"}, rodape, substitui="P-CNPJ#1"))  # fmt: skip
+    assert r["aceita"] is True
+    assert r["novas_pendencias"] == [{"id": "P-D1", "itens": ["D1"], "pergunta": DEFINICOES["P-D1"].pergunta}]
+    pendencia = await chamar(srv, "ver_pendencia", run_id=run_id, id="P-D1")
+    assert pendencia["aberta"] is True and [c["valor"] for c in pendencia["candidatos"]] == ["CICLANA DE TAL"]
+    julgamentos = ler_json(pasta(tmp_path, run_id) / "julgamentos.json")
+    (d1_antigo,) = [j for j in julgamentos if j["pendencia"] == "P-D1"]
+    assert (d1_antigo["ativa"], d1_antigo["invalidado"]) == (False, "mudança a montante")
 
 
 async def test_marcas_gravadas_no_julgamento(abrir, tmp_path):

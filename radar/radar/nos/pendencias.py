@@ -5,7 +5,9 @@ categorias que a definição lista) e:
 
 - se a condição de geração falha, fica `Pulado`; a condição vem antes da resposta, de modo que uma resposta
   que perdeu o sentido (a P-A3 depois de a P-A1 ser corrigida para "sem retorno") não passa adiante;
-- se há resposta ativa, entrega `Feito({"resposta": ...})`;
+- se há resposta ativa, entrega `Feito({"resposta": ...})`, com a pendência refeita em `Feito.pendencias`: se os
+  candidatos mudaram desde a resposta (a P-CNPJ corrigida para outra empresa muda os sócios da P-D1), o motor
+  invalida a resposta e reabre a pendência;
 - senão, devolve `Aguardando` com a pendência.
 
 | Nó | Entradas | Gera |
@@ -199,9 +201,10 @@ class PendNo(NoBase):
         candidatos = self._especificacao.preparar(ctx, entradas, s)
         if isinstance(candidatos, Pulado):
             return candidatos
+        pendencia = nova_pendencia(self.pendencia, ctx, candidatos, self.nome, s.matriz)
         if (resposta := respostas.get(self.pendencia)) is not None:
-            return Feito({"resposta": resposta.model_dump(mode="json")})
-        return Aguardando([nova_pendencia(self.pendencia, ctx, candidatos, self.nome, s.matriz)])
+            return Feito({"resposta": resposta.model_dump(mode="json")}, pendencias=[pendencia])
+        return Aguardando([pendencia])
 
 
 def nos_de_pendencia() -> list[PendNo]:
