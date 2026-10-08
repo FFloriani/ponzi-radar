@@ -1,0 +1,6 @@
+# texto em LF em qualquer clone (o ouro e o teste do .mcp.json comparam bytes); binários sem conversão
+* text=auto eol=lf
+*.pdf binary
+*.zip binary
+*.png binary
+*.har binary
