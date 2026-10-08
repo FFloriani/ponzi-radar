@@ -201,6 +201,26 @@ def test_percentual_milhar_converte_com_o_valor_certo():
     assert c.extra["pct_mes"] == converter_para_mes(1000, "ano")
 
 
+@pytest.mark.parametrize(
+    "absurdo",
+    [
+        "10.000.000.000.000% ao dia",
+        "999.999.999.999.999% ao dia",
+        "rendimento diário de 10.000.000.000.000%",  # a unidade vem antes
+        "999.999.999.999.999% a cada 24 horas",
+    ],
+)
+def test_percentual_grande_demais_e_descartado_e_o_resto_segue(absurdo):
+    # (1 + p/100) ** 30 estoura o float: `converter_para_mes` levanta ValueError
+    with pytest.raises(ValueError):
+        converter_para_mes(1e15, "dia")
+    assert candidatos(absurdo, "percentual") == []
+    texto = f"Rende 1% ao dia e {absurdo}. CNPJ 33.000.167/0001-01 e 2% ao mês, garantido."
+    cs = extrair(texto, "a")
+    assert [c.valor for c in cs if c.categoria == "percentual"] == ["1|dia", "2|mes"]
+    assert {c.categoria for c in cs} >= {"cnpj", "garantido"}
+
+
 def test_percentual_repetido_guarda_a_primeira_ocorrencia():
     texto = "Rende 1% ao dia. Sim, 1% ao dia! Até 1% ao dia."
     c = candidatos(texto, "percentual")
@@ -507,6 +527,25 @@ def test_indicacao_formas_de_rede(texto, esperado):
 @pytest.mark.parametrize(
     "texto,esperado",
     [
+        ("Indique seus amigos e ganhe 10%", ["indique"]),
+        ("Indique alguém", ["indique"]),
+        ("Indique 3 amigos", ["indique"]),
+        ("Convide seus amigos", ["convide"]),
+        ("Indiquem seus amigos", ["indiquem"]),
+        ("Convidem a família", ["convidem"]),
+        ("você pode indicar amigos", ["indicar amigos"]),
+        ("Indique amigos", ["indique amigos"]),  # a frase fixa vale mais que a palavra solta
+        ("indicado para iniciantes, convidados e indicar", []),  # pedaço de outra palavra não conta
+        ("reindique, desconvide", []),
+    ],
+)
+def test_indicacao_indique_e_convide_soltos(texto, esperado):
+    assert valores(texto, "indicacao") == esperado
+
+
+@pytest.mark.parametrize(
+    "texto,esperado",
+    [
         ("Taxa de liberação de 10%", ["taxa de liberação"]),
         ("taxa de desbloqueio", ["taxa de desbloqueio"]),
         ("Liberação do saque em D+1", ["liberação do saque"]),
@@ -782,6 +821,18 @@ def test_atributos_ignoram_script_data_uri_e_repetidos():
     assert [(c.valor, c.posicao) for c in cs] == [
         ("wa.me/5511999998888", html.index("https://wa.me/5511999998888"))
     ]
+
+
+def test_atributos_numa_tag_so_os_20_primeiros_href_src_e_action():
+    valores_do_html = [f"https://wa.me/{i:012d}" for i in range(30)]
+    html = "<a " + " ".join(f'{("href", "src", "action")[i % 3]}="{v}"' for i, v in enumerate(valores_do_html)) + ">"
+    cs = extrair_atributos(html, "h")
+    assert [c.valor for c in cs] == [f"wa.me/{i:012d}" for i in range(20)]
+    # e o offset de cada um continua certo, um depois do outro
+    assert [c.posicao for c in cs] == [html.index(v) for v in valores_do_html[:20]]
+    # os 20 contam só os que têm valor novo; a mesma tag com outros atributos não gasta a conta
+    html = '<a id=1 class=x title=y href="https://t.me/canal_vip" data-a=1 data-b=2>x</a>'
+    assert atributos(html) == ["t.me/canal_vip"]
 
 
 def test_atributos_so_href_src_e_action():
@@ -1119,6 +1170,9 @@ HTMLS_HOSTIS = {
     "script": "<script>" + "x" * 5_000_000,
     "href_vazio": "<a href>" * 400_000,
     "base64": '<img src="data:image/png;base64,' + "QUJD" * 1_000_000 + '">',
+    # 80 mil `href` distintos numa tag só (1 MB): custava 22 s quando cada um buscava o offset na tag inteira
+    "href_distintos_numa_tag": "<a " + "".join(f'href="u{i}" ' for i in range(80_000)) + ">",
+    "href_e_src_distintos_numa_tag": "<img " + "".join(f"src=s{i} href=h{i} " for i in range(60_000)) + ">",
 }
 
 
@@ -1369,6 +1423,12 @@ async def test_no_2mb_de_emails_distintos_no_no(ctx, serv):
     assert len(resultado.saidas["candidatos"]) == TETO_POR_CATEGORIA
     assert resultado.saidas["truncado"] == {"https://alvo.com.br/": ["email"]}
     assert len(json.dumps(resultado.saidas)) < 100_000  # e não 60 MB
+
+
+async def test_no_percentual_absurdo_nao_derruba_o_no(ctx, serv):
+    p = pagina(serv, "https://alvo.com.br/", "Rende 10.000.000.000.000% ao dia e 1% ao mês. Pix")
+    resultado = await ExtracaoNo().executar(ctx, {"captura": {"paginas": [p], "bloqueada": False}}, {}, serv)
+    assert [c["valor"] for c in resultado.saidas["candidatos"]] == ["1|mes", "pix"]
 
 
 # --- dentro do motor: as dependências, a normalização das saídas e a retomada

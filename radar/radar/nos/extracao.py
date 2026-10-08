@@ -179,7 +179,12 @@ _INDICACAO = _frases(
     r"c[óo]digo de (?:indica(?:[çc][ãa]o|[çc][õo]es)|afiliad[oa]|convite)",
     r"indique e (?:ganhe|receba)",
     r"indique (?:amigos|um amigo)",
+    r"indicar amigos",
     r"convide (?:amigos|e ganhe)",
+    r"indiquem",
+    r"indique",
+    r"convidem",
+    r"convide",
     r"rede de indicados",
     r"b[ôo]nus bin[áa]ri[oa]",
     r"bin[áa]ri[oa]",
@@ -381,10 +386,14 @@ def _para_decimal(numero: str) -> Decimal:
     return Decimal(numero.replace(",", "."))
 
 
-def _percentual(baixo: str, bruto: str, periodo: str, inicio: int, fim: int) -> _Achado:
+def _percentual(baixo: str, bruto: str, periodo: str, inicio: int, fim: int) -> _Achado | None:
     numero = _para_decimal(bruto)
+    try:
+        pct_mes = converter_para_mes(float(numero), periodo)
+    except ValueError:
+        return None  # "10.000.000.000.000% ao dia" estoura o float: sem conversão, o achado é descartado
     ate = bool(_ATE.search(baixo[max(0, inicio - 24) : inicio]))
-    extra = {"pct_mes": converter_para_mes(float(numero), periodo), "ate": ate}
+    extra = {"pct_mes": pct_mes, "ate": ate}
     return _Achado(inicio, fim, "percentual", f"{format(numero.normalize(), 'f')}|{periodo}", extra)
 
 
@@ -401,7 +410,8 @@ def _percentuais(texto: str, baixo: str) -> Iterator[_Achado]:
             continue
         vistos.add((m.group(1), periodo))
         fim = m.end() if m.group("faixa") else m.end("unidade")  # o achado vai até o fim da unidade
-        yield _percentual(baixo, m.group(1), periodo, m.start(1), fim)
+        if achado := _percentual(baixo, m.group(1), periodo, m.start(1), fim):
+            yield achado
     # a unidade antes: o número que vem logo depois de cada marcador, se ele for o mais próximo
     inicios, fins, periodos = [], [], []
     for marcador in _ANTES.finditer(baixo):
@@ -421,7 +431,8 @@ def _percentuais(texto: str, baixo: str) -> Iterator[_Achado]:
         if (propria and _periodo_de(propria)) or (numero.group(1), periodo) in vistos:
             continue  # a unidade de depois do número vale mais, e já foi vista
         vistos.add((numero.group(1), periodo))
-        yield _percentual(baixo, numero.group(1), periodo, inicio, numero.end())
+        if achado := _percentual(baixo, numero.group(1), periodo, inicio, numero.end()):
+            yield achado
 
 
 # --- CNPJ
@@ -645,13 +656,16 @@ def extrair(texto: str, artefato: str) -> list[Candidato]:
 # ---------------------------------------------------------------------------- atributos do HTML
 
 _ATRIBUTOS_DE_LINK = frozenset({"href", "src", "action"})
+_ATRIBUTOS_POR_TAG = 20  # valores novos lidos de uma mesma tag
 
 
 class _Atributos(HTMLParser):
     """Os valores de `href`, `src` e `action` de todas as tags, com o offset de cada um no HTML.
 
     O `HTMLParser` não executa nem baixa nada e não entra em `<script>` e `<style>`. Valores repetidos
-    ficam com o primeiro offset; `data:` (imagem em base64) e valores vazios ficam de fora.
+    ficam com o primeiro offset; `data:` (imagem em base64) e valores vazios ficam de fora. De cada tag
+    vêm no máximo `_ATRIBUTOS_POR_TAG` valores novos, e o offset de cada um é achado na tag a partir do fim
+    do anterior (a busca de cada valor desde o começo da tag era quadrática numa tag com milhares de `href`).
     """
 
     def __init__(self, html: str) -> None:
@@ -672,16 +686,27 @@ class _Atributos(HTMLParser):
         return self._inicios_de_linha[linha - 1] + coluna
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        novos = 0
+        bruto: str | None = None  # o texto da tag, só se algum valor for novo
+        base = 0  # offset da tag no HTML
+        cursor = 0  # onde, na tag, acabou o valor anterior: a busca do próximo parte daí
         for nome, valor in attrs:
             if nome not in _ATRIBUTOS_DE_LINK or not valor:
                 continue
             valor = valor.strip()[:_VALOR_MAXIMO]
             if not valor or valor in self.valores or valor[:5].lower() == "data:":
                 continue
+            if novos == _ATRIBUTOS_POR_TAG:
+                break  # uma tag com dezenas de links distintos não é de contato (e cada busca custa a tag)
+            if bruto is None:
+                bruto, base = self.get_starttag_text() or "", self._offset_da_tag()
+            novos += 1
             # o valor lido já tem as entidades resolvidas (`&amp;`): se não aparece igual na tag, o
             # offset é o da tag
-            achou = (self.get_starttag_text() or "").find(valor)
-            self.valores[valor] = self._offset_da_tag() + max(achou, 0)
+            achou = bruto.find(valor, cursor)
+            if achou >= 0:
+                cursor = achou + len(valor)
+            self.valores[valor] = base + max(achou, 0)
 
 
 def _recortar_html(html: str) -> str:
