@@ -648,8 +648,10 @@ def test_declaracao_do_no():
 
 def test_no_esta_no_nucleo_depois_da_extracao():
     nos = nos_do_nucleo()
-    assert [n.nome for n in nos][-2:] == ["extracao", "cnpj"]
-    assert isinstance(nos[-2], ExtracaoNo) and isinstance(nos[-1], CnpjNo)
+    nomes = [n.nome for n in nos]
+    i = nomes.index("extracao")  # `registros`, `cvm_sancionador` e `cvm_alertas` (T11) vêm logo depois do `cnpj`
+    assert nomes[i : i + 2] == ["extracao", "cnpj"]
+    assert isinstance(nos[i], ExtracaoNo) and isinstance(nos[i + 1], CnpjNo)
 
 
 class _Fixo(NoBase):

@@ -1,0 +1,30 @@
+
+<p class="ajustMargin-left no-padding sm-padding col-sm-12">
+<b>Busca por:</b>
+"Atuação Irregular"
+</p>
+<h2 class="col-sm-12" id="mostrarTags"></h2>
+<section class="no-padding listaResultados col-sm-8">
+<form class="ajustMargin-left sm-no-margin form-inline orderResults pull-left" action="#">
+<div class="col-sm-6 no-padding">
+<span>Nenhum resultado encontrado</span>
+</div>
+</form>
+</section>
+<script>
+$(document).ready(() => {
+var arrTags = ''.split(',');
+arrTags.forEach((value, index, array) => {
+$('ul.listaTags li input[value="' + value + '"]').prop('checked', true);
+});
+$('#mostrarTags').text('');
+$('.tagAside').change(function () {
+history.replaceState(null, null, location.href.replace(/\&?tags=[^&]+(&|$)/g, ''))
+});
+$('a.localtag').click(function () {
+var tag = $(this).attr('title');
+var checkbox = $("input[name='" + tag + "']");
+$(checkbox).click();
+});
+});
+</script>

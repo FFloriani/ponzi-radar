@@ -238,6 +238,20 @@ async def test_cache_nunca_guarda_erro(respx_mock):
     assert resposta.texto == "voltou" and resposta.de_cache is False and rota.call_count == 2
 
 
+async def test_usar_cache_false_vai_a_rede_e_renova_o_cache(respx_mock):
+    # quem precisa de dado fresco (índices com validade) não pode receber a resposta de horas atrás
+    rota = respx_mock.get("https://api.x/fresco").mock(
+        side_effect=[httpx.Response(200, text="velho"), httpx.Response(200, text="novo")]
+    )
+    r = rede_sem_espera()
+    assert (await r.get("https://api.x/fresco")).texto == "velho"
+    fresca = await r.get("https://api.x/fresco", usar_cache=False)
+    assert (fresca.texto, fresca.de_cache, rota.call_count) == ("novo", False, 2)
+    # a resposta renovada passa a ser a do cache
+    seguinte = await r.get("https://api.x/fresco")
+    assert (seguinte.texto, seguinte.de_cache, rota.call_count) == ("novo", True, 2)
+
+
 async def test_cache_e_por_instancia(respx_mock):
     rota = respx_mock.get("https://api.x/g").mock(return_value=httpx.Response(200))
     await rede_sem_espera().get("https://api.x/g")

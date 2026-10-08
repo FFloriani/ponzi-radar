@@ -7,6 +7,7 @@ from radar.nos.alvo import AlvoNo
 from radar.nos.captura import CapturaNo
 from radar.nos.cnpj import CnpjNo
 from radar.nos.ct import CtNo
+from radar.nos.cvm import CvmAlertasNo, CvmSancionadorNo, RegistrosNo
 from radar.nos.dns import DnsNo
 from radar.nos.extracao import ExtracaoNo
 from radar.nos.rdap import RdapNo
@@ -14,7 +15,8 @@ from radar.nos.wayback import WaybackIndiceNo, WaybackSnapshotNo
 
 
 # `WaybackSnapshotNo` declara `captura` como opcional e o motor recusa dependência inexistente: os
-# dois entram juntos, a captura antes do snapshot. `ExtracaoNo` lê os dois e `CnpjNo` lê a extração.
+# dois entram juntos, a captura antes do snapshot. `ExtracaoNo` lê os dois e `CnpjNo` lê a extração. Os três nós da
+# CVM/BCB leem `Servicos.indices` (sem ele caem em erro): `cvm_alertas` usa o `cnpj` se houver, os outros dois dependem dele.
 def nos_do_nucleo() -> list[NoBase]:
     return [
         AlvoNo(),
@@ -26,4 +28,7 @@ def nos_do_nucleo() -> list[NoBase]:
         WaybackSnapshotNo(),
         ExtracaoNo(),
         CnpjNo(),
+        RegistrosNo(),
+        CvmSancionadorNo(),
+        CvmAlertasNo(),
     ]

@@ -1,0 +1,37 @@
+{
+ "@odata.context": "https://was-p.bcnet.bcb.gov.br/olinda/servico/Instituicoes_em_funcionamento/versao/v1/odata$metadata#SedesSociedades",
+ "value": [
+  {
+   "CNPJ": "15482499",
+   "NOME_INSTITUICAO": "TURCÂMBIO - SOCIEDADE CORRETORA DE CÂMBIO LTDA.",
+   "SEGMENTO": "Sociedade Corretora de Câmbio",
+   "ENDERECO": "AVENIDA DOUTOR JOÃO RIMSA",
+   "COMPLEMENTO": null,
+   "BAIRRO": "CENTRO",
+   "CEP": "88780000",
+   "MUNICIPIO": "IMBITUBA",
+   "UF": "SC",
+   "DDD": "48",
+   "TELEFONE": "32546200",
+   "E_MAIL": "LEONARDO@TURCAMBIO.COM.BR",
+   "SITIO_NA_INTERNET": "WWW.TURCAMBIO.COM.BR",
+   "MUNICIPIO_IBGE": "4207304"
+  },
+  {
+   "CNPJ": "39738065",
+   "NOME_INSTITUICAO": "FFCRED SOCIEDADE DE CRÉDITO DIRETO S.A..",
+   "SEGMENTO": "Sociedade de Crédito Direto",
+   "ENDERECO": "AV. SETE DE SETEMBRO, N- 483",
+   "COMPLEMENTO": "SALA 05D",
+   "BAIRRO": "CENTRO",
+   "CEP": "99700084",
+   "MUNICIPIO": "ERECHIM",
+   "UF": "RS",
+   "DDD": "54",
+   "TELEFONE": "996933262",
+   "E_MAIL": "JULIO@FFCRED.COM",
+   "SITIO_NA_INTERNET": "WWW.FFCREDSCD.COM.BR",
+   "MUNICIPIO_IBGE": "4307005"
+  }
+ ]
+}

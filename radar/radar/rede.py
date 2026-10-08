@@ -155,7 +155,13 @@ class Rede:
         params: dict | None = None,
         headers: dict | None = None,
         seguir_redirect: bool = True,
+        usar_cache: bool = True,
     ) -> RespostaRede:
+        """`usar_cache=False` ignora a resposta guardada e vai à rede (a nova passa a ser a guardada).
+
+        O cache em memória não expira. Quem tem validade própria, como os índices da CVM e do BCB,
+        precisa disso para um processo longo não devolver o arquivo baixado horas atrás.
+        """
         if tipo not in ("api", "navegador"):
             raise ValueError(f"tipo de User-Agent desconhecido: {tipo!r}")
         try:
@@ -175,7 +181,7 @@ class Rede:
             seguir_redirect,
             tuple(sorted(cabecalhos.items())),
         )
-        if (guardada := self._cache.get(chave)) is not None:
+        if usar_cache and (guardada := self._cache.get(chave)) is not None:
             return replace(guardada, de_cache=True)
 
         atual = alvo

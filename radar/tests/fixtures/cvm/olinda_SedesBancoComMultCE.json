@@ -1,0 +1,39 @@
+{
+ "@odata.context": "https://was-p.bcnet.bcb.gov.br/olinda/servico/Instituicoes_em_funcionamento/versao/v1/odata$metadata#SedesBancoComMultCE",
+ "value": [
+  {
+   "CNPJ": "61190658",
+   "NOME_INSTITUICAO": "BANCO ITAÚ VEÍCULOS S.A.",
+   "SEGMENTO": "Banco Múltiplo",
+   "ENDERECO": "RUA TENENTE MAURO DE MIRANDA  36",
+   "COMPLEMENTO": "BLOCO D  8  ANDAR  PARTE",
+   "BAIRRO": "PARQUE JABAQUARA",
+   "CEP": "04345030",
+   "MUNICIPIO": "SÃO PAULO",
+   "UF": "SP",
+   "DDD": "11",
+   "TELEFONE": "50199968",
+   "CARTEIRA_COMERCIAL": "Não",
+   "E_MAIL": "RELACIONAMENTO.BACEN@ITAU-UNIBANCO.COM.BR",
+   "SITIO_NA_INTERNET": "WWW.BANCOFIAT.COM.BR",
+   "MUNICIPIO_IBGE": "3550308"
+  },
+  {
+   "CNPJ": "46518205",
+   "NOME_INSTITUICAO": "JPMORGAN CHASE BANK, NATIONAL ASSOCIATION",
+   "SEGMENTO": "Banco Comercial Estrangeiro - Filial no país",
+   "ENDERECO": "AV BRIG FARIA LIMA  3729",
+   "COMPLEMENTO": "10 ANDAR",
+   "BAIRRO": "ITAIM BIBI",
+   "CEP": "04538905",
+   "MUNICIPIO": "SÃO PAULO",
+   "UF": "SP",
+   "DDD": "11",
+   "TELEFONE": "49503700",
+   "CARTEIRA_COMERCIAL": "Sim",
+   "E_MAIL": "OUVIDORIA.JP.MORGAN@JPMORGAN.COM",
+   "SITIO_NA_INTERNET": "WWW.JPMORGANCHASE.COM",
+   "MUNICIPIO_IBGE": "3550308"
+  }
+ ]
+}

@@ -1,0 +1,35 @@
+{
+ "@odata.context": "https://was-p.bcnet.bcb.gov.br/olinda/servico/Instituicoes_em_funcionamento/versao/v1/odata$metadata#SedesConsorcios",
+ "value": [
+  {
+   "CNPJ": "58860976",
+   "NOME_INSTITUICAO": "M.I6 ADMINISTRADORA DE CONSÓRCIO LTDA.",
+   "ENDERECO": "PRAÇA OTÁVIO ROCHA, 65",
+   "COMPLEMENTO": "CJ 26",
+   "BAIRRO": "CENTRO HISTÓRICO",
+   "CEP": "90020140",
+   "MUNICIPIO": "PORTO ALEGRE",
+   "UF": "RS",
+   "DDD": "61",
+   "TELEFONE": "995552775",
+   "E_MAIL": "REUNIAODIRETORIA@GRUPOASPECIR.COM.BR",
+   "SITIO_NA_INTERNET": "HTTP://WWW.MI6CONSORCIO.COM.BR",
+   "MUNICIPIO_IBGE": "4314902"
+  },
+  {
+   "CNPJ": "45725975",
+   "NOME_INSTITUICAO": "FINAMA ADMINISTRADORA DE CONSORCIO LTDA",
+   "ENDERECO": "RUA LUIZ VAZ DE CAMOES  2959",
+   "COMPLEMENTO": null,
+   "BAIRRO": "REDENTORA",
+   "CEP": "15015750",
+   "MUNICIPIO": "SÃO JOSÉ DO RIO PRETO",
+   "UF": "SP",
+   "DDD": "17",
+   "TELEFONE": "21364000",
+   "E_MAIL": "ATENDIMENTO@CONSORCIOFINAMA.COM.BR",
+   "SITIO_NA_INTERNET": "WWW.CONSORCIOFINAMA.COM.BR",
+   "MUNICIPIO_IBGE": "3549805"
+  }
+ ]
+}

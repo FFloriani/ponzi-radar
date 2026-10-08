@@ -23,6 +23,7 @@ from radar.execucao import (
     execucao_anterior,
     listar_casos,
 )
+from radar.indices import Indices
 from radar.modelos import Aguardando, Contexto, ErroNo, Evidencia, Feito, Pendencia, Resposta
 from radar.motor import Motor, NoBase, Servicos
 from radar.nos import nos_do_nucleo
@@ -30,11 +31,13 @@ from radar.nos.alvo import AlvoNo, normalizar_alvo
 from radar.nos.captura import CapturaNo
 from radar.nos.cnpj import CnpjNo
 from radar.nos.ct import CtNo
+from radar.nos.cvm import CvmAlertasNo, CvmSancionadorNo, RegistrosNo
 from radar.nos.dns import DnsNo
 from radar.nos.extracao import ExtracaoNo
 from radar.nos.rdap import RdapNo
 from radar.nos.wayback import WaybackIndiceNo, WaybackSnapshotNo
 from radar.rede import Rede
+from tests.mocks_cvm import mocar_cvm, mocar_deliberacoes, mocar_olinda
 
 FIXTURES = Path(__file__).parent / "fixtures" / "api"
 URL_RDAP_BR = "https://rdap.registro.br/domain/petrobras.com.br"
@@ -734,10 +737,12 @@ async def test_carregar_execucao_aponta_para_a_pasta_atual(tmp_path):
 def test_nos_do_nucleo():
     nos = nos_do_nucleo()
     assert [type(n) for n in nos] == [
-        AlvoNo, RdapNo, DnsNo, CtNo, WaybackIndiceNo, CapturaNo, WaybackSnapshotNo, ExtracaoNo, CnpjNo
+        AlvoNo, RdapNo, DnsNo, CtNo, WaybackIndiceNo, CapturaNo, WaybackSnapshotNo, ExtracaoNo, CnpjNo,
+        RegistrosNo, CvmSancionadorNo, CvmAlertasNo,
     ]
     assert [n.nome for n in nos] == [
-        "alvo", "rdap", "dns", "ct", "wayback_indice", "captura", "wayback_snapshot", "extracao", "cnpj"
+        "alvo", "rdap", "dns", "ct", "wayback_indice", "captura", "wayback_snapshot", "extracao", "cnpj",
+        "registros", "cvm_sancionador", "cvm_alertas",
     ]
     assert nos is not nos_do_nucleo()  # lista nova a cada chamada
 
@@ -786,13 +791,15 @@ def _mocar_apis(respx_mock, *, com_dns: bool, html: bytes | None = None, com_cnp
         )
 
 
-async def _rodar_nucleo(tmp_path, as_of: date | None) -> tuple[Contexto, Motor]:
-    # modo_contato="nenhum": a `captura` fica pulada e o teste nunca abre o navegador
+async def _rodar_nucleo(tmp_path, as_of: date | None, *, com_indices: bool = False) -> tuple[Contexto, Motor]:
+    # modo_contato="nenhum": a `captura` fica pulada e o teste nunca abre o navegador. Sem `com_indices` o serviço de
+    # índices não existe e os nós da CVM/BCB caem em erro (os testes que não são deles não mocam esses arquivos)
     ctx = criar_contexto("https://www.petrobras.com.br/", as_of, "nenhum", False, tmp_path, AGORA)
     config = Config(rede=RedeConfig(limites={"*": 0}))
     rede = Rede(config.rede, dormir=_nao_dormir)
+    indices = Indices(tmp_path / "_indices", rede, 24, agora=lambda: AGORA) if com_indices else None
     try:
-        motor = Motor(ctx, nos_do_nucleo(), criar_servicos(config, ctx.pasta, rede))
+        motor = Motor(ctx, nos_do_nucleo(), criar_servicos(config, ctx.pasta, rede, indices=indices))
         await motor.executar()
     finally:
         await rede.fechar()
@@ -801,10 +808,14 @@ async def _rodar_nucleo(tmp_path, as_of: date | None) -> tuple[Contexto, Motor]:
 
 async def test_nucleo_ponta_a_ponta_em_modo_atual(respx_mock, tmp_path):
     _mocar_apis(respx_mock, com_dns=True)
-    ctx, motor = await _rodar_nucleo(tmp_path, None)
+    mocar_cvm(respx_mock)
+    mocar_olinda(respx_mock)
+    mocar_deliberacoes(respx_mock)
+    ctx, motor = await _rodar_nucleo(tmp_path, None, com_indices=True)
     assert motor.status() == {
         "alvo": "feito", "rdap": "feito", "dns": "feito", "ct": "feito", "wayback_indice": "feito",
         "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito", "cnpj": "feito",
+        "registros": "feito", "cvm_sancionador": "feito", "cvm_alertas": "feito",
     }
 
     ex = carregar_execucao(ctx.pasta)
@@ -822,9 +833,17 @@ async def test_nucleo_ponta_a_ponta_em_modo_atual(respx_mock, tmp_path):
     # sem CNPJ na página, o titular do RDAP é o único candidato e dispensa a P-CNPJ
     assert (ex.saidas["cnpj"]["cnpj"], ex.saidas["cnpj"]["fonte"]) == ("33000167000101", "brasilapi")
     assert ex.saidas["cnpj"]["razao_social"] == "PETROLEO BRASILEIRO S A PETROBRAS"
+    # a Petrobras não está nos cadastros da CVM nem nas sedes do BCB, não é acusada e nenhuma stop order cita o CNPJ dela
+    assert (ex.saidas["registros"]["registrado"], ex.saidas["registros"]["motivo"]) == (False, None)
+    assert ex.saidas["cvm_sancionador"] == {"processos": [], "motivo": None}
+    assert ex.saidas["cvm_alertas"] == {"correspondencias": []}
     assert motor.pendencias_abertas() == []
     # 1 RDAP + 5 DoH + 1 crt.sh + 2 CDX do Wayback (domínio e home) + snapshot da home (HTML e texto) + 1 BrasilAPI
-    assert len(log_custodia(ctx.pasta)) == 13
+    # + 5 provas de consulta aos índices (cadastros_cvm, instituicoes_bcb, dominios_bcb, sancionador, deliberacoes)
+    assert len(log_custodia(ctx.pasta)) == 18
+    assert sorted(e["origem"] for e in log_custodia(ctx.pasta) if e["tipo"] == "indice") == [
+        "cadastros_cvm", "deliberacoes", "dominios_bcb", "instituicoes_bcb", "sancionador"
+    ]
     assert verificar(ctx.pasta) == []
 
 
@@ -883,6 +902,7 @@ async def test_nucleo_retroativo_pula_dns_e_esconde_o_titular(respx_mock, tmp_pa
     assert motor.status() == {
         "alvo": "feito", "rdap": "feito", "dns": "pulado", "ct": "feito", "wayback_indice": "feito",
         "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito", "cnpj": "aguardando",
+        "registros": "pendente", "cvm_sancionador": "pendente", "cvm_alertas": "pendente",  # esperam a P-CNPJ
     }
     assert [(p.id, p.no_origem, p.candidatos) for p in motor.pendencias_abertas()] == [("P-CNPJ", "cnpj", [])]
 
@@ -906,9 +926,14 @@ async def test_nucleo_dns_servfail_deixa_o_no_em_erro_e_sem_saidas(respx_mock, t
     assert motor.status() == {
         "alvo": "feito", "rdap": "feito", "dns": "erro", "ct": "feito", "wayback_indice": "feito",
         "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito", "cnpj": "feito",
+        "registros": "erro", "cvm_sancionador": "erro", "cvm_alertas": "erro",
     }
     ex = carregar_execucao(ctx.pasta)
     assert "Status 2 (SERVFAIL)" in ex.status["dns"]["motivo"]
+    # esta execução não tem o serviço de índices: os três nós da CVM/BCB dizem isso e não deixam saída
+    for no in ("registros", "cvm_sancionador", "cvm_alertas"):
+        assert ex.status[no] == {"status": "erro", "motivo": "serviço de índices não configurado"}
+        assert no not in ex.saidas
     assert "dns" not in ex.saidas  # nada de `nxdomain=False` com cara de dado coletado
 
 
@@ -922,6 +947,7 @@ async def test_nucleo_rdap_em_erro_nao_derruba_dns_e_ct(respx_mock, tmp_path):
     assert motor.status() == {
         "alvo": "feito", "rdap": "erro", "dns": "feito", "ct": "feito", "wayback_indice": "feito",
         "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito", "cnpj": "aguardando",
+        "registros": "pendente", "cvm_sancionador": "pendente", "cvm_alertas": "pendente",
     }
     ex = carregar_execucao(ctx.pasta)
     assert "404" in ex.status["rdap"]["motivo"]
