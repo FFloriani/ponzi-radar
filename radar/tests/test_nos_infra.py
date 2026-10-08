@@ -767,7 +767,7 @@ def _mocar_cnpj(respx_mock) -> None:
 
 def _mocar_apis(respx_mock, *, com_dns: bool, html: bytes | None = None, com_cnpj: bool = True) -> None:
     _mocar_wayback(respx_mock, html)
-    if com_cnpj:  # o respx falha a rota que ninguém chamou: sem titular nem CNPJ na página, o nó não consulta
+    if com_cnpj:  # sem titular nem CNPJ na página o nó não consulta; sem a rota, uma consulta indevida falharia
         _mocar_cnpj(respx_mock)
     respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(200, json=fixture("rdap_registrobr_petrobras")))
     respx_mock.get(URL_CRTSH, params={"q": "petrobras.com.br", "output": "json"}).mock(

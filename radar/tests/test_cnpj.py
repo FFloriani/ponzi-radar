@@ -115,8 +115,9 @@ def entradas(*cnpjs: str, titular: str | None = None, rdap: bool = True, extras:
 
 
 def mocar_brasilapi(respx_mock, cnpj: str = PETROBRAS, corpo: dict | None = None):
+    """A BrasilAPI respondendo 200 para `cnpj`. Sem `corpo`, é a fixture com o `cnpj` pedido (a API devolve o dele)."""
     return respx_mock.get(URL_BRASILAPI + cnpj).mock(
-        return_value=httpx.Response(200, json=corpo if corpo is not None else fixture("brasilapi"))
+        return_value=httpx.Response(200, json=corpo if corpo is not None else {**fixture("brasilapi"), "cnpj": cnpj})
     )
 
 
@@ -269,6 +270,7 @@ async def test_resposta_sem_qsa(respx_mock, ctx_hoje, serv):
 
 async def test_campos_ausentes_ou_em_outro_formato(respx_mock, ctx_hoje, serv):
     corpo = {
+        "cnpj": PETROBRAS,
         "razao_social": "EMPRESA FICTICIA LTDA",
         "nome_fantasia": "",
         "data_inicio_atividade": "2025-13-45",
@@ -292,34 +294,108 @@ async def test_campos_ausentes_ou_em_outro_formato(respx_mock, ctx_hoje, serv):
     }
 
 
-@pytest.mark.parametrize("capital", [True, "muito", None, [1]])
+@pytest.mark.parametrize(
+    "capital",
+    [True, "muito", None, [1], pytest.param(10**400, id="10**400"), pytest.param(-(10**400), id="-10**400")]
+    + [pytest.param("9" * 400, id="texto-gigante")],
+)
 async def test_capital_social_invalido_vira_none(respx_mock, ctx_hoje, serv, capital):
+    # `float(10**400)` levanta OverflowError: o campo vira `None` e a resposta da BrasilAPI continua valendo
     mocar_brasilapi(respx_mock, corpo={**fixture("brasilapi"), "capital_social": capital})
     r = await CnpjNo().executar(ctx_hoje, entradas(PETROBRAS), {}, serv)
     assert r.saidas["capital_social"] is None
+    assert r.saidas["fonte"] == "brasilapi" and r.saidas["razao_social"] == "PETROLEO BRASILEIRO S A PETROBRAS"
 
 
 @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
 async def test_capital_social_nao_finito_vira_none(respx_mock, ctx_hoje, serv, literal):
     # o `json` do Python aceita esses literais, que não são JSON de verdade
-    corpo = b'{"razao_social": "X", "capital_social": ' + literal.encode() + b"}"
+    corpo = b'{"cnpj": "' + PETROBRAS.encode() + b'", "razao_social": "X", "capital_social": ' + literal.encode() + b"}"
     respx_mock.get(URL_BRASILAPI + PETROBRAS).mock(return_value=httpx.Response(200, content=corpo))
     r = await CnpjNo().executar(ctx_hoje, entradas(PETROBRAS), {}, serv)
     assert r.saidas["capital_social"] is None
 
 
-@pytest.mark.parametrize("cnae", [True, "60000A", 6000.5, None, "", [1]])
+@pytest.mark.parametrize(
+    "cnae",
+    [True, "60000A", 6000.5, None, "", [1], pytest.param(10**400, id="10**400"), -1, 10_000_000, "12345678"],
+)
 async def test_cnae_invalido_vira_none(respx_mock, ctx_hoje, serv, cnae):
     mocar_brasilapi(respx_mock, corpo={**fixture("brasilapi"), "cnae_fiscal": cnae})
     r = await CnpjNo().executar(ctx_hoje, entradas(PETROBRAS), {}, serv)
     assert r.saidas["cnae"] is None
 
 
-async def test_retroativo_marca_situacao_e_socios(respx_mock, ctx_2019, serv):
+async def test_retroativo_marca_tudo_menos_cnpj_e_abertura(respx_mock, ctx_2019, serv):
     mocar_brasilapi(respx_mock)
     r = await CnpjNo().executar(ctx_2019, entradas(PETROBRAS), {}, serv)
-    assert r.saidas["vazamento_temporal"] == ["situacao", "socios"]
-    assert r.saidas["abertura"] == "1966-09-28"  # a abertura é exata em qualquer as_of
+    # a abertura é exata em qualquer as_of; o resto é o de hoje
+    assert r.saidas["vazamento_temporal"] == [
+        "razao_social", "nome_fantasia", "cnae", "cnae_descricao", "capital_social", "situacao", "socios", "fonte",
+    ]
+    assert r.saidas["abertura"] == "1966-09-28" and r.saidas["cnpj"] == PETROBRAS
+    assert set(r.saidas) - set(r.saidas["vazamento_temporal"]) == {"cnpj", "abertura", "vazamento_temporal"}
+
+
+async def test_atual_nao_marca_vazamento(respx_mock, ctx_hoje, serv):
+    mocar_brasilapi(respx_mock)
+    r = await CnpjNo().executar(ctx_hoje, entradas(PETROBRAS), {}, serv)
+    assert r.saidas["vazamento_temporal"] == []
+
+
+# --- a resposta tem de ser da empresa pedida
+
+
+@pytest.mark.parametrize(
+    "corpo",
+    [
+        {"message": "erro"},  # corpo de erro de API com status 200
+        {"type": "not_found", "message": "CNPJ não encontrado"},
+        {},
+        {"cnpj": PETROBRAS, "razao_social": "   "},  # sem razão social
+        {"cnpj": PETROBRAS, "razao_social": None},
+        {"cnpj": PETROBRAS, "razao_social": 123},
+        {"razao_social": "PETROLEO BRASILEIRO S A PETROBRAS"},  # não diz de que CNPJ é
+        {"cnpj": None, "razao_social": "PETROLEO BRASILEIRO S A PETROBRAS"},
+        {"cnpj": BANCO_DO_BRASIL, "razao_social": "BANCO DO BRASIL SA"},  # é de outra empresa
+        {"cnpj": "33000167000102", "razao_social": "X"},  # CNPJ de DV inválido
+        {"cnpj": ["33000167000101"], "razao_social": "X"},
+    ],
+)
+async def test_resposta_que_nao_e_da_empresa_cai_no_minhareceita(respx_mock, ctx_hoje, serv, corpo):
+    respx_mock.get(URL_BRASILAPI + PETROBRAS).mock(return_value=httpx.Response(200, json=corpo))
+    reserva = respx_mock.get(URL_MINHARECEITA + PETROBRAS).mock(
+        return_value=httpx.Response(200, json=fixture("minhareceita"))
+    )
+    r = await CnpjNo().executar(ctx_hoje, entradas(PETROBRAS), {}, serv)
+    assert reserva.call_count == 1
+    assert r.saidas["fonte"] == "minhareceita" and r.saidas["razao_social"] == "PETROLEO BRASILEIRO S A PETROBRAS"
+
+
+async def test_resposta_de_erro_nas_duas_apis_e_erro_do_no(respx_mock, ctx_hoje, serv):
+    respx_mock.get(URL_BRASILAPI + PETROBRAS).mock(return_value=httpx.Response(200, json={"message": "erro"}))
+    respx_mock.get(URL_MINHARECEITA + PETROBRAS).mock(
+        return_value=httpx.Response(200, json={**fixture("minhareceita"), "cnpj": BANCO_DO_BRASIL})
+    )
+    with pytest.raises(ErroNo) as e:
+        await CnpjNo().executar(ctx_hoje, entradas(PETROBRAS), {}, serv)
+    assert e.value.permanente is False
+    brasilapi, _, minhareceita = e.value.mensagem.removeprefix("APIs de CNPJ indisponíveis: ").partition("; ")
+    assert brasilapi == "BrasilAPI: resposta sem razao_social"
+    assert minhareceita == f"minhareceita: resposta não é do CNPJ {PETROBRAS}"
+
+
+@pytest.mark.parametrize("escrito", ["33.000.167/0001-01", 33000167000101, "33000167000101"])
+async def test_cnpj_da_resposta_com_pontuacao_ou_numero(respx_mock, ctx_hoje, serv, escrito):
+    mocar_brasilapi(respx_mock, corpo={**fixture("brasilapi"), "cnpj": escrito})
+    r = await CnpjNo().executar(ctx_hoje, entradas(PETROBRAS), {}, serv)
+    assert r.saidas["fonte"] == "brasilapi" and r.saidas["cnpj"] == PETROBRAS
+
+
+async def test_cnpj_da_resposta_numero_com_zero_a_esquerda(respx_mock, ctx_hoje, serv):
+    mocar_brasilapi(respx_mock, BANCO_DO_BRASIL, {**fixture("brasilapi"), "cnpj": 191})  # 00000000000191
+    r = await CnpjNo().executar(ctx_hoje, entradas(BANCO_DO_BRASIL), {}, serv)
+    assert r.saidas["fonte"] == "brasilapi" and r.saidas["cnpj"] == BANCO_DO_BRASIL
 
 
 # ---------------------------------------------------------------------------- escolha do CNPJ
@@ -345,11 +421,43 @@ async def test_varios_cnpjs_com_titular_rdap(respx_mock, ctx_hoje, serv):
     assert rota.call_count == 1
 
 
-async def test_titular_vale_mesmo_que_o_site_cite_so_outros_cnpjs(respx_mock, ctx_hoje, serv):
-    """O titular entra na conta ao lado dos CNPJs do site e, havendo mais de uma raiz, é ele que vale."""
-    rota = mocar_brasilapi(respx_mock)
+async def test_titular_fora_das_raizes_da_pagina_abre_pendencia(respx_mock, ctx_hoje, serv):
+    """Domínio registrado por quem não é o operador (agência, contabilidade): não escolhe sozinho."""
+    rota_titular = mocar_brasilapi(respx_mock, PETROBRAS)
+    rota_pagina = mocar_brasilapi(respx_mock, BANCO_DO_BRASIL)
     r = await CnpjNo().executar(ctx_hoje, entradas(BANCO_DO_BRASIL, CAIXA, titular=PETROBRAS), {}, serv)
-    assert isinstance(r, Feito) and r.saidas["cnpj"] == PETROBRAS
+    assert isinstance(r, Aguardando) and len(r.pendencias) == 1
+    p = r.pendencias[0]
+    assert (p.id, p.no_origem) == ("P-CNPJ", "cnpj")
+    # o titular vai junto, na frente, e a pendência diz que ele vem do RDAP
+    assert [c.valor for c in p.candidatos] == [PETROBRAS, BANCO_DO_BRASIL, CAIXA]
+    assert p.candidatos[0].extra == {"origem": "rdap"} and p.candidatos[0].categoria == "cnpj"
+    assert [c.extra for c in p.candidatos[1:]] == [{}, {}]
+    assert rota_titular.call_count == 0 and rota_pagina.call_count == 0
+
+
+async def test_agencia_titular_e_operador_no_rodape_abre_pendencia(respx_mock, ctx_hoje, serv):
+    rota = mocar_brasilapi(respx_mock, CAIXA)
+    r = await CnpjNo().executar(ctx_hoje, entradas(BANCO_DO_BRASIL, titular=CAIXA), {}, serv)
+    assert isinstance(r, Aguardando)
+    assert [c.valor for c in r.pendencias[0].candidatos] == [CAIXA, BANCO_DO_BRASIL]
+    assert rota.call_count == 0
+
+
+async def test_titular_fora_das_raizes_usa_a_matriz_de_cada_raiz_da_pagina(ctx_hoje, serv):
+    banco_filial = _com_dv("000000000002")
+    r = await CnpjNo().executar(
+        ctx_hoje, entradas(banco_filial, PETROBRAS, BANCO_DO_BRASIL, titular=CAIXA), {}, serv
+    )
+    assert isinstance(r, Aguardando)
+    assert [c.valor for c in r.pendencias[0].candidatos] == [CAIXA, BANCO_DO_BRASIL, PETROBRAS]
+
+
+async def test_titular_na_pagina_com_outras_raizes_vale_o_titular(respx_mock, ctx_hoje, serv):
+    """A raiz do titular entre as da página confirma o titular; os outros CNPJs (gateway etc.) não pesam."""
+    rota = mocar_brasilapi(respx_mock, CAIXA)
+    r = await CnpjNo().executar(ctx_hoje, entradas(BANCO_DO_BRASIL, CAIXA, PETROBRAS, titular=CAIXA), {}, serv)
+    assert isinstance(r, Feito) and r.saidas["cnpj"] == CAIXA
     assert rota.call_count == 1
 
 
@@ -408,7 +516,7 @@ async def test_matriz_e_filial_da_mesma_raiz_sao_um_candidato_e_vale_a_matriz(re
 
 async def test_so_filial_da_raiz_usa_o_primeiro_encontrado(respx_mock, ctx_hoje, serv):
     outra_filial = _com_dv("330001670003")
-    rota = respx_mock.get(URL_BRASILAPI + outra_filial).mock(return_value=httpx.Response(200, json=fixture("brasilapi")))
+    rota = mocar_brasilapi(respx_mock, outra_filial)
     r = await CnpjNo().executar(ctx_hoje, entradas(outra_filial, PETROBRAS_FILIAL), {}, serv)
     assert isinstance(r, Feito) and r.saidas["cnpj"] == outra_filial
     assert rota.call_count == 1
@@ -440,10 +548,17 @@ async def test_titular_filial_com_outras_raizes_usa_a_matriz_da_raiz_do_titular(
 
 
 async def test_titular_filial_sem_matriz_conhecida_vale_a_propria_filial(respx_mock, ctx_hoje, serv):
-    rota = respx_mock.get(URL_BRASILAPI + PETROBRAS_FILIAL).mock(return_value=httpx.Response(200, json=fixture("brasilapi")))
-    r = await CnpjNo().executar(ctx_hoje, entradas(BANCO_DO_BRASIL, titular=PETROBRAS_FILIAL), {}, serv)
-    assert isinstance(r, Feito) and r.saidas["cnpj"] == PETROBRAS_FILIAL
+    outra_filial = _com_dv("330001670003")
+    rota = mocar_brasilapi(respx_mock, PETROBRAS_FILIAL)
+    r = await CnpjNo().executar(ctx_hoje, entradas(BANCO_DO_BRASIL, outra_filial, titular=PETROBRAS_FILIAL), {}, serv)
+    assert isinstance(r, Feito) and r.saidas["cnpj"] == PETROBRAS_FILIAL  # o titular é o primeiro achado da raiz
     assert rota.call_count == 1
+
+
+async def test_titular_filial_de_outra_raiz_que_a_pagina_abre_pendencia(respx_mock, ctx_hoje, serv):
+    r = await CnpjNo().executar(ctx_hoje, entradas(BANCO_DO_BRASIL, titular=PETROBRAS_FILIAL), {}, serv)
+    assert isinstance(r, Aguardando)
+    assert [c.valor for c in r.pendencias[0].candidatos] == [PETROBRAS_FILIAL, BANCO_DO_BRASIL]
 
 
 # ---------------------------------------------------------------------------- resposta à P-CNPJ
