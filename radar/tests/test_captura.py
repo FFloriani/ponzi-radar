@@ -234,21 +234,54 @@ def test_erro_http_e_status_400_ou_mais():
 
 def test_opcoes_do_contexto_sem_proxy(tmp_path):
     opcoes = _opcoes_do_contexto(RedeConfig(), tmp_path / "captura.har")
+    # I5: sem `user_agent`: o navegador usa o UA nativo, coerente com o `sec-ch-ua` (o `ua_navegador` é da Rede)
     assert opcoes == {
         "accept_downloads": False,
         "service_workers": "block",
-        "user_agent": UA_NAVEGADOR,
         "record_har_path": str(tmp_path / "captura.har"),
         "record_har_content": "embed",
     }
 
 
-def test_opcoes_do_contexto_com_proxy_e_ua_da_config(tmp_path):
+def test_opcoes_do_contexto_com_proxy(tmp_path):
     rede = RedeConfig(proxy="socks5://127.0.0.1:9050", ua_navegador="radar-teste/1.0")
     opcoes = _opcoes_do_contexto(rede, tmp_path / "captura.har")
     assert opcoes["proxy"] == {"server": "socks5://127.0.0.1:9050"}
-    assert opcoes["user_agent"] == "radar-teste/1.0"
+    assert "user_agent" not in opcoes
     assert opcoes["accept_downloads"] is False and opcoes["service_workers"] == "block"
+
+
+def test_o_webrtc_so_sai_pelo_proxy():
+    # I5: o UDP do WebRTC não passa pelo proxy HTTP/SOCKS e revelaria o IP do analista a um STUN do site
+    assert "--force-webrtc-ip-handling-policy=disable_non_proxied_udp" in modulo_captura.ARGS_DO_NAVEGADOR
+    assert "--webrtc-ip-handling-policy=disable_non_proxied_udp" in modulo_captura.ARGS_DO_NAVEGADOR
+    # e nada de esconder a automação: não contornamos anti-bot
+    assert not any("AutomationControlled" in a for a in modulo_captura.ARGS_DO_NAVEGADOR)
+
+
+@pytest.mark.parametrize(
+    ("url", "local"),
+    [
+        ("http://127.0.0.1:8000/x", True), ("http://localhost/x", True), ("http://app.localhost/", True),
+        ("http://192.168.0.10/", True), ("http://10.0.0.1/", True), ("http://[::1]/", True),
+        ("http://169.254.169.254/latest", True), ("http://100.64.0.1/", True),
+        ("https://exemplo.com.br/", False), ("http://203.0.113.9/", True), ("http://8.8.8.8/", False),
+        ("data:text/plain,x", False), ("about:blank", False),
+    ],
+)  # fmt: skip
+def test_host_local(url, local):
+    # 203.0.113.0/24 é de documentação: não é global, conta como local
+    assert modulo_captura._endereco_local(url) is local
+
+
+def test_guarda_so_libera_o_proprio_host_da_url_inicial():
+    publico = modulo_captura._Guarda("https://exemplo.com.br/")
+    assert publico.permitido("https://cdn.exemplo.com.br/a.js")
+    assert not publico.permitido("http://127.0.0.1:8080/admin") and not publico.permitido("http://192.168.0.1/")
+    local = modulo_captura._Guarda("http://127.0.0.1:5000/")
+    # o site de teste local: o próprio host e o resto do loopback (a mesma máquina) passam; a rede privada não
+    assert local.permitido("http://127.0.0.1:9/x") and local.permitido("http://localhost:5000/pixel.gif")
+    assert not local.permitido("http://192.168.0.1/")
 
 
 def test_texto_com_surrogate_solitario_nao_derruba_a_gravacao():
@@ -631,11 +664,13 @@ async def test_networkidle_que_nao_chega_nao_derruba_a_captura(servidor_local, t
 
 
 @lento
-async def test_user_agent_da_config(servidor_local, pedidos_locais, tmp_path):
+async def test_navegador_usa_o_proprio_user_agent(servidor_local, pedidos_locais, tmp_path):
+    # I5: o UA do contexto mentiria a versão que o `sec-ch-ua` conta; o `ua_navegador` da config fica só para a Rede
     rede = RedeConfig(ua_navegador="radar-teste/1.0 (config)")
     await capturar(tmp_path, servidor_local + "/index.html", rede=rede, max_subpaginas=1)
     assert len(pedidos_locais) >= 2
-    assert {p.user_agent for p in pedidos_locais} == {"radar-teste/1.0 (config)"}
+    (ua,) = {p.user_agent for p in pedidos_locais}
+    assert "Chrome/" in ua and "radar-teste" not in ua and ua != UA_NAVEGADOR
 
 
 @lento
@@ -653,7 +688,7 @@ async def test_opcoes_do_contexto_chegam_ao_new_context(servidor_local, tmp_path
     (kwargs,) = chamadas
     assert "proxy" not in kwargs  # sem proxy na config, conexão direta
     assert kwargs["accept_downloads"] is False and kwargs["service_workers"] == "block"
-    assert kwargs["user_agent"] == UA_NAVEGADOR
+    assert "user_agent" not in kwargs
     assert kwargs["record_har_content"] == "embed" and kwargs["record_har_path"].endswith(".har")
 
 
@@ -928,3 +963,57 @@ async def test_redirect_para_outro_dominio_nao_rastreia_o_destino(servidor_local
     assert r.saidas["falhas"] == []
     assert caminhos(pedidos_locais) == ["/saida", "/index.html"]  # nem termos.html nem planos.html
     assert r.saidas["terceiros"] == ["localhost"]
+
+
+# ---------------------------------------------------------------------------- opsec da captura (I5)
+
+
+@lento
+async def test_com_proxy_o_rtcpeerconnection_nao_existe(proxy_local, tmp_path):
+    rede = RedeConfig(proxy=f"http://127.0.0.1:{proxy_local.server_port}")
+    r, serv = await capturar(tmp_path, "http://alvo-atras-do-proxy.test/webrtc.html", rede=rede, max_subpaginas=0)
+    (pagina,) = r.saidas["paginas"]
+    assert "webrtc:undefined" in texto_de(serv, pagina)
+
+
+@lento
+async def test_sem_proxy_o_webrtc_fica_com_a_politica_do_navegador(servidor_local, tmp_path):
+    # sem proxy não há IP a esconder: a página continua como um navegador comum a veria
+    r, serv = await capturar(tmp_path, servidor_local + "/webrtc.html", max_subpaginas=0)
+    (pagina,) = r.saidas["paginas"]
+    assert "webrtc:function" in texto_de(serv, pagina)
+
+
+@lento
+async def test_navegador_sobe_com_a_politica_de_webrtc(servidor_local, tmp_path, monkeypatch):
+    chamadas = []
+    original = BrowserType.launch
+
+    async def espiao(self, **kwargs):
+        chamadas.append(kwargs)
+        return await original(self, **kwargs)
+
+    monkeypatch.setattr(BrowserType, "launch", espiao)
+    await capturar(tmp_path, servidor_local + "/index.html", max_subpaginas=0)
+    (kwargs,) = chamadas
+    assert list(kwargs["args"]) == list(modulo_captura.ARGS_DO_NAVEGADOR)
+
+
+# ---------------------------------------------------------------------------- endereços locais e popups
+
+
+@lento
+async def test_site_nao_alcanca_enderecos_locais_do_analista(proxy_local, tmp_path):
+    # o site (público, atrás do proxy) pede recursos de 127.0.0.1, localhost e da rede privada: nenhum sai
+    rede = RedeConfig(proxy=f"http://127.0.0.1:{proxy_local.server_port}")
+    url = "http://alvo-atras-do-proxy.test/com_locais.html"
+    r, serv = await capturar(tmp_path, url, rede=rede, max_subpaginas=0)
+    assert "Página com recursos locais" in texto_de(serv, r.saidas["paginas"][0])
+    assert proxy_local.requisicoes == [url]
+
+
+@lento
+async def test_popup_aberto_pelo_site_nao_navega(servidor_local, pedidos_locais, tmp_path):
+    r, _ = await capturar(tmp_path, servidor_local + "/popup.html", max_subpaginas=0)
+    assert len(r.saidas["paginas"]) == 1
+    assert caminhos(pedidos_locais) == ["/popup.html"]  # o /planos.html?popup=1 nunca foi pedido

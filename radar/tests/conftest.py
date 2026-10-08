@@ -89,12 +89,27 @@ class _Servidor(ThreadingHTTPServer):
         self.pedidos: list[Pedido] = []
 
 
+# o que o proxy de mentira serve por caminho; o resto ganha a página padrão
+_PAGINAS_DO_PROXY = {
+    # um site (atrás do proxy) que tenta o WebRTC: o texto da página diz se o RTCPeerConnection existe
+    "/webrtc.html": "<p id='r'>?</p><script>document.getElementById('r').textContent = "
+    "'webrtc:' + typeof RTCPeerConnection;</script>",
+    # um site que pede recursos de endereços locais do analista (loopback, rede privada)
+    "/com_locais.html": "<p>Página com recursos locais.</p><img src='http://127.0.0.1:1/x.gif'>"
+    "<img src='http://192.168.0.10/y.gif'><img src='http://localhost:1/z.gif'><iframe src='http://10.0.0.1/'></iframe>",
+}
+
+
 class _HandlerDoProxy(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self.server.requisicoes.append(self.path)  # a URL absoluta, como um proxy HTTP a recebe
+        miolo = next(
+            (pagina for caminho, pagina in _PAGINAS_DO_PROXY.items() if self.path.endswith(caminho)),
+            "Conteúdo servido pelo proxy.",
+        )
         corpo = (
             "<!doctype html><html><head><meta charset='utf-8'><title>Via proxy</title></head>"
-            "<body>Conteúdo servido pelo proxy.</body></html>"
+            f"<body>{miolo}</body></html>"
         ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")

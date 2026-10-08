@@ -2,13 +2,20 @@
 
 É o único nó que toca o site do alvo, e só como um visitante comum: `goto` em links, nunca clique,
 preenchimento nem envio de formulário; downloads recusados e service workers bloqueados. O Playwright
-é a exceção à regra "toda saída via `Rede`": o navegador tem pilha de rede própria e recebe o proxy e
-o `User-Agent` de `config.rede`.
+é a exceção à regra "toda saída via `Rede`": o navegador tem pilha de rede própria e recebe o proxy de
+`config.rede`.
+
+Opsec do analista (I5 da revisão final): o WebRTC só usa UDP pelo proxy (`ARGS_DO_NAVEGADOR`) e, com proxy, o
+`RTCPeerConnection` some da página (um STUN do site revelaria o IP real); o navegador usa o próprio User-Agent,
+coerente com o `sec-ch-ua` (o `ua_navegador` da config é o da `Rede`). Nada esconde a automação: não contornamos
+anti-bot. O site também não alcança endereços locais do analista (localhost, IP literal que não é global), a não ser
+o próprio host da `url_inicial` (o site de teste local), e as janelas que ele abre sozinho são fechadas sem navegar.
 """
 
 from __future__ import annotations
 
 import contextlib
+import ipaddress
 import json
 import re
 import tempfile
@@ -18,7 +25,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from playwright.async_api import BrowserContext, async_playwright
+from playwright.async_api import BrowserContext, Page, Request, Route, async_playwright
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
@@ -48,6 +55,18 @@ _MOTIVO_DESAFIO = "desafio anti-bot"
 _EXTENSOES_DE_ARQUIVO = frozenset({"zip", "pdf", "exe", "apk", "rar", "7z", "dmg", "msi"})
 _JS_LINKS = "() => Array.from(document.links, (link) => link.href)"
 _ERRO_DO_CHROMIUM = re.compile(r"net::(ERR_[A-Z0-9_]+)")
+# o WebRTC só usa UDP pelo proxy: sem proxy UDP (HTTP, SOCKS), nenhum candidato ICE sai pela rede do analista
+ARGS_DO_NAVEGADOR = (
+    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+)
+# com proxy, o site nem vê o WebRTC: um STUN dele não tem como pedir o IP do analista
+_SEM_WEBRTC = """(() => {
+  for (const nome of ["RTCPeerConnection", "webkitRTCPeerConnection", "RTCDataChannel", "RTCIceCandidate",
+                      "RTCSessionDescription", "RTCRtpSender", "RTCRtpReceiver", "RTCRtpTransceiver"]) {
+    try { delete window[nome]; } catch (e) {}
+  }
+})();"""
 
 
 class _FalhaDeNavegacao(Exception):
@@ -86,17 +105,84 @@ def _e_erro_http(status: int | None) -> bool:
 
 
 def _opcoes_do_contexto(rede: RedeConfig, caminho_har: Path) -> dict[str, Any]:
-    """Argumentos de `browser.new_context`: o navegador de um visitante, que grava o HAR e não baixa nada."""
+    """Argumentos de `browser.new_context`: o navegador de um visitante, que grava o HAR e não baixa nada. Sem
+    `user_agent`: o UA nativo é o que o `sec-ch-ua` e o `navigator.userAgentData` confirmam (I5)."""
     opcoes: dict[str, Any] = {
         "accept_downloads": False,
         "service_workers": "block",
-        "user_agent": rede.ua_navegador,
         "record_har_path": str(caminho_har),
         "record_har_content": "embed",
     }
     if rede.proxy:
         opcoes["proxy"] = {"server": rede.proxy}
     return opcoes
+
+
+def _host_local(host: str) -> bool:
+    host = host.strip("[]").rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    return not ip.is_global or ip.is_multicast
+
+
+def _loopback(host: str) -> bool:
+    host = host.strip("[]").rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback
+
+
+def _endereco_local(url: str) -> bool:
+    """A URL aponta para um endereço local do analista: `localhost` ou IP literal que não é global (loopback, rede
+    privada, link-local, CGNAT, documentação). Nome comum e o que não tem host (`data:`, `about:`) não são."""
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        return False
+    return bool(host) and _host_local(host)
+
+
+class _Guarda:
+    """O filtro de rede do contexto: nada de endereço local do analista (só o host da `url_inicial`, e o resto do
+    loopback quando ela mesma é local: o site de teste) e nada de requisição de janela que o site abriu sozinho."""
+
+    def __init__(self, url_inicial: str) -> None:
+        self._host_inicial = (urlsplit(url_inicial).hostname or "").lower()
+        self.paginas: set[Page] = set()
+
+    def permitido(self, url: str) -> bool:
+        if not _endereco_local(url):
+            return True
+        host = (urlsplit(url).hostname or "").lower()
+        return host == self._host_inicial or (_loopback(host) and _loopback(self._host_inicial))
+
+    def _da_captura(self, pedido: Request) -> bool:
+        try:
+            return pedido.frame.page in self.paginas
+        except Exception:
+            # sem frame: a navegação de uma janela nova antes de o frame dela existir (o popup que o site abre; as
+            # abas da captura já existem quando navegam) ou um service worker (já bloqueado no contexto)
+            return not pedido.is_navigation_request()
+
+    async def rotear(self, rota: Route) -> None:
+        if self.permitido(rota.request.url) and self._da_captura(rota.request):
+            await rota.continue_()
+        else:
+            await rota.abort("blockedbyclient")
+
+
+async def _fechar_janela(pagina: Page) -> None:
+    with contextlib.suppress(PlaywrightError):
+        await pagina.close()
 
 
 def _terceiros(har: bytes, dominio_alvo: str) -> list[str]:
@@ -231,9 +317,14 @@ class _Visita:
         return _e_erro_http(self.status)
 
 
-async def _visitar(contexto: BrowserContext, url: str, cfg: CapturaConfig, com_links: bool) -> _Visita:
-    """Abre `url` numa aba nova (o travamento de uma não contamina as outras) e lê o que renderizou."""
+async def _visitar(
+    contexto: BrowserContext, url: str, cfg: CapturaConfig, com_links: bool, guarda: _Guarda
+) -> _Visita:
+    """Abre `url` numa aba nova (o travamento de uma não contamina as outras) e lê o que renderizou. A janela que a
+    página abrir sozinha é fechada (e as requisições dela, barradas pela `guarda`)."""
     pagina = await contexto.new_page()
+    guarda.paginas.add(pagina)
+    pagina.on("popup", _fechar_janela)
     try:
         try:
             resposta = await pagina.goto(url, wait_until="domcontentloaded")
@@ -274,7 +365,7 @@ def _guardar_desafio(s: Servicos, v: _Visita) -> None:
 
 
 async def _percorrer(
-    contexto: BrowserContext, ctx: Contexto, cfg: CapturaConfig, s: Servicos
+    contexto: BrowserContext, ctx: Contexto, cfg: CapturaConfig, s: Servicos, guarda: _Guarda
 ) -> tuple[list[dict], bool, list[dict]]:
     """Visita a página inicial e as subpáginas. Devolve `(paginas sem o HAR, bloqueada, falhas)`.
 
@@ -284,7 +375,7 @@ async def _percorrer(
     subpágina, inclusive erro HTTP e erro inesperado ao processar o conteúdo do site, vai para
     `falhas` e as outras seguem.
     """
-    inicio = await _visitar(contexto, ctx.url_inicial, cfg, com_links=True)
+    inicio = await _visitar(contexto, ctx.url_inicial, cfg, com_links=True, guarda=guarda)
     if inicio.e_desafio:
         _guardar_desafio(s, inicio)
         screenshot = s.custodia.guardar(inicio.screenshot, "png", tipo="screenshot", origem=inicio.url)
@@ -299,7 +390,7 @@ async def _percorrer(
     falhas: list[dict] = []
     for url in _escolher_links(inicio.links, ctx.url_inicial, inicio.url, ctx.alvo, cfg.max_subpaginas):
         try:
-            visita = await _visitar(contexto, url, cfg, com_links=False)
+            visita = await _visitar(contexto, url, cfg, com_links=False, guarda=guarda)
             if visita.e_desafio:
                 _guardar_desafio(s, visita)
                 falhas.append({"url": url, "motivo": _MOTIVO_DESAFIO})
@@ -316,14 +407,18 @@ async def _percorrer(
 async def _capturar(ctx: Contexto, dominio: str, s: Servicos) -> Feito:
     cfg = s.config.captura
     async with async_playwright() as playwright:
-        navegador = await playwright.chromium.launch()
+        navegador = await playwright.chromium.launch(args=list(ARGS_DO_NAVEGADOR))
         try:
             with tempfile.TemporaryDirectory(prefix="radar-har-") as pasta_tmp:
                 caminho_har = Path(pasta_tmp) / "captura.har"
                 contexto = await navegador.new_context(**_opcoes_do_contexto(s.config.rede, caminho_har))
                 try:
                     contexto.set_default_timeout(cfg.timeout_pagina_s * 1000)
-                    paginas, bloqueada, falhas = await _percorrer(contexto, ctx, cfg, s)
+                    if s.config.rede.proxy:
+                        await contexto.add_init_script(_SEM_WEBRTC)
+                    guarda = _Guarda(ctx.url_inicial)
+                    await contexto.route("**/*", guarda.rotear)
+                    paginas, bloqueada, falhas = await _percorrer(contexto, ctx, cfg, s, guarda)
                 finally:
                     await contexto.close()  # o HAR só é gravado quando o contexto fecha
                 har = caminho_har.read_bytes()
