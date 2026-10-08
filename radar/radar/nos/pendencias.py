@@ -13,26 +13,27 @@ categorias que a definição lista) e:
 | `pend_a1`, `pend_b`, `pend_d4` | `extracao` | sempre |
 | `pend_a2` | `extracao` | só com candidato `historico_rentabilidade` |
 | `pend_a3` | `pend_a1`, `extracao` | P-A1 `confirmado`/`corrigido` com `pct_mes` > 0 ou `taxa_diaria`, ou candidato `investimento` |
-| `pend_c` | `extracao` (opcional: `cnpj`) | sempre |
-| `pend_c4` | `cvm_alertas` | sempre; as correspondências só por nome são os candidatos |
+| `pend_c` | `extracao` (opcional: `cnpj`) | sempre; a empresa do `cnpj`, se há, é o candidato `empresa` |
+| `pend_c4` | `cvm_alertas` (opcional: `cnpj`) | sempre; candidato `empresa` e as correspondências só por nome |
 | `pend_d1` | `extracao` (opcional: `cnpj`) | sempre; os sócios do `cnpj`, se há, são os candidatos |
 | `pend_e` | todos os coletores, opcionais | sempre |
 
-O `cnpj` é opcional da P-C e da P-D1 só para a pendência abrir depois dele: a P-CNPJ pode estar aguardando, e os
-sócios que a P-D1 mostra saem dele.
+O `cnpj` é opcional da P-C, da P-C4 e da P-D1 porque a pendência abre depois dele (a P-CNPJ pode estar aguardando)
+e usa o que ele achou.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date
 
 from radar.modelos import Aguardando, Candidato, Contexto, ErroNo, Feito, Pulado
 from radar.motor import NoBase, Servicos
 from radar.pendencias.definicoes import DEFINICOES, nova_pendencia
 
 # o que o nó decide antes de abrir a pendência: os candidatos dela ou o motivo de não gerá-la
-_Preparo = Callable[[dict[str, dict], Servicos], list[Candidato] | Pulado]
+_Preparo = Callable[[Contexto, dict[str, dict], Servicos], list[Candidato] | Pulado]
 
 # todos os nós que coletam dados (o `alvo` só normaliza a entrada): a P-E espera por eles, qualquer que seja o resultado
 _COLETORES = (
@@ -49,13 +50,25 @@ def _da_extracao(entradas: dict[str, dict], pendencia: str) -> list[Candidato]:
 
 
 def _candidatos_da_extracao(pendencia: str) -> _Preparo:
-    def preparar(entradas: dict[str, dict], s: Servicos) -> list[Candidato]:
+    def preparar(ctx: Contexto, entradas: dict[str, dict], s: Servicos) -> list[Candidato]:
         return _da_extracao(entradas, pendencia)
 
     return preparar
 
 
-def _preparar_a2(entradas: dict[str, dict], s: Servicos) -> list[Candidato] | Pulado:
+def _da_empresa(entradas: dict[str, dict]) -> list[Candidato]:
+    """A empresa que o nó `cnpj` identificou, como candidato `empresa`; nenhum se o nó não está nas entradas ou
+    não achou o CNPJ. É o que os critérios da P-C e da P-C4 mandam comparar e pesquisar. No modo retroativo a razão
+    social e o nome fantasia são os de hoje (o `cnpj` os marca em `vazamento_temporal`); aqui só identificam a empresa."""
+    empresa = entradas.get("cnpj") or {}
+    if not (cnpj := empresa.get("cnpj")):
+        return []
+    partes = [empresa.get("razao_social"), f"CNPJ {cnpj}", empresa.get("nome_fantasia")]
+    trecho = " — ".join(parte for parte in partes if parte)
+    return [Candidato(categoria="empresa", valor=cnpj, trecho=trecho, artefato="cnpj", posicao=0)]
+
+
+def _preparar_a2(ctx: Contexto, entradas: dict[str, dict], s: Servicos) -> list[Candidato] | Pulado:
     candidatos = _da_extracao(entradas, "P-A2")
     return candidatos if candidatos else Pulado("sem histórico de rentabilidade")
 
@@ -74,20 +87,24 @@ def _a1_promete_retorno(saida: dict | None) -> bool:
     return com_pct or valor.get("taxa_diaria") is True
 
 
-def _preparar_a3(entradas: dict[str, dict], s: Servicos) -> list[Candidato] | Pulado:
+def _preparar_a3(ctx: Contexto, entradas: dict[str, dict], s: Servicos) -> list[Candidato] | Pulado:
     candidatos = _da_extracao(entradas, "P-A3")
     if candidatos or _a1_promete_retorno(entradas.get("pend_a1")):
         return candidatos
     return Pulado("sem oferta de investimento")
 
 
-def _preparar_c4(entradas: dict[str, dict], s: Servicos) -> list[Candidato]:
-    """Deliberações da CVM que o `cvm_alertas` achou só pelo nome. Sem CNPJ nem domínio batendo, a identidade
-    da empresa é palpite e quem confirma é o Claude. `artefato` é a ref de custódia do JSON do `cvm_alertas`,
-    se a saída a trouxer em `artefato`; senão, o nome do nó."""
+def _preparar_c(ctx: Contexto, entradas: dict[str, dict], s: Servicos) -> list[Candidato]:
+    return [*_da_empresa(entradas), *_da_extracao(entradas, "P-C")]
+
+
+def _preparar_c4(ctx: Contexto, entradas: dict[str, dict], s: Servicos) -> list[Candidato]:
+    """A empresa e as deliberações da CVM que o `cvm_alertas` achou só pelo nome. Sem CNPJ nem domínio batendo, a
+    identidade da empresa é palpite e quem confirma é o Claude. `artefato` das deliberações é a ref de custódia do
+    JSON do `cvm_alertas`, se a saída a trouxer em `artefato`; senão, o nome do nó."""
     saida = entradas["cvm_alertas"]
     artefato = saida.get("artefato") or "cvm_alertas"
-    return [
+    deliberacoes = [
         Candidato(
             categoria="alerta_cvm_nome",
             valor=f"Deliberação {c['numero']}",
@@ -100,6 +117,7 @@ def _preparar_c4(entradas: dict[str, dict], s: Servicos) -> list[Candidato]:
         for c in saida["correspondencias"]
         if c.get("tipo") == "nome"
     ]
+    return [*_da_empresa(entradas), *deliberacoes]
 
 
 def _candidato_do_socio(socio: dict) -> Candidato:
@@ -111,14 +129,29 @@ def _candidato_do_socio(socio: dict) -> Candidato:
     return Candidato(categoria="socio", valor=socio["nome"], trecho=trecho, artefato="cnpj", posicao=0)
 
 
-def _preparar_d1(entradas: dict[str, dict], s: Servicos) -> list[Candidato]:
+def _entrou_depois(socio: dict, as_of: date) -> bool:
+    """A `entrada` do sócio é posterior ao `as_of`. Sem data (ou com uma que não é ISO) não dá para saber: não vale."""
+    try:
+        return date.fromisoformat(socio["entrada"]) > as_of
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _preparar_d1(ctx: Contexto, entradas: dict[str, dict], s: Servicos) -> list[Candidato]:
     """A P-D1 é sempre gerada. Os sócios do quadro da Receita são os candidatos; sem eles (o `cnpj` não achou a
-    empresa, falhou ou veio sem quadro) a pendência pede ao Claude que identifique os responsáveis."""
+    empresa, falhou ou veio sem quadro) a pendência pede ao Claude que identifique os responsáveis.
+
+    O quadro é o de hoje (o `cnpj` marca `socios` em `vazamento_temporal` no modo retroativo, e a marca não chega
+    até aqui): na execução retroativa ficam de fora os que entraram depois do `as_of`. Quem já saiu da sociedade
+    não aparece no quadro, e isso os critérios dizem.
+    """
     socios = (entradas.get("cnpj") or {}).get("socios") or []
+    if ctx.retroativo:
+        socios = [socio for socio in socios if not _entrou_depois(socio, ctx.as_of)]
     return [_candidato_do_socio(socio) for socio in socios]
 
 
-def _preparar_e(entradas: dict[str, dict], s: Servicos) -> list[Candidato]:
+def _preparar_e(ctx: Contexto, entradas: dict[str, dict], s: Servicos) -> list[Candidato]:
     if s.matriz is None:
         raise ErroNo("matriz não configurada", permanente=True)
     return []
@@ -137,8 +170,8 @@ _ESPECIFICACOES = {
     "pend_a2": _Especificacao("P-A2", ("extracao",), (), _preparar_a2),
     "pend_a3": _Especificacao("P-A3", ("pend_a1", "extracao"), (), _preparar_a3),
     "pend_b": _Especificacao("P-B", ("extracao",), (), _candidatos_da_extracao("P-B")),
-    "pend_c": _Especificacao("P-C", ("extracao",), ("cnpj",), _candidatos_da_extracao("P-C")),
-    "pend_c4": _Especificacao("P-C4", ("cvm_alertas",), (), _preparar_c4),
+    "pend_c": _Especificacao("P-C", ("extracao",), ("cnpj",), _preparar_c),
+    "pend_c4": _Especificacao("P-C4", ("cvm_alertas",), ("cnpj",), _preparar_c4),
     "pend_d1": _Especificacao("P-D1", ("extracao",), ("cnpj",), _preparar_d1),
     "pend_d4": _Especificacao("P-D4", ("extracao",), (), _candidatos_da_extracao("P-D4")),
     "pend_e": _Especificacao("P-E", (), _COLETORES, _preparar_e),
@@ -163,7 +196,7 @@ class PendNo(NoBase):
     async def executar(
         self, ctx: Contexto, entradas: dict[str, dict], respostas: dict, s: Servicos
     ) -> Feito | Aguardando | Pulado:
-        candidatos = self._especificacao.preparar(entradas, s)
+        candidatos = self._especificacao.preparar(ctx, entradas, s)
         if isinstance(candidatos, Pulado):
             return candidatos
         if (resposta := respostas.get(self.pendencia)) is not None:

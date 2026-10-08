@@ -19,6 +19,7 @@ from radar.pendencias.definicoes import (
     CABECALHO_NAO_CONFIAVEL,
     DEFINICOES,
     LIMITE_CONTEUDO_DO_ALVO,
+    MAX_CANDIDATOS_POR_CATEGORIA,
     nova_pendencia,
 )
 from radar.pendencias.esquemas import (
@@ -308,10 +309,22 @@ def test_criterios_da_p_c4():
         assert termo in c
 
 
+@pytest.mark.parametrize("pendencia_id", ["P-C", "P-C4"])
+def test_criterios_citam_o_candidato_empresa(pendencia_id):
+    # os critérios mandam comparar/pesquisar a razão social e o CNPJ: a pendência tem de levar esses dados
+    assert "candidato empresa" in DEFINICOES[pendencia_id].criterios
+
+
 def test_criterios_da_p_d1_cobrem_o_caso_sem_socios():
     c = DEFINICOES["P-D1"].criterios
     assert "sem sócios" in c.lower() and "responsáveis pelo site" in c and "notícias" in c and "registros" in c
     assert "CPF" in c  # a resposta nunca leva documento pessoal
+
+
+def test_criterios_da_p_d1_dizem_que_o_quadro_e_o_de_hoje():
+    c = DEFINICOES["P-D1"].criterios
+    assert "quem já saiu da sociedade não aparece" in c
+    assert "só ficam os que entraram até o as_of" in c and "sócio sem data de entrada fica" in c
 
 
 def test_criterios_da_p_e_definem_a_prova_de_aportes_novos():
@@ -372,7 +385,10 @@ def test_restricoes_dizem_o_que_e_dado_nao_confiavel(tmp_path):
     assert p.restricoes == {
         "as_of": "2019-06-06",
         "modo_cego": True,
-        "dados_nao_confiaveis": ["conteudo_do_alvo", "candidatos[].trecho"],
+        "dados_nao_confiaveis": [
+            "conteudo_do_alvo", "candidatos[].trecho", "candidatos[].valor", "candidatos[].extra",
+        ],
+        "candidatos_omitidos": {},
     }
 
 
@@ -391,17 +407,58 @@ def test_cabecalho_vem_mesmo_sem_trechos(ctx, pendencia_id):
 
 def test_conteudo_limitado_a_6000(ctx):
     assert LIMITE_CONTEUDO_DO_ALVO == 6000
-    candidatos = [candidato("percentual", f"{i}|dia", "x" * 200 + f" {i}%", i) for i in range(500)]
+    # 20 percentuais + 20 garantidos de ~300 caracteres: 12 mil caracteres para um teto de 6 mil
+    candidatos = [candidato(c, f"{i}", "x" * 300 + f" {i}", i) for c in ("percentual", "garantido") for i in range(30)]
     p = nova_pendencia("P-A1", ctx, candidatos, "pend_a1")
     assert p.conteudo_do_alvo.startswith(CABECALHO_NAO_CONFIAVEL)
-    assert 5700 < len(p.conteudo_do_alvo) <= 6000  # enche o limite, não passa dele
-    assert len(p.candidatos) == 500  # o teto é só do texto: nenhum candidato some da lista
+    assert 5600 < len(p.conteudo_do_alvo) <= 6000  # enche o limite, não passa dele
+    assert len(p.candidatos) == 2 * MAX_CANDIDATOS_POR_CATEGORIA
 
 
 def test_conteudo_sem_corte_no_meio_de_trecho(ctx):
-    candidatos = [candidato("percentual", f"{i}|dia", f"trecho completo número {i} " + "y" * 150, i) for i in range(100)]
+    candidatos = [
+        candidato(c, f"{i}", f"trecho completo número {i} " + "y" * 300, i)
+        for c in ("percentual", "garantido")
+        for i in range(MAX_CANDIDATOS_POR_CATEGORIA)
+    ]
     linhas = nova_pendencia("P-A1", ctx, candidatos, "pend_a1").conteudo_do_alvo.split("\n")[1:]
-    assert linhas and all(linha.endswith("y" * 150) for linha in linhas)
+    assert 0 < len(linhas) < len(candidatos)  # o limite cortou linhas, mas nenhuma pela metade
+    assert all(linha.endswith("y" * 300) for linha in linhas)
+
+
+def test_teto_de_candidatos_por_categoria(ctx):
+    assert MAX_CANDIDATOS_POR_CATEGORIA == 20
+    candidatos = [candidato("percentual", f"{i}|dia", f"{i}% ao dia", i) for i in range(500)]
+    candidatos += [candidato("garantido", f"g{i}", "garantido", i) for i in range(21)]
+    candidatos += [candidato("investimento", "investir")]
+    p = nova_pendencia("P-A1", ctx, candidatos, "pend_a1")
+    valores = {c: [x.valor for x in p.candidatos if x.categoria == c] for c in ("percentual", "garantido", "investimento")}
+    # ficam os 20 primeiros de cada categoria, na ordem em que o nó os entregou
+    assert valores["percentual"] == [f"{i}|dia" for i in range(20)]
+    assert valores["garantido"] == [f"g{i}" for i in range(20)]
+    assert valores["investimento"] == ["investir"]  # a categoria que não chegou ao teto não perde nada
+    # só as categorias com omissão aparecem
+    assert p.restricoes["candidatos_omitidos"] == {"percentual": 480, "garantido": 1}
+    assert len(p.candidatos) == 41
+
+
+def test_exatamente_no_teto_nao_omite(ctx):
+    candidatos = [candidato("percentual", f"{i}|dia", f"{i}% ao dia", i) for i in range(MAX_CANDIDATOS_POR_CATEGORIA)]
+    p = nova_pendencia("P-A1", ctx, candidatos, "pend_a1")
+    assert len(p.candidatos) == MAX_CANDIDATOS_POR_CATEGORIA
+    assert p.restricoes["candidatos_omitidos"] == {}
+
+
+def test_o_conteudo_so_usa_os_candidatos_que_ficaram(ctx):
+    candidatos = [candidato("percentual", f"{i}|dia", f"trecho {i}", i) for i in range(25)]
+    linhas = nova_pendencia("P-A1", ctx, candidatos, "pend_a1").conteudo_do_alvo.split("\n")[1:]
+    assert linhas == [f"[percentual] trecho {i}" for i in range(20)]
+
+
+def test_o_teto_vale_para_qualquer_categoria(ctx):
+    socios = [Candidato(categoria="socio", valor=f"S{i}", trecho=f"S{i}", artefato="cnpj", posicao=0) for i in range(25)]
+    p = nova_pendencia("P-D1", ctx, socios, "pend_d1")
+    assert len(p.candidatos) == 20 and p.restricoes["candidatos_omitidos"] == {"socio": 5}
 
 
 def test_trecho_gigante_nao_estoura_o_limite_nem_derruba_os_outros(ctx):
@@ -415,11 +472,12 @@ def test_trecho_gigante_nao_estoura_o_limite_nem_derruba_os_outros(ctx):
 
 def test_nenhuma_categoria_passa_fome_por_causa_de_outra(ctx):
     # um site que enche de percentuais não pode tirar o "garantido" do conteúdo
-    candidatos = [candidato("percentual", f"{i}|dia", "p" * 200 + str(i), i) for i in range(300)]
+    candidatos = [candidato("percentual", f"{i}|dia", "p" * 400 + str(i), i) for i in range(300)]
     candidatos.append(candidato("garantido", "garantido", "retorno garantido", 9999))
     p = nova_pendencia("P-A1", ctx, candidatos, "pend_a1")
     assert len(p.conteudo_do_alvo) <= LIMITE_CONTEUDO_DO_ALVO
     assert "[garantido] retorno garantido" in p.conteudo_do_alvo
+    assert p.conteudo_do_alvo.count("[percentual]") < MAX_CANDIDATOS_POR_CATEGORIA  # só os percentuais estourariam
 
 
 def test_conteudo_so_leva_as_categorias_da_pendencia(ctx):
@@ -509,7 +567,7 @@ def test_declaracao_dos_nos():
         "pend_a3": (("pend_a1", "extracao"), ()),
         "pend_b": (("extracao",), ()),
         "pend_c": (("extracao",), ("cnpj",)),
-        "pend_c4": (("cvm_alertas",), ()),
+        "pend_c4": (("cvm_alertas",), ("cnpj",)),
         "pend_d1": (("extracao",), ("cnpj",)),
         "pend_d4": (("extracao",), ()),
     }
@@ -715,6 +773,72 @@ async def test_pend_c4_sempre_gera(ctx, serv):
     assert isinstance(r, Aguardando) and r.pendencias[0].candidatos == []
 
 
+# a saída do nó `cnpj` (só o que a P-C e a P-C4 leem)
+EMPRESA = {
+    "cnpj": PETROBRAS,
+    "razao_social": "PETROLEO BRASILEIRO S A PETROBRAS",
+    "nome_fantasia": "PETROBRAS - EDISE",
+    "socios": [],
+}
+CANDIDATO_EMPRESA = Candidato(
+    categoria="empresa",
+    valor=PETROBRAS,
+    trecho="PETROLEO BRASILEIRO S A PETROBRAS — CNPJ 33000167000101 — PETROBRAS - EDISE",
+    artefato="cnpj",
+    posicao=0,
+)
+SAIDA_CVM = {
+    "correspondencias": [
+        {"tipo": "nome", "valor": "petrobras", "numero": 509, "data": "2023-05-02", "url": "https://c/509", "trecho": "B"}
+    ],
+    "cobertura": {"com_texto_integral": 7, "so_resumo": 0},
+}
+
+
+async def test_pend_c_leva_a_empresa_do_cnpj_antes_dos_candidatos_da_extracao(ctx, serv):
+    entradas = {**entradas_da_extracao(candidato("pix", "11999998888"), candidato("email", "a@b.com")), "cnpj": EMPRESA}
+    r = await PendNo("pend_c").executar(ctx, entradas, {}, serv)
+    p = r.pendencias[0]
+    assert (p.id, p.itens) == ("P-C", ["C2", "C3"])
+    assert [(c.categoria, c.valor) for c in p.candidatos] == [("empresa", PETROBRAS), ("pix", "11999998888")]
+    assert p.candidatos[0] == CANDIDATO_EMPRESA
+    assert "[empresa]" not in p.conteudo_do_alvo  # a Receita não é o site: só os trechos do site entram
+
+
+async def test_pend_c4_leva_a_empresa_do_cnpj_antes_das_deliberacoes(ctx, serv):
+    r = await PendNo("pend_c4").executar(ctx, {"cvm_alertas": SAIDA_CVM, "cnpj": EMPRESA}, {}, serv)
+    p = r.pendencias[0]
+    assert [(c.categoria, c.valor) for c in p.candidatos] == [
+        ("empresa", PETROBRAS), ("alerta_cvm_nome", "Deliberação 509"),
+    ]  # fmt: skip
+    assert p.candidatos[0] == CANDIDATO_EMPRESA
+
+
+@pytest.mark.parametrize("nome", ["pend_c", "pend_c4"])
+@pytest.mark.parametrize(
+    "cnpj",
+    [
+        pytest.param(None, id="sem o nó cnpj nas entradas"),
+        pytest.param({"cnpj": None, "motivo": "não encontrado"}, id="P-CNPJ sem resposta útil"),
+        pytest.param({"cnpj": "", "razao_social": "X"}, id="CNPJ vazio"),
+    ],
+)
+async def test_pend_c_e_c4_sem_cnpj_nao_inventam_empresa(ctx, serv, nome, cnpj):
+    entradas = {**entradas_da_extracao(), "cvm_alertas": {"correspondencias": [], "cobertura": {}}}
+    if cnpj is not None:
+        entradas["cnpj"] = cnpj
+    r = await PendNo(nome).executar(ctx, entradas, {}, serv)
+    assert isinstance(r, Aguardando) and r.pendencias[0].candidatos == []
+
+
+async def test_candidato_empresa_sem_nome_fantasia_ou_razao_social(ctx, serv):
+    entradas = {**entradas_da_extracao(), "cnpj": {"cnpj": PETROBRAS, "razao_social": "ACME LTDA", "nome_fantasia": None}}
+    r = await PendNo("pend_c").executar(ctx, entradas, {}, serv)
+    assert r.pendencias[0].candidatos[0].trecho == f"ACME LTDA — CNPJ {PETROBRAS}"
+    r = await PendNo("pend_c").executar(ctx, {**entradas_da_extracao(), "cnpj": {"cnpj": PETROBRAS}}, {}, serv)
+    assert r.pendencias[0].candidatos[0].trecho == f"CNPJ {PETROBRAS}"
+
+
 SOCIOS = [
     {"nome": "MAGDA MARIA DE REGINA CHAMBRIARD", "qualificacao": "Presidente", "entrada": "2024-06-07"},
     {"nome": "CLARICE COPPETTI", "qualificacao": "Diretor", "entrada": "2023-04-17"},
@@ -738,6 +862,37 @@ async def test_pend_d1_com_socios(ctx, serv):
         ("socio", "SO ENTRADA", "SO ENTRADA (entrada 2020-01-02)", "cnpj", 0),
     ]
     assert p.conteudo_do_alvo == CABECALHO_NAO_CONFIAVEL  # sócios vêm da Receita, não do site
+
+
+def socios_com_entradas(*entradas: str | None) -> list[dict]:
+    return [{"nome": f"SOCIO {i}", "qualificacao": "Sócio", "entrada": e} for i, e in enumerate(entradas)]
+
+
+async def test_pend_d1_retroativa_descarta_quem_entrou_depois_do_as_of(tmp_path, serv):
+    ctx = contexto(tmp_path, date(2020, 1, 2))
+    assert ctx.retroativo
+    # o quadro é o de hoje: entrou antes, no dia, depois (de pouco e de muito), sem data e com data que não é ISO
+    socios = socios_com_entradas("2019-12-31", "2020-01-02", "2020-01-03", "2024-06-07", None, "ontem")
+    entradas = {**entradas_da_extracao(), "cnpj": {"cnpj": PETROBRAS, "socios": socios}}
+    r = await PendNo("pend_d1").executar(ctx, entradas, {}, serv)
+    assert [c.valor for c in r.pendencias[0].candidatos] == ["SOCIO 0", "SOCIO 1", "SOCIO 4", "SOCIO 5"]
+
+
+async def test_pend_d1_retroativa_sem_ninguem_antes_do_as_of_pede_os_responsaveis(tmp_path, serv):
+    ctx = contexto(tmp_path, date(2020, 1, 2))
+    socios = socios_com_entradas("2024-06-07", "2025-07-29")
+    entradas = {**entradas_da_extracao(), "cnpj": {"cnpj": PETROBRAS, "socios": socios}}
+    r = await PendNo("pend_d1").executar(ctx, entradas, {}, serv)
+    assert isinstance(r, Aguardando)  # a P-D1 continua sendo gerada
+    assert r.pendencias[0].candidatos == []
+
+
+async def test_pend_d1_atual_nao_filtra_por_data(ctx, serv):
+    assert not ctx.retroativo
+    socios = socios_com_entradas("2024-06-07", "2026-12-01", None)
+    entradas = {**entradas_da_extracao(), "cnpj": {"cnpj": PETROBRAS, "socios": socios}}
+    r = await PendNo("pend_d1").executar(ctx, entradas, {}, serv)
+    assert [c.valor for c in r.pendencias[0].candidatos] == ["SOCIO 0", "SOCIO 1", "SOCIO 2"]
 
 
 @pytest.mark.parametrize(

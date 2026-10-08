@@ -858,7 +858,12 @@ async def test_nucleo_ponta_a_ponta_em_modo_atual(respx_mock, tmp_path):
     assert sorted(abertas) == ["P-A1", "P-B", "P-C", "P-C4", "P-D1", "P-D4", "P-E"]
     assert [c.valor for c in abertas["P-D1"].candidatos] == [s["nome"] for s in ex.saidas["cnpj"]["socios"]]
     assert len(abertas["P-D1"].candidatos) == 3
-    assert abertas["P-C4"].candidatos == []  # nenhuma deliberação cita o nome
+    # a P-C e a P-C4 levam a empresa que o `cnpj` achou; nenhuma deliberação da CVM cita o nome dela
+    for pendencia in ("P-C", "P-C4"):
+        assert [(c.categoria, c.valor) for c in abertas[pendencia].candidatos] == [("empresa", "33000167000101")]
+    assert abertas["P-C4"].candidatos[0].trecho == (
+        "PETROLEO BRASILEIRO S A PETROBRAS — CNPJ 33000167000101 — PETROBRAS - EDISE"
+    )
     assert "atraso_pagamento" in abertas["P-E"].formato_resposta["tipos_validos"]
     assert set(ex.pendencias) == set(abertas) and all(v["aberta"] for v in ex.pendencias.values())
     # 1 RDAP + 5 DoH + 1 crt.sh + 2 CDX do Wayback (domínio e home) + snapshot da home (HTML e texto) + 1 BrasilAPI
