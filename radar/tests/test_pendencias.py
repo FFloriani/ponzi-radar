@@ -1285,6 +1285,14 @@ async def test_pend_d1_leva_os_processos_do_sancionador(ctx, serv):
     assert p.candidatos[2].extra["nome_curto"] is False
 
 
+async def test_pend_d1_cita_o_json_do_sancionador_quando_a_saida_tem_a_ref(ctx, serv):
+    # a fonte citável do processo (no modo cego o Claude não vê o NUP): o JSON que o `cvm_sancionador` guardou
+    ref = "sha256:" + "cd" * 32
+    entradas = {**entradas_da_extracao(), "cvm_sancionador": {"processos": PROCESSOS, "motivo": None, "artefato": ref}}
+    r = await PendNo("pend_d1").executar(ctx, entradas, {}, serv)
+    assert [c.artefato for c in r.pendencias[0].candidatos if c.categoria == "processo_cvm"] == [ref, ref]
+
+
 def test_criterios_da_p_d1_explicam_os_processos_e_o_nome_curto():
     c = DEFINICOES["P-D1"].criterios
     assert "processo_cvm" in c and "nome_curto" in c and "homônimo" in c

@@ -25,12 +25,16 @@ from radar import execucao, mcp_server
 from radar.arquivos import ler_json
 from radar.config import Config
 from radar.custodia import verificar
+from radar.diff import alertas_da_execucao
+from radar.execucao import carregar_execucao
 from radar.mcp_server import AVISO_NAO_CONFIAVEL, LIMITE_TEXTO, criar_servidor
 from radar.modelos import Aguardando, Candidato, ErroNo, Feito
 from radar.motor import Motor, NoBase
 from radar.nos.alvo import AlvoNo
+from radar.nos.cvm import _guardar as guardar_indice
 from radar.nos.pendencias import PendNo
 from radar.pendencias.definicoes import CABECALHO_NAO_CONFIAVEL, DEFINICOES, nova_pendencia
+from radar.pendencias.mascara import MARCADOR
 from radar.pontuacao import CLASSES
 from radar.rede import Rede
 
@@ -1344,7 +1348,7 @@ async def test_modo_cego_mascara_os_cnpjs_antes_do_no_cnpj_e_aceita_o_token(abri
 
     r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-CNPJ", resposta=resposta("[CNPJ_9]"))
     assert (r["aceita"], r["campo"]) == (False, "valor.cnpj")
-    assert r["motivo"].startswith("token de CNPJ desconhecido: [CNPJ_9]")
+    assert r["motivo"].startswith("token desconhecido: [CNPJ_9]")
     r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-CNPJ", resposta=resposta("[cnpj_1]"))
     assert r["aceita"] is True, r
     # o servidor trocou o token pelo CNPJ real antes de validar e gravar
@@ -1453,6 +1457,127 @@ def test_unir_mascara_numera_processo_e_deliberacao_e_mantem_o_token_do_valor():
     assert base == {"905": "[DELIBERACAO_1]", URL_905: "[DELIBERACAO_1]"}
     assert mcp_server._unir_mascara(base, {"509": "[DELIBERACAO_1]"}) is True and base["509"] == "[DELIBERACAO_2]"
     assert mcp_server._unir_mascara(base, {NUP: "[PROCESSO_1]"}) is True and base[NUP] == "[PROCESSO_1]"
+
+
+# ---------------------------------------------------------------------------- fonte citável no modo cego (terceira passada)
+
+PAGINA_905 = (
+    "<html><body><p>Deliberação CVM nº 905: EXEMPLO PARTICIPACOES LTDA oferece contratos de investimento coletivo "
+    "sem registro.</p></body></html>"
+)
+
+
+class CvmComJson(NoBase):
+    """O `cvm_sancionador` ou o `cvm_alertas` que, como o real, guarda o JSON do resultado na custódia e entrega a ref
+    dele em `artefato`."""
+
+    def __init__(self, nome: str, indice: str, chave: str, saidas: dict) -> None:
+        super().__init__(nome=nome)
+        self.indice, self.chave, self.saidas_fixas = indice, chave, saidas
+
+    async def executar(self, ctx, entradas, respostas, s):
+        artefato = guardar_indice(s, self.indice, {"cnpj": "12345678000195"}, self.saidas_fixas[self.chave])
+        return Feito({**self.saidas_fixas, "artefato": artefato})
+
+
+def _nos_com_fonte_citavel() -> list[NoBase]:
+    """Os nós da R3, com o `cvm_sancionador` e o `cvm_alertas` guardando o JSON na custódia."""
+    jsons = {"cvm_sancionador": ("sancionador", "processos"), "cvm_alertas": ("deliberacoes", "correspondencias")}
+    return [
+        CvmComJson(no.nome, *jsons[no.nome], no.saidas_fixas) if no.nome in jsons else no
+        for no in _nos_com_processo_e_deliberacao()
+    ]
+
+
+def _resposta_c4(fonte: str, url: str, trecho: str) -> dict:
+    return {
+        "status": "confirmado",
+        "valor": {"alerta_vigente": True, "alertas": [{"regulador": "CVM", "data": "2025-11-25", "url": url}]},
+        "evidencias": [{"fonte": fonte, "trecho": trecho, "data_fonte": "2025-11-25", "tipo_fonte": "oficial"}],
+    }
+
+
+def _resposta_d1(fonte: str, trecho: str) -> dict:
+    pessoa = {"pessoa": "[PESSOA_1]", "vinculo": "sócio da [EMPRESA], acusada no processo [PROCESSO_1]"}
+    return {
+        "status": "confirmado",
+        "valor": {"historico_fraude": True, "pessoas": [pessoa]},
+        "evidencias": [{"fonte": fonte, "trecho": trecho, "data_fonte": None, "tipo_fonte": "oficial"}],
+    }
+
+
+async def _candidato(srv, run_id: str, pid: str, categoria: str) -> dict:
+    pendencia = await chamar(srv, "ver_pendencia", run_id=run_id, id=pid)
+    return next(c for c in pendencia["candidatos"] if c["categoria"] == categoria)
+
+
+async def test_modo_cego_responde_a_p_c4_e_a_p_d1_com_os_tokens_que_ve(abrir, tmp_path, respx_mock, dns_publico):
+    srv = await abrir(_nos_com_fonte_citavel())
+    run_id = await iniciar(srv, modo_cego=True)
+    respx_mock.get(URL_905).mock(return_value=httpx.Response(200, html=PAGINA_905))
+    deliberacao = await _candidato(srv, run_id, "P-C4", "alerta_cvm_nome")
+    trecho = deliberacao["trecho"]  # como o Claude o vê: "Deliberação CVM nº [DELIBERACAO_1]: [EMPRESA] oferece..."
+    assert deliberacao["extra"]["url"] == "[DELIBERACAO_1]" and "[DELIBERACAO_1]" in trecho
+
+    async def responder(pid: str, resposta: dict) -> dict:
+        return await chamar(srv, "responder_pendencia", run_id=run_id, id=pid, resposta=resposta)
+
+    # o token que a máscara não tem é recusado com o campo, antes de qualquer busca
+    r = await responder("P-C4", _resposta_c4("[DELIBERACAO_7]", "[DELIBERACAO_1]", trecho))
+    assert (r["aceita"], r["campo"]) == (False, "evidencias[0].fonte")
+    assert r["motivo"].startswith("token desconhecido: [DELIBERACAO_7]")
+    r = await responder("P-C4", _resposta_c4("[DELIBERACAO_1]", "[DELIBERACAO_2]", trecho))
+    assert (r["aceita"], r["campo"]) == (False, "valor.alertas[0].url")
+    # o token conhecido vale a URL da deliberação na fonte e na url; o trecho é conferido mascarado
+    assert (await responder("P-C4", _resposta_c4("[DELIBERACAO_1]", "[deliberacao_1]", trecho)))["aceita"] is True
+
+    # a P-D1 cita o JSON do sancionador, que o Claude lê mascarado (sem o NUP)
+    processo = await _candidato(srv, run_id, "P-D1", "processo_cvm")
+    texto = (await chamar(srv, "ver_artefato", run_id=run_id, sha256=processo["artefato"]))["texto"]
+    assert NUP not in texto and '"nup": "[PROCESSO_1]"' in texto
+    trecho_d1 = '"acusado": "[EMPRESA]", "data_abertura": "2020-03-10"'
+    assert (await responder("P-D1", _resposta_d1(processo["artefato"], trecho_d1)))["aceita"] is True
+
+    julgamentos = {j["pendencia"]: j["resposta"] for j in ler_json(pasta(tmp_path, run_id) / "julgamentos.json")}
+    c4, d1 = julgamentos["P-C4"], julgamentos["P-D1"]
+    assert c4["evidencias"][0]["fonte"] == URL_905 and c4["valor"]["alertas"][0]["url"] == URL_905
+    assert d1["evidencias"][0]["fonte"] == processo["artefato"]
+    assert d1["valor"]["pessoas"] == [
+        {"pessoa": "FULANO BELTRANO", "vinculo": f"sócio da EXEMPLO PARTICIPACOES LTDA, acusada no processo {NUP}"}
+    ]
+    assert c4["evidencias"][0]["trecho"] == trecho  # o trecho fica como o Claude o viu
+
+
+async def test_modo_cego_o_dossie_e_o_diff_guardam_o_valor_real(abrir, tmp_path, respx_mock, dns_publico):
+    srv = await abrir(_nos_com_fonte_citavel())
+    run_id = await iniciar(srv, modo_cego=True)
+    respx_mock.get(URL_905).mock(return_value=httpx.Response(200, html=PAGINA_905))
+    processo = await _candidato(srv, run_id, "P-D1", "processo_cvm")
+    for pid, resposta in (
+        ("P-C4", _resposta_c4("[DELIBERACAO_1]", "[DELIBERACAO_1]", "oferece contratos")),
+        ("P-D1", _resposta_d1(processo["artefato"], '"objeto": "Apurar oferta irregular"')),
+    ):
+        r = await chamar(srv, "responder_pendencia", run_id=run_id, id=pid, resposta=resposta)
+        assert r["aceita"] is True, (pid, r)
+    d = await chamar(srv, "gerar_dossie", run_id=run_id, forcar=False)
+    dossie = Path(d["caminho"]).read_text(encoding="utf-8")
+    assert URL_905 in dossie and "FULANO BELTRANO" in dossie and NUP in dossie
+    assert MARCADOR.search(dossie) is None, MARCADOR.search(dossie)
+    alertas = alertas_da_execucao(carregar_execucao(pasta(tmp_path, run_id)))
+    assert alertas and {alerta.fonte for alerta in alertas} == {URL_905}
+    assert not any(MARCADOR.search(f"{alerta.chave} {alerta.rotulo}") for alerta in alertas)
+
+
+def test_token_ambiguo_numa_fonte_e_recusado_e_num_texto_vale_o_primeiro_valor():
+    mascara = {"exemplo.com.br": "[ALVO]", "www.exemplo.com.br": "[ALVO]", "EXEMPLO PARTICIPACOES LTDA": "[EMPRESA]",
+               "Exemplo Participações Ltda.": "[EMPRESA]", "Exemplo Invest": "[EMPRESA]"}  # fmt: skip
+    with pytest.raises(ValueError, match=r"token ambíguo: \[ALVO\]"):
+        mcp_server._desfazer_tokens("https://[ALVO]/regras", mascara, localizador=True)
+    assert mcp_server._desfazer_tokens("site [ALVO] da [EMPRESA]", mascara, localizador=False) == (
+        "site exemplo.com.br da EXEMPLO PARTICIPACOES LTDA"
+    )
+    # a razão social com acento e pontuação é o mesmo valor; o nome do título é outro
+    assert mcp_server._valores_do_token(mascara, "[empresa]") == ["EXEMPLO PARTICIPACOES LTDA", "Exemplo Invest"]
 
 
 # ---------------------------------------------------------------------------- sessão fechada quando a execução não abre

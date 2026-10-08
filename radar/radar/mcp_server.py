@@ -70,7 +70,7 @@ from radar.pendencias.validacao import arquivar_fonte as baixar_fonte
 from radar.pendencias.validacao import validar
 from radar.pontuacao import carregar_matriz, itens_da_execucao, pontuar_eixo1, sinais_da_execucao
 from radar.rede import ErroRede, Rede
-from radar.texto import decodificar, texto_de_html, texto_de_pdf
+from radar.texto import decodificar, normalizar, texto_de_html, texto_de_pdf
 
 # quanto uma ferramenta espera o trabalho do motor antes de devolver `em_andamento` (os testes trocam)
 ESPERA_S: float = 50
@@ -99,7 +99,7 @@ _REF = re.compile(r"sha256:[0-9a-f]{64}")
 _NUMERADO = re.compile(r"\[(PESSOA|CNPJ|PROCESSO|DELIBERACAO)_(\d+)\]")
 # os marcadores de CNPJ: um CNPJ (nas duas formas) que já tem marcador o mantém
 _DE_CNPJ = re.compile(r"\[CNPJ(?:_\d+)?\]")
-_TOKEN_DE_CNPJ = re.compile(r"\[CNPJ(?:_\d+)?\]", re.IGNORECASE)
+# o que separa as partes de um termo (o CNPJ, o NUP, a razão social com pontuação): fora disso, é o mesmo valor
 _SEPARADORES_DO_CNPJ = re.compile(r"[.\-/\s]")
 # no modo cego, ver_pendencia e ver_artefato esperam os coletores sem trabalho por fazer (a máscara vem das saídas)
 _TERMINAIS = frozenset({"feito", "pulado", "erro", "bloqueado"})
@@ -274,15 +274,77 @@ def _unir_mascara(base: dict[str, str], nova: dict[str, str]) -> bool:
     return mudou
 
 
-def _cnpj_do_token(mascara: dict[str, str], token: str) -> str | None:
-    """O CNPJ (14 caracteres) que o marcador `token` esconde na máscara da execução; `None` se nenhum ou mais de um."""
-    reais = {
-        limpo
-        for termo, marcador in mascara.items()
-        if marcador.casefold() == token.casefold()
-        and cnpj_valido(limpo := _SEPARADORES_DO_CNPJ.sub("", termo).upper())
-    }
-    return next(iter(reais)) if len(reais) == 1 else None
+class _TokenInvalido(ValueError):
+    """O marcador que a resposta cita não esconde nada na máscara, ou esconde mais de um valor onde precisa de um."""
+
+    def __init__(self, motivo: str, campo: str) -> None:
+        super().__init__(motivo)
+        self.motivo, self.campo = motivo, campo
+
+
+def _valores_do_token(mascara: dict[str, str], token: str) -> list[str]:
+    """Os valores que o marcador `token` esconde na máscara da execução, na ordem em que entraram. O mesmo valor
+    escrito de outro jeito conta uma vez (o CNPJ formatado e o só com os caracteres, as formas do NUP, a razão social
+    com e sem acento ou pontuação); o CNPJ sai com os 14 caracteres, sem pontuação."""
+    valores: dict[str, str] = {}
+    for termo, marcador in mascara.items():
+        if marcador.casefold() == token.casefold():
+            chave = _SEPARADORES_DO_CNPJ.sub("", normalizar(termo))
+            valores.setdefault(chave, limpo if cnpj_valido(limpo := chave.upper()) else termo)
+    return list(valores.values())
+
+
+def _e_url(texto: str) -> bool:
+    return texto.lower().startswith(("http://", "https://"))
+
+
+def _desfazer_tokens(texto: str, mascara: dict[str, str], localizador: bool) -> str:
+    """`texto` com cada marcador da máscara trocado pelo valor que ele esconde (`ValueError` com o motivo se não
+    esconde nenhum). O texto que é só o marcador, num localizador (a `fonte` da evidência, uma `url` do valor), vale a
+    URL que ele esconde (a da deliberação, não o número); no resto, o valor que não é URL. Num localizador, o marcador
+    que esconde mais de um valor desses (o `[ALVO]` do domínio e dos subdomínios) é recusado; num texto, vale o
+    primeiro que entrou na máscara (a razão social, o domínio)."""
+
+    def trocar(achado: re.Match[str]) -> str:
+        token = achado.group()
+        valores = _valores_do_token(mascara, token)
+        if not valores:
+            raise ValueError(f"token desconhecido: {token}; use um que aparece na pendência ou no artefato")
+        url = localizador and token == texto.strip()
+        preferidos = [valor for valor in valores if _e_url(valor) == url] or valores
+        if localizador and len(preferidos) > 1:
+            raise ValueError(f"token ambíguo: {token} esconde mais de um valor; cite o sha256: do artefato")
+        return preferidos[0]
+
+    return MARCADOR.sub(trocar, texto)
+
+
+def _desfazer_em(valor: Any, mascara: dict[str, str], campo: str, localizador: bool = False) -> Any:
+    """`_desfazer_tokens` nos textos de `valor`, em qualquer profundidade (as chaves ficam); a chave `url` é
+    localizador. `_TokenInvalido` diz o `campo` do texto recusado."""
+    if isinstance(valor, str):
+        try:
+            return _desfazer_tokens(valor, mascara, localizador or campo.endswith(".url"))
+        except ValueError as erro:
+            raise _TokenInvalido(str(erro), campo) from None
+    if isinstance(valor, dict):
+        return {chave: _desfazer_em(item, mascara, f"{campo}.{chave}") for chave, item in valor.items()}
+    if isinstance(valor, list):
+        return [_desfazer_em(item, mascara, f"{campo}[{i}]") for i, item in enumerate(valor)]
+    return valor
+
+
+def _sem_tokens(resposta: Resposta, mascara: dict[str, str]) -> Resposta:
+    """A resposta do modo cego com os valores reais no lugar dos marcadores que o Claude citou de volta: no `valor` e
+    na `fonte` de cada evidência. O `trecho` fica como ele o viu: é conferido contra o texto mascarado da fonte."""
+    evidencias = [
+        evidencia.model_copy(
+            update={"fonte": _desfazer_em(evidencia.fonte, mascara, f"evidencias[{i}].fonte", localizador=True)}
+        )
+        for i, evidencia in enumerate(resposta.evidencias)
+    ]
+    valor = _desfazer_em(resposta.valor, mascara, "valor")
+    return resposta.model_copy(update={"valor": valor, "evidencias": evidencias})
 
 
 def _recortar(completo: str, mascara: dict[str, str] | None) -> str:
@@ -698,14 +760,13 @@ class _Radar:
             modelo = Resposta.model_validate(resposta)
         except ValidationError as erro:
             return _fora_do_formato(erro)
-        if ex.cega and pid == "P-CNPJ":
-            # o Claude só viu o CNPJ mascarado: o token da máscara vale como o CNPJ que ele esconde (I9)
-            token = modelo.valor.get("cnpj")
-            if isinstance(token, str) and _TOKEN_DE_CNPJ.fullmatch(token.strip()):
-                if (real := _cnpj_do_token(self._mascara(ex) or {}, token.strip())) is None:
-                    motivo = f"token de CNPJ desconhecido: {token.strip()}; use um que aparece na pendência ou no artefato"
-                    return _recusa(motivo, "valor.cnpj")
-                modelo = modelo.model_copy(update={"valor": {**modelo.valor, "cnpj": real}})
+        if ex.cega:
+            # o Claude só viu o texto mascarado: o marcador que ele cita de volta (o CNPJ da P-CNPJ, a fonte e a url da
+            # deliberação da P-C4, o sócio da P-D1) vale o que esconde; o trecho segue conferido mascarado (I9, R3)
+            try:
+                modelo = _sem_tokens(modelo, self._mascara(ex) or {})
+            except _TokenInvalido as erro:
+                return _recusa(erro.motivo, erro.campo)
         limite = self._limite()
         if not await self._esperar(ex.tarefa, limite):
             return {**_em_andamento(ex.run_id, MENSAGEM_TRABALHO), **_recusa(_NAO_GRAVADA)}
@@ -841,7 +902,9 @@ _DESCRICOES = {
         "aviso diz quantos candidatos ficaram de fora por tamanho. No modo cego, o que identifica o alvo vem "
         "mascarado ([ALVO], [EMPRESA], [CNPJ], [CNPJ_n], [PESSOA_n], [PROCESSO_n], [DELIBERACAO_n]) e, com trabalho "
         "rodando, devolve em_andamento; "
-        "na P-CNPJ do modo cego, o valor cnpj pode ser o token ([CNPJ_n]) que aparece na pendência. "
+        "a resposta do modo cego pode citar de volta esses marcadores, na fonte da evidência e nos textos do valor "
+        "(o [CNPJ_n] da P-CNPJ, o [DELIBERACAO_n] como fonte e url da P-C4, o [PESSOA_n] da P-D1): o servidor troca "
+        "cada um pelo valor real; o trecho é citado como foi visto, mascarado. "
         f"{AVISO_NAO_CONFIAVEL}"
     ),
     "ver_artefato": (

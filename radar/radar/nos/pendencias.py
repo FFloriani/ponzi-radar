@@ -118,7 +118,7 @@ def _preparar_c(ctx: Contexto, entradas: dict[str, dict], s: Servicos) -> list[C
 def _preparar_c4(ctx: Contexto, entradas: dict[str, dict], s: Servicos) -> list[Candidato]:
     """A empresa e as deliberações da CVM que o `cvm_alertas` achou só pelo nome. Sem CNPJ nem domínio batendo, a
     identidade da empresa é palpite e quem confirma é o Claude. `artefato` das deliberações é a ref de custódia do
-    JSON do `cvm_alertas`, se a saída a trouxer em `artefato`; senão, o nome do nó."""
+    JSON do `cvm_alertas` (a fonte citável); sem ela (execução de antes da ref), o nome do nó."""
     saida = entradas.get("cvm_alertas") or {"correspondencias": []}  # sem o índice: o aviso vai nos critérios
     artefato = saida.get("artefato") or "cvm_alertas"
     deliberacoes = [
@@ -154,8 +154,9 @@ def _entrou_depois(socio: dict, as_of: date) -> bool:
         return False
 
 
-def _candidato_do_processo(processo: dict) -> Candidato:
-    """Um processo sancionador da CVM que o `cvm_sancionador` ligou à empresa ou a um sócio (I7)."""
+def _candidato_do_processo(processo: dict, artefato: str) -> Candidato:
+    """Um processo sancionador da CVM que o `cvm_sancionador` ligou à empresa ou a um sócio (I7). `artefato` é a ref
+    de custódia do JSON do `cvm_sancionador` (a fonte citável); sem ela (execução de antes da ref), o nome do nó."""
     partes = [
         f"Processo sancionador CVM {processo.get('nup')}",
         processo.get("objeto"),
@@ -168,7 +169,7 @@ def _candidato_do_processo(processo: dict) -> Candidato:
     }
     return Candidato(
         categoria="processo_cvm", valor=str(processo.get("nup")), trecho=" — ".join(p for p in partes if p),
-        artefato="cvm_sancionador", posicao=0, extra=extra,
+        artefato=artefato, posicao=0, extra=extra,
     )  # fmt: skip
 
 
@@ -184,10 +185,12 @@ def _preparar_d1(ctx: Contexto, entradas: dict[str, dict], s: Servicos) -> list[
     if ctx.retroativo:
         socios = [socio for socio in socios if not _entrou_depois(socio, ctx.as_of)]
     # os processos já vêm filtrados pelo `as_of` (abertos até ele)
-    processos = (entradas.get("cvm_sancionador") or {}).get("processos") or []
+    sancionador = entradas.get("cvm_sancionador") or {}
+    processos = sancionador.get("processos") or []
+    artefato = sancionador.get("artefato") or "cvm_sancionador"
     return [
         *(_candidato_do_socio(socio) for socio in socios),
-        *(_candidato_do_processo(p) for p in processos if isinstance(p, dict)),
+        *(_candidato_do_processo(p, artefato) for p in processos if isinstance(p, dict)),
     ]
 
 

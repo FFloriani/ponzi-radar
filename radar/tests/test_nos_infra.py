@@ -1054,8 +1054,11 @@ async def test_nucleo_ponta_a_ponta_em_modo_atual(respx_mock, tmp_path):
     assert ex.saidas["cnpj"]["razao_social"] == "PETROLEO BRASILEIRO S A PETROBRAS"
     # a Petrobras não está nos cadastros da CVM nem nas sedes do BCB, não é acusada e nenhuma stop order cita o CNPJ dela
     assert (ex.saidas["registros"]["registrado"], ex.saidas["registros"]["motivo"]) == (False, None)
-    assert ex.saidas["cvm_sancionador"] == {"processos": [], "motivo": None}
-    assert ex.saidas["cvm_alertas"] == {"correspondencias": [], "cobertura": {"com_texto_integral": 7, "so_resumo": 0}}
+    sancionador, alertas = ex.saidas["cvm_sancionador"], ex.saidas["cvm_alertas"]
+    assert (sancionador["processos"], sancionador["motivo"]) == ([], None)
+    assert (alertas["correspondencias"], alertas["cobertura"]) == ([], {"com_texto_integral": 7, "so_resumo": 0})
+    # a ref do JSON de cada consulta, a fonte citável da P-D1 e da P-C4
+    assert sancionador["artefato"].startswith("sha256:") and alertas["artefato"].startswith("sha256:")
     # as pendências do Claude: cada nó `pend_*` abriu a sua, a P-D1 com os sócios do quadro da Receita (nó `cnpj`)
     abertas = {p.id: p for p in motor.pendencias_abertas()}
     assert sorted(abertas) == ["P-A1", "P-B", "P-C", "P-C4", "P-D1", "P-D4", "P-E"]

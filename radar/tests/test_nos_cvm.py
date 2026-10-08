@@ -85,6 +85,10 @@ def corpo_da_custodia(serv, entrada: dict) -> dict:
     return json.loads(serv.custodia.ler(f"sha256:{entrada['sha256']}"))
 
 
+def sem_artefato(saidas: dict) -> dict:
+    return {chave: valor for chave, valor in saidas.items() if chave != "artefato"}
+
+
 # ------------------------------------------------------------------------------------ registros
 
 
@@ -242,7 +246,7 @@ async def test_registros_indice_em_erro_derruba_o_no(respx_mock, tmp_path, serv)
 def test_sancionador_declaracao():
     no = CvmSancionadorNo()
     assert (no.nome, no.entradas, no.as_of, no.toca_alvo) == ("cvm_sancionador", ("cnpj",), "filtravel", False)
-    assert no.saidas == ("processos", "motivo", "indices_vencidos")
+    assert no.saidas == ("processos", "motivo", "artefato", "indices_vencidos")
 
 
 async def test_sancionador_por_razao_social(respx_mock, tmp_path, serv):
@@ -294,17 +298,21 @@ async def test_sancionador_por_socio(respx_mock, tmp_path, serv):
 async def test_sancionador_sem_correspondencia_e_sem_cnpj(respx_mock, tmp_path, serv):
     mocar_cvm(respx_mock)
     nada = await CvmSancionadorNo().executar(contexto(tmp_path), entrada_cnpj("33000167000101"), {}, serv)
-    assert nada.saidas == {"processos": [], "motivo": None}
+    (entrada,) = entradas_custodia(serv)
+    assert nada.saidas == {"processos": [], "motivo": None, "artefato": f"sha256:{entrada['sha256']}"}
     sem = await CvmSancionadorNo().executar(contexto(tmp_path), entrada_cnpj(None), {}, serv)
-    assert sem.saidas == {"processos": [], "motivo": "sem CNPJ"}
+    assert sem.saidas == {"processos": [], "motivo": "sem CNPJ"}  # sem nome para procurar, nada vai para a custódia
+    assert len(entradas_custodia(serv)) == 1
 
 
 async def test_sancionador_guarda_na_custodia(respx_mock, tmp_path, serv):
     mocar_cvm(respx_mock)
     entradas = entrada_cnpj("33000167000101", "AGUIA AGENTE AUTONOMO DE INVESTIMENTOS LTDA")
-    await CvmSancionadorNo().executar(contexto(tmp_path), entradas, {}, serv)
+    r = await CvmSancionadorNo().executar(contexto(tmp_path), entradas, {}, serv)
     (entrada,) = entradas_custodia(serv)
     assert (entrada["tipo"], entrada["origem"]) == ("indice", "sancionador")
+    # a ref do JSON é a fonte citável dos candidatos da P-D1
+    assert r.saidas["artefato"] == f"sha256:{entrada['sha256']}"
     corpo = corpo_da_custodia(serv, entrada)
     assert len(corpo["correspondencias"]) == 2 and corpo["consulta"]["cnpj"] == "33000167000101"
     # a consulta guarda quantos processos foram olhados, não os nomes dos sócios
@@ -449,7 +457,7 @@ def test_alertas_declaracao():
     assert (no.nome, no.entradas, no.opcionais, no.as_of, no.toca_alvo) == (
         "cvm_alertas", ("alvo",), ("cnpj",), "exato", False
     )
-    assert no.saidas == ("correspondencias", "cobertura", "indices_vencidos")
+    assert no.saidas == ("correspondencias", "cobertura", "artefato", "indices_vencidos")
 
 
 async def test_alertas_casa_por_cnpj_dominio_e_nome(respx_mock, tmp_path, serv):
@@ -479,7 +487,7 @@ async def test_alertas_sem_cnpj_casa_so_por_dominio(respx_mock, tmp_path, serv):
     nao_achou = await CvmAlertasNo().executar(ctx, {**entrada_alvo("santotrader.com"), **entrada_cnpj(None)}, {}, serv)
     assert tipos(nao_achou.saidas["correspondencias"]) == [("dominio", 905)]
     outro = await CvmAlertasNo().executar(contexto(tmp_path, alvo="limpo.com.br"), entrada_alvo("limpo.com.br"), {}, serv)
-    assert outro.saidas == {"correspondencias": [], "cobertura": {"com_texto_integral": 7, "so_resumo": 0}}
+    assert sem_artefato(outro.saidas) == {"correspondencias": [], "cobertura": {"com_texto_integral": 7, "so_resumo": 0}}
 
 
 @pytest.mark.parametrize("plataforma", ["instagram.com", "youtube.com"])
@@ -525,7 +533,7 @@ async def test_alertas_cobertura_diz_quantas_so_tem_o_resumo(respx_mock, tmp_pat
     reg.rota_pdfs.mock(return_value=httpx.Response(404))
     ctx = contexto(tmp_path, alvo="limpo.com.br")
     r = await CvmAlertasNo().executar(ctx, entrada_alvo("limpo.com.br"), {}, serv)
-    assert r.saidas == {"correspondencias": [], "cobertura": {"com_texto_integral": 1, "so_resumo": 1}}
+    assert sem_artefato(r.saidas) == {"correspondencias": [], "cobertura": {"com_texto_integral": 1, "so_resumo": 1}}
 
 
 async def test_alertas_acha_o_cnpj_no_texto_do_pdf_de_uma_deliberacao_antiga(respx_mock, tmp_path, serv):
@@ -544,9 +552,11 @@ async def test_alertas_acha_o_cnpj_no_texto_do_pdf_de_uma_deliberacao_antiga(res
 async def test_alertas_guarda_na_custodia(respx_mock, tmp_path, serv):
     mocar_deliberacoes(respx_mock)
     ctx = contexto(tmp_path, alvo="santotrader.com")
-    await CvmAlertasNo().executar(ctx, entrada_alvo("santotrader.com"), {}, serv)
+    r = await CvmAlertasNo().executar(ctx, entrada_alvo("santotrader.com"), {}, serv)
     (entrada,) = entradas_custodia(serv)
     assert (entrada["tipo"], entrada["origem"]) == ("indice", "deliberacoes")
+    # a ref do JSON é a fonte citável das deliberações da P-C4
+    assert r.saidas["artefato"] == f"sha256:{entrada['sha256']}"
     corpo = corpo_da_custodia(serv, entrada)
     assert corpo["consulta"] == {
         "dominio": "santotrader.com",
@@ -605,7 +615,7 @@ async def test_nos_pelo_motor(respx_mock, tmp_path):
     ex = carregar_execucao(ctx.pasta)
     registros = ex.saidas["registros"]
     assert (registros["registrado"], registros["motivo"], registros["cvm"], registros["bcb"]) == (False, None, [], [])
-    assert ex.saidas["cvm_sancionador"] == {"processos": [], "motivo": None}
+    assert sem_artefato(ex.saidas["cvm_sancionador"]) == {"processos": [], "motivo": None}
     assert tipos(ex.saidas["cvm_alertas"]["correspondencias"]) == [("cnpj", 905), ("dominio", 905), ("nome", 905)]
     # os índices ficam em cache compartilhado; na custódia da execução só a prova das consultas
     origens = [e["origem"] for e in entradas_custodia_de(ctx.pasta)]

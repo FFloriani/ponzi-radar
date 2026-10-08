@@ -2,7 +2,9 @@
 
 Os três consultam os índices em cache (`Servicos.indices`, ver `radar/indices.py`), que são compartilhados entre
 as execuções: o que fica na custódia de cada execução é um JSON com a consulta e as correspondências achadas
-(`tipo="indice"`, `origem=<nome do índice>`), como prova do que foi olhado e do que apareceu.
+(`tipo="indice"`, `origem=<nome do índice>`), como prova do que foi olhado e do que apareceu. O `cvm_sancionador` e o
+`cvm_alertas` devolvem a ref desse JSON em `artefato`: é a fonte citável dos candidatos da P-D1 e da P-C4 (no modo
+cego, o Claude cita o JSON, que ele vê mascarado, em vez do NUP ou da URL da deliberação, que ele não vê).
 """
 
 from __future__ import annotations
@@ -41,10 +43,11 @@ def _com_vencidos(saidas: dict, **listas: object) -> dict:
     return {**saidas, "indices_vencidos": vencidos} if vencidos else saidas
 
 
-def _guardar(s: Servicos, indice: str, consulta: dict, correspondencias: list[dict]) -> None:
+def _guardar(s: Servicos, indice: str, consulta: dict, correspondencias: list[dict]) -> str:
+    """Guarda na custódia o JSON da consulta e das correspondências; devolve a ref (`sha256:<hex>`)."""
     corpo = {"indice": indice, "consulta": consulta, "correspondencias": correspondencias}
     dados = json.dumps(corpo, ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8")
-    s.custodia.guardar(dados, "json", tipo="indice", origem=indice)
+    return s.custodia.guardar(dados, "json", tipo="indice", origem=indice)
 
 
 def _cnpj_da_entrada(entradas: dict[str, dict]) -> str | None:
@@ -165,13 +168,14 @@ class CvmSancionadorNo(NoBase):
     só conta se foi aberto até o `as_of`. Cada processo sai com `vinculo` ("razao_social" ou "socio"): o quadro
     de sócios é o de hoje e a fonte não tem CPF, então um homônimo de sócio pesa menos que a razão social. O nome de
     sócio com menos de 3 palavras casa com muita gente: o processo entra com `nome_curto=True` (homônimo provável).
-    Os processos vão para a P-D1 como candidatos `processo_cvm` e para a seção 5 do dossiê (I7).
-    Sem CNPJ não há nome para procurar: `processos` vazio e `motivo` "sem CNPJ".
+    Os processos vão para a P-D1 como candidatos `processo_cvm`, com `artefato` (a ref do JSON guardado na custódia)
+    como fonte citável, e para a seção 5 do dossiê (I7). Sem CNPJ não há nome para procurar: `processos` vazio,
+    `motivo` "sem CNPJ" e nada na custódia.
     """
 
     nome = "cvm_sancionador"
     entradas = ("cnpj",)
-    saidas = ("processos", "motivo", "indices_vencidos")
+    saidas = ("processos", "motivo", "artefato", "indices_vencidos")
     as_of = "filtravel"
 
     async def executar(
@@ -219,8 +223,8 @@ class CvmSancionadorNo(NoBase):
             "nomes_consultados": len(vinculos),
             "processos_consultados": len(todos),
         }
-        _guardar(s, "sancionador", consulta, achados)
-        return Feito(_com_vencidos({"processos": achados, "motivo": None}, sancionador=todos))
+        artefato = _guardar(s, "sancionador", consulta, achados)
+        return Feito(_com_vencidos({"processos": achados, "motivo": None, "artefato": artefato}, sancionador=todos))
 
 
 # --- cvm_alertas -----------------------------------------------------------------------------------
@@ -316,13 +320,14 @@ class CvmAlertasNo(NoBase):
 
     `cobertura` diz em quantas das deliberações consultadas (as de data até o `as_of`) o texto integral foi lido
     e em quantas só o resumo, que quase nunca traz CNPJ nem domínio: sem correspondência, o resultado só vale
-    como evidência negativa para as `com_texto_integral`.
+    como evidência negativa para as `com_texto_integral`. `artefato` é a ref do JSON guardado na custódia, a fonte
+    citável das deliberações que vão para a P-C4.
     """
 
     nome = "cvm_alertas"
     entradas = ("alvo",)
     opcionais = ("cnpj",)
-    saidas = ("correspondencias", "cobertura", "indices_vencidos")
+    saidas = ("correspondencias", "cobertura", "artefato", "indices_vencidos")
     as_of = "exato"
 
     async def executar(
@@ -338,5 +343,6 @@ class CvmAlertasNo(NoBase):
         integrais = sum(d.integral for d in consultadas)
         cobertura = {"com_texto_integral": integrais, "so_resumo": len(consultadas) - integrais}
         consulta = {"dominio": ctx.alvo, "cnpj": cnpj, "as_of": ctx.as_of.isoformat(), "cobertura": cobertura}
-        _guardar(s, "deliberacoes", consulta, correspondencias)
-        return Feito(_com_vencidos({"correspondencias": correspondencias, "cobertura": cobertura}, deliberacoes=delibs))
+        artefato = _guardar(s, "deliberacoes", consulta, correspondencias)
+        saidas = {"correspondencias": correspondencias, "cobertura": cobertura, "artefato": artefato}
+        return Feito(_com_vencidos(saidas, deliberacoes=delibs))
