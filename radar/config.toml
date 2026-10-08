@@ -7,7 +7,8 @@
 ## Já [rede.limites] substitui o dicionário inteiro (o "*" volta a 1.0 se faltar).
 ## [rede.timeouts] soma ao padrão: listar outro host não tira o do Wayback.
 
-## Onde ficam as execuções. Caminho relativo vale a partir da pasta radar/.
+## Onde ficam as execuções. Caminho relativo vale a partir da pasta radar/. Para a calibração no modo cego com o
+## Claude Code (que lê os arquivos do projeto aberto), use uma pasta fora do projeto, em config.local.toml.
 # casos_dir = "../casos"
 
 [rede]

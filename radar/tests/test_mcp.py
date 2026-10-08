@@ -1295,3 +1295,91 @@ async def test_execucoes_no_mesmo_servidor_veem_respostas_novas(abrir, respx_moc
     segunda = await iniciar(srv)
     assert ler_json(pasta(tmp_path, primeira) / "evidencias.json")["dns"]["A"] == ["203.0.113.1"]
     assert ler_json(pasta(tmp_path, segunda) / "evidencias.json")["dns"]["A"] == ["203.0.113.2"]
+
+
+# ---------------------------------------------------------------------------- modo cego antes do `cnpj` (I9)
+
+CNPJ_DO_RODAPE = "12345678000195"  # o do rodapé do HTML da `Coleta`
+CNPJ_DO_GATEWAY = "33000167000101"
+
+
+def _extracao_com_cnpjs() -> Fixo:
+    candidatos = [
+        {"categoria": "cnpj", "valor": valor, "trecho": f"CNPJ {valor}", "artefato": "sha256:" + "0" * 64, "posicao": 0}
+        for valor in (CNPJ_DO_RODAPE, CNPJ_DO_GATEWAY)
+    ]
+    return Fixo("extracao", {"candidatos": candidatos, "fonte": "captura", "truncado": {}})
+
+
+def test_unir_mascara_cnpj_mantem_o_token_que_o_valor_ja_tem():
+    base = {"12.345.678/0001-95": "[CNPJ_1]", "12345678000195": "[CNPJ_1]"}
+    nova = {"12.345.678/0001-95": "[CNPJ]", "12345678000195": "[CNPJ]",
+            "33.000.167/0001-01": "[CNPJ_1]", "33000167000101": "[CNPJ_1]"}  # fmt: skip
+    assert mcp_server._unir_mascara(base, nova) is True
+    assert base == {"12.345.678/0001-95": "[CNPJ_1]", "12345678000195": "[CNPJ_1]",
+                    "33.000.167/0001-01": "[CNPJ_2]", "33000167000101": "[CNPJ_2]"}  # fmt: skip
+
+
+def test_unir_mascara_outro_cnpj_confirmado_ganha_numero():
+    # a P-CNPJ corrigida para outra empresa: o [CNPJ] já marca a antiga, a nova não divide o marcador com ela
+    base = {"12.345.678/0001-95": "[CNPJ]", "12345678000195": "[CNPJ]"}
+    assert mcp_server._unir_mascara(base, {"33.000.167/0001-01": "[CNPJ]", "33000167000101": "[CNPJ]"}) is True
+    assert base["33000167000101"] == base["33.000.167/0001-01"] == "[CNPJ_1]"
+
+
+async def test_modo_cego_mascara_os_cnpjs_antes_do_no_cnpj_e_aceita_o_token(abrir, tmp_path):
+    nos = [AlvoNo(), Coleta(), _extracao_com_cnpjs(), CnpjPelaResposta()]
+    srv = await abrir(nos)
+    run_id = await iniciar(srv, modo_cego=True)
+    html = artefatos(tmp_path, run_id)["html"]
+    # a P-CNPJ está aberta e o `cnpj` não sabe a empresa: o CNPJ do rodapé já sai mascarado
+    texto = (await chamar(srv, "ver_artefato", run_id=run_id, sha256=html))["texto"]
+    assert "CNPJ [CNPJ_1]" in texto and "12.345.678" not in texto
+
+    def resposta(valor: str) -> dict:
+        evidencia = {"fonte": html, "trecho": "Exemplo Participacoes Ltda - CNPJ [CNPJ_1]", "data_fonte": None,
+                     "tipo_fonte": "operador"}  # fmt: skip
+        return {"status": "confirmado", "valor": {"cnpj": valor}, "evidencias": [evidencia]}
+
+    r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-CNPJ", resposta=resposta("[CNPJ_9]"))
+    assert (r["aceita"], r["campo"]) == (False, "valor.cnpj")
+    assert r["motivo"].startswith("token de CNPJ desconhecido: [CNPJ_9]")
+    r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-CNPJ", resposta=resposta("[cnpj_1]"))
+    assert r["aceita"] is True, r
+    # o servidor trocou o token pelo CNPJ real antes de validar e gravar
+    (julgamento,) = ler_json(pasta(tmp_path, run_id) / "julgamentos.json")
+    assert julgamento["resposta"]["valor"] == {"cnpj": CNPJ_DO_RODAPE}
+    assert ler_json(pasta(tmp_path, run_id) / "evidencias.json")["cnpj"]["cnpj"] == CNPJ_DO_RODAPE
+
+
+async def test_token_de_cnpj_fora_do_modo_cego_e_valor_invalido(abrir, tmp_path):
+    srv = await abrir([AlvoNo(), Coleta(), _extracao_com_cnpjs(), CnpjPelaResposta()])
+    run_id = await iniciar(srv)
+    evidencia = {"fonte": artefatos(tmp_path, run_id)["html"], "trecho": "Exemplo Participacoes Ltda - CNPJ",
+                 "data_fonte": None, "tipo_fonte": "operador"}  # fmt: skip
+    r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-CNPJ",
+                     resposta={"status": "confirmado", "valor": {"cnpj": "[CNPJ_1]"}, "evidencias": [evidencia]})
+    assert (r["aceita"], r["campo"]) == (False, "valor") and "CNPJ inválido" in r["motivo"]
+
+
+async def test_modo_cego_so_mostra_pendencia_e_artefato_com_os_coletores_parados(abrir, tmp_path):
+    nos = [AlvoNo(), Coleta(), Pend("pend_a1", "P-A1")]
+    srv = await abrir(nos)
+    run_id = await iniciar(srv, modo_cego=True)
+    html = artefatos(tmp_path, run_id)["html"]
+    # o processo caiu com a coleta no meio: outro servidor abre a execução com o coletor pendente
+    estado = ler_json(pasta(tmp_path, run_id) / "estado.json")
+    estado["nos"]["coleta"] = {"status": "executando", "motivo": None}
+    (pasta(tmp_path, run_id) / "estado.json").write_text(json.dumps(estado), encoding="utf-8")
+    outro = await abrir(nos)
+    trabalho = {"run_id": run_id, "em_andamento": True, "mensagem": "há trabalho em andamento; consulte status(run_id)"}
+    assert await chamar(outro, "ver_pendencia", run_id=run_id, id="P-A1") == trabalho
+    assert await chamar(outro, "ver_artefato", run_id=run_id, sha256=html) == trabalho
+    # o status drena o motor: com a coleta feita, as duas voltam a servir
+    assert (await chamar(outro, "status", run_id=run_id))["nos"]["coleta"] == "feito"
+    assert (await chamar(outro, "ver_pendencia", run_id=run_id, id="P-A1"))["id"] == "P-A1"
+    assert "texto" in await chamar(outro, "ver_artefato", run_id=run_id, sha256=html)
+
+
+def test_instrucoes_avisam_que_o_modo_cego_so_protege_o_canal_mcp():
+    assert "casos_dir" in mcp_server.INSTRUCOES and "config.local.toml" in mcp_server.INSTRUCOES

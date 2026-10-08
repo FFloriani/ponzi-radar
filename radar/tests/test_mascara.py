@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from radar.pendencias.mascara import mascarar, montar_mascara
+from radar.pendencias.mascara import MARCADOR, mascarar, montar_mascara
 
 HOME = (
     '<html><head><meta charset="utf-8"><title>  Exemplo   Invest — Rendimento diário </title>'
@@ -510,3 +510,40 @@ def test_texto_ascii_e_texto_com_acento_trocam_igual():
 @pytest.mark.parametrize("texto", ["", "nada a esconder"])
 def test_mascarar_sem_mascara_devolve_o_texto(texto):
     assert mascarar(texto, {}) == texto
+
+
+# --- CNPJs candidatos (I9) ---------------------------------------------------------------------------------
+
+
+def _candidato_cnpj(valor: str) -> dict:
+    return {"categoria": "cnpj", "valor": valor, "trecho": f"CNPJ {valor}", "artefato": "sha256:aa", "posicao": 0}
+
+
+def test_cnpjs_candidatos_da_extracao_e_do_rdap_tem_token_proprio():
+    # a P-CNPJ abre antes de o nó `cnpj` achar a empresa: os CNPJs da página e o titular do domínio já identificam
+    saidas = {
+        "rdap": {"cnpj_titular": "00000000000191"},
+        "extracao": {"candidatos": [
+            _candidato_cnpj("33000167000101"), _candidato_cnpj("00360305000104"), _candidato_cnpj("00000000000191"),
+            {"categoria": "email", "valor": "a@b.com", "trecho": "a@b.com", "artefato": "x", "posicao": 0},
+        ]},
+    }  # fmt: skip
+    assert montar_mascara(saidas, sem_artefatos) == {
+        "00.000.000/0001-91": "[CNPJ_1]", "00000000000191": "[CNPJ_1]",
+        "33.000.167/0001-01": "[CNPJ_2]", "33000167000101": "[CNPJ_2]",
+        "00.360.305/0001-04": "[CNPJ_3]", "00360305000104": "[CNPJ_3]",
+    }  # fmt: skip
+
+
+def test_cnpj_confirmado_e_cnpj_e_os_outros_candidatos_ganham_numero():
+    saidas = {
+        **saidas_completas(),
+        "extracao": {"candidatos": [_candidato_cnpj("33000167000101"), _candidato_cnpj("00360305000104")]},
+    }
+    mascara = montar_mascara(saidas, sem_artefatos)
+    assert mascara["33000167000101"] == "[CNPJ]" and mascara["00360305000104"] == "[CNPJ_1]"
+    assert mascarar("CNPJ 00.360.305/0001-04 e 33000167000101", mascara) == "CNPJ [CNPJ_1] e [CNPJ]"
+
+
+def test_marcador_numerado_de_cnpj_e_marcador():
+    assert MARCADOR.fullmatch("[CNPJ_12]") and MARCADOR.fullmatch("[cnpj]") and not MARCADOR.fullmatch("[CNPJ_]")

@@ -1,7 +1,8 @@
 """Máscara do modo cego (spec 7.5): o que identifica o alvo vira marcador antes de chegar ao Claude.
 
 `montar_mascara` junta, das saídas dos nós, os termos que revelam o site (`[ALVO]`), a empresa (`[EMPRESA]`), o
-CNPJ (`[CNPJ]`) e os sócios (`[PESSOA_n]`); `mascarar` aplica o dicionário a um texto.
+CNPJ (`[CNPJ]` o confirmado, `[CNPJ_n]` os candidatos) e os sócios (`[PESSOA_n]`); `mascarar` aplica o dicionário a
+um texto.
 
 A comparação é sobre o texto dobrado (sem acento, sem caixa, sem caracteres invisíveis), com o mapa de volta às
 posições do original: o que fica de fora do termo achado continua como estava. Entre as palavras de um termo vale
@@ -31,7 +32,7 @@ _PARTES_DO_TERMO = re.compile(r"[\s.\-/]+")
 _SEPARADORES_DO_TITULO = re.compile(r"\s*[|–—·:]\s*|\s+-\s+")
 _CNPJ = re.compile(r"[0-9a-z]{12}[0-9]{2}")
 # os marcadores que `montar_mascara` produz
-MARCADOR = re.compile(r"\[(?:alvo|empresa|cnpj|pessoa_\d+)\]", re.IGNORECASE)
+MARCADOR = re.compile(r"\[(?:alvo|empresa|cnpj(?:_\d+)?|pessoa_\d+)\]", re.IGNORECASE)
 # Palavras (dobradas) de forma jurídica, de setor e de vitrine: a razão social, o `og:site_name` e o domínio as
 # trazem, mas elas não identificam uma marca. Uma parte do título que só tem essas palavras em comum com eles não é
 # o nome do site ("Investimentos" em "EXEMPLO INVESTIMENTOS LTDA" ou em exemploinvestimentos.com.br). `invest` fica
@@ -185,6 +186,8 @@ def montar_mascara(saidas: dict[str, dict], ler_artefato: Callable[[str], bytes]
       como "Marca | Rendimento de 1,5% ao dia" ou "Investimentos - Marca" não faz da promessa ou da palavra de setor
       o nome da empresa;
     - `cnpj.cnpj`, formatado e só com os caracteres (numérico ou alfanumérico) -> `[CNPJ]`;
+    - `rdap.cnpj_titular` e os candidatos `cnpj` da `extracao`, nas duas formas -> `[CNPJ_n]`, um número por CNPJ
+      (I9: a P-CNPJ abre antes de o nó `cnpj` achar a empresa, e o rodapé com o CNPJ não pode sair cru);
     - `cnpj.socios[].nome` -> `[PESSOA_n]`, com n a posição do sócio no quadro.
 
     Termos com menos de 4 caracteres não entram. Um termo que já entrou (sem diferenciar maiúsculas) não entra
@@ -236,6 +239,18 @@ def montar_mascara(saidas: dict[str, dict], ler_artefato: Callable[[str], bytes]
         if len(limpo) == 14:
             adicionar(_cnpj_formatado(limpo), "[CNPJ]")
             adicionar(limpo, "[CNPJ]")
+    candidatos = [_no(saidas, "rdap").get("cnpj_titular")]
+    extraidos = _no(saidas, "extracao").get("candidatos")
+    for candidato in extraidos if isinstance(extraidos, list) else []:
+        if isinstance(candidato, dict) and candidato.get("categoria") == "cnpj":
+            candidatos.append(candidato.get("valor"))
+    numerados = 0
+    for valor in candidatos:
+        limpo = _PONTUACAO_DO_CNPJ.sub("", valor).upper() if isinstance(valor, str) else ""
+        if len(limpo) == 14 and limpo.casefold() not in vistos:
+            numerados += 1
+            adicionar(_cnpj_formatado(limpo), f"[CNPJ_{numerados}]")
+            adicionar(limpo, f"[CNPJ_{numerados}]")
 
     socios = cnpj.get("socios")
     for n, socio in enumerate(socios if isinstance(socios, list) else [], start=1):
