@@ -12,7 +12,7 @@ import pytest
 from radar.config import Config, RedeConfig
 from radar.custodia import Custodia, verificar
 from radar.execucao import carregar_execucao, criar_contexto, criar_servicos
-from radar.indices import Deliberacao, IndiceVencido, Indices
+from radar.indices import Deliberacao, IndiceVencido, Indices, ProcessoCVM
 from radar.modelos import Contexto, ErroNo, Feito
 from radar.motor import Motor, NoBase, Servicos
 from radar.nos.alvo import AlvoNo
@@ -680,3 +680,26 @@ async def test_indice_em_dia_nao_acrescenta_a_chave(respx_mock, tmp_path, serv):
     mocar_deliberacoes(respx_mock)
     r = await CvmAlertasNo().executar(contexto(tmp_path), entrada_alvo(), {}, serv)
     assert "indices_vencidos" not in r.saidas
+
+
+# ------------------------------------------------------------------------------------ nome curto (I7)
+
+
+class _IndicesComProcessos:
+    async def sancionador(self):
+        def processo(nup: str, acusado: str) -> ProcessoCVM:
+            return ProcessoCVM(nup=nup, objeto="Apurar oferta irregular", data_abertura=date(2020, 1, 10),
+                               fase="Julgamento", acusado=acusado, situacao="Acusado envia defesa")  # fmt: skip
+
+        return [processo("1", "JOÃO SILVA"), processo("2", "CARLOS ALBERTO PEREIRA NETO"), processo("3", "EMPRESA X LTDA")]
+
+
+async def test_sancionador_marca_o_nome_curto_de_socio(tmp_path, rede):
+    # nome de sócio com menos de 3 palavras casa com muita gente: o processo entra, marcado como possível homônimo
+    serv = Servicos(config=Config(), rede=rede, custodia=Custodia(tmp_path / "execucao"), indices=_IndicesComProcessos())
+    socios = [{"nome": "João Silva"}, {"nome": "Carlos Alberto Pereira Neto"}]
+    entradas = entrada_cnpj("33000167000101", "EMPRESA X LTDA", socios=socios)
+    r = await CvmSancionadorNo().executar(contexto(tmp_path), entradas, {}, serv)
+    assert [(p["nup"], p["vinculo"], p["nome_curto"]) for p in r.saidas["processos"]] == [
+        ("3", "razao_social", False), ("2", "socio", False), ("1", "socio", True)
+    ]  # mesma data de abertura: pela ordem do NUP, do maior para o menor

@@ -23,6 +23,8 @@ from radar.texto import normalizar
 # valer como "registrado antes do as_of"
 _SEM_REGISTRO = frozenset({"", "em analise", "registro nao concedido"})
 _TAMANHO_MINIMO_DO_NOME = 8
+# nome de sócio com menos palavras que isto ("João Silva") casa com muita gente: o processo entra como homônimo provável
+_PALAVRAS_DO_NOME_DE_SOCIO = 3
 _MARGEM_DO_TRECHO = 120
 
 
@@ -161,7 +163,9 @@ class CvmSancionadorNo(NoBase):
 
     O acusado casa com a razão social ou com o nome de algum sócio (sem acento, caixa nem pontuação) e o processo
     só conta se foi aberto até o `as_of`. Cada processo sai com `vinculo` ("razao_social" ou "socio"): o quadro
-    de sócios é o de hoje e a fonte não tem CPF, então um homônimo de sócio pesa menos que a razão social.
+    de sócios é o de hoje e a fonte não tem CPF, então um homônimo de sócio pesa menos que a razão social. O nome de
+    sócio com menos de 3 palavras casa com muita gente: o processo entra com `nome_curto=True` (homônimo provável).
+    Os processos vão para a P-D1 como candidatos `processo_cvm` e para a seção 5 do dossiê (I7).
     Sem CNPJ não há nome para procurar: `processos` vazio e `motivo` "sem CNPJ".
     """
 
@@ -185,11 +189,16 @@ class CvmSancionadorNo(NoBase):
             if isinstance(socio, dict) and isinstance(socio.get("nome"), str):
                 vinculos.setdefault(_chave_do_nome(socio["nome"]), "socio")
         vinculos.pop("", None)
+        curtos = {
+            chave for chave, vinculo in vinculos.items()
+            if vinculo == "socio" and len(chave.split()) < _PALAVRAS_DO_NOME_DE_SOCIO
+        }  # fmt: skip
 
         todos = await indices.sancionador()
         achados = []
         for p in todos:
-            vinculo = vinculos.get(_chave_do_nome(p.acusado))
+            chave = _chave_do_nome(p.acusado)
+            vinculo = vinculos.get(chave)
             if vinculo is not None and p.data_abertura is not None and p.data_abertura <= ctx.as_of:
                 achados.append(
                     {
@@ -200,6 +209,7 @@ class CvmSancionadorNo(NoBase):
                         "acusado": p.acusado,
                         "situacao": p.situacao,
                         "vinculo": vinculo,
+                        "nome_curto": chave in curtos,
                     }
                 )
         achados.sort(key=lambda a: (a["data_abertura"], a["nup"], a["acusado"]), reverse=True)

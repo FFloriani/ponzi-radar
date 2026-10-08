@@ -102,6 +102,14 @@ Dados da empresa indisponíveis: {{ emp.motivo|md }}.
 {% endfor %}
 
 {% endif %}
+{% if processos %}
+**Processos sancionadores da CVM (coletor)**
+
+{% for p in processos %}
+- {{ p.nup|md }} — {{ p.objeto|md }} — acusado {{ p.acusado|md }} ({{ p.vinculo|md }}) — aberto em {{ p.abertura|md }} — {{ p.situacao|md }}
+{% endfor %}
+
+{% endif %}
 **Registros oficiais**
 
 {% if oficiais.motivo %}

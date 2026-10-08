@@ -190,8 +190,11 @@ _DEFINICOES = (
             "titular do domínio) e pesquise-os do mesmo jeito. Histórico é envolvimento anterior comprovado "
             "(condenação, processo, sanção ou reportagem) em pirâmide ou golpe financeiro. Como o quadro pode não "
             "incluir quem operava o site no as_of, confira no rodapé, nos termos e na imprensa quem eram os "
-            "responsáveis na época; fatos posteriores ao as_of não valem. Informe em pessoas só o nome e o vínculo; "
-            "nunca informe CPF nem outro documento pessoal."
+            "responsáveis na época; fatos posteriores ao as_of não valem. Os candidatos processo_cvm são processos "
+            "sancionadores da CVM, abertos até o as_of, cujo acusado tem o nome da empresa (vinculo razao_social) ou "
+            "de um sócio (vinculo socio); nome_curto=true é nome de sócio com menos de 3 palavras, homônimo provável: "
+            "só conte o processo se confirmar que o acusado é a mesma pessoa. Informe em pessoas só o nome e o "
+            "vínculo; nunca informe CPF nem outro documento pessoal."
         ),
         modelo_valor=ValorD1,
         categorias=(),

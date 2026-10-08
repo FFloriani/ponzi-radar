@@ -410,6 +410,33 @@ def _registros_oficiais(ex: ExecucaoSalva) -> dict:
     }
 
 
+_VINCULO_DO_PROCESSO = {"razao_social": "razão social", "socio": "sócio"}
+
+
+def _processos_sancionadores(ex: ExecucaoSalva) -> list[dict]:
+    """Os processos sancionadores da CVM que o coletor ligou à empresa ou a um sócio (I7); o nome curto de sócio leva
+    o aviso de homônimo provável."""
+    processos = (saida(ex, "cvm_sancionador") or {}).get("processos")
+    linhas = []
+    for p in processos if isinstance(processos, list) else []:
+        if not isinstance(p, dict):
+            continue
+        vinculo = _VINCULO_DO_PROCESSO.get(p.get("vinculo"), str(p.get("vinculo") or _NA))
+        if p.get("nome_curto") is True:
+            vinculo += ", nome curto: possível homônimo"
+        linhas.append(
+            {
+                "nup": str(p.get("nup") or _NA),
+                "objeto": str(p.get("objeto") or _NA),
+                "acusado": str(p.get("acusado") or _NA),
+                "vinculo": vinculo,
+                "abertura": str(p.get("data_abertura") or _NA),
+                "situacao": str(p.get("situacao") or _NA),
+            }
+        )
+    return linhas
+
+
 def _pessoas_com_vinculo(ex: ExecucaoSalva, itens: dict[str, Item]) -> list[dict]:
     """As pessoas que a P-D1 ligou a esquemas, com o vínculo (nome e vínculo; nunca documento)."""
     if itens["D1"].estado != "confirmado" or (valor := valor_confirmado(ex, "P-D1")) is None:
@@ -589,6 +616,7 @@ def _contexto(
         "emp": _empresa(ex),
         "oficiais": _registros_oficiais(ex),
         "pessoas": _pessoas_com_vinculo(ex, pont.itens),
+        "processos": _processos_sancionadores(ex),
         "infra": _infraestrutura(ex),
         "lacunas": _lacunas(ex, pont.itens),
         "mud": _mudancas(anterior, diff, motivo_sem_diff),

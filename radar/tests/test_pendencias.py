@@ -581,7 +581,7 @@ def test_declaracao_dos_nos():
         "pend_b": ((), ("extracao",)),
         "pend_c": ((), ("extracao", "cnpj")),
         "pend_c4": ((), ("cvm_alertas", "cnpj")),
-        "pend_d1": ((), ("extracao", "cnpj")),
+        "pend_d1": ((), ("extracao", "cnpj", "cvm_sancionador")),  # I7: os processos do coletor
         "pend_d4": ((), ("extracao",)),
     }
     for nome, (entradas, opcionais) in esperado.items():
@@ -1251,3 +1251,40 @@ async def test_com_pagina_e_indice_nao_ha_aviso(ctx, serv):
     assert AVISO_SEM_PAGINA not in r.pendencias[0].criterios
     r = await PendNo("pend_c4").executar(ctx, entradas_completas(), {}, serv)
     assert AVISO_SEM_INDICE_CVM not in r.pendencias[0].criterios
+
+
+# ---------------------------------------------------------------------------- processos sancionadores na P-D1 (I7)
+
+PROCESSOS = [
+    {"nup": "19957000011202001", "objeto": "Apurar atuação sem autorização", "data_abertura": "2020-03-10",
+     "fase": "Julgamento", "acusado": "JOÃO SILVA", "situacao": "Acusado envia defesa", "vinculo": "socio",
+     "nome_curto": True},
+    {"nup": "19957000022201801", "objeto": "Apurar oferta irregular", "data_abertura": "2018-06-20",
+     "fase": "Finalizado", "acusado": "EXEMPLO INVESTIMENTOS LTDA", "situacao": "Condenado",
+     "vinculo": "razao_social", "nome_curto": False},
+]
+
+
+async def test_pend_d1_leva_os_processos_do_sancionador(ctx, serv):
+    entradas = {
+        **entradas_da_extracao(),
+        "cnpj": {"cnpj": PETROBRAS, "socios": [{"nome": "JOÃO SILVA", "qualificacao": "Sócio", "entrada": None}]},
+        "cvm_sancionador": {"processos": PROCESSOS, "motivo": None},
+    }
+    r = await PendNo("pend_d1").executar(ctx, entradas, {}, serv)
+    (p,) = r.pendencias
+    assert [(c.categoria, c.valor) for c in p.candidatos] == [
+        ("socio", "JOÃO SILVA"), ("processo_cvm", "19957000011202001"), ("processo_cvm", "19957000022201801"),
+    ]
+    processo = p.candidatos[1]
+    for parte in ("19957000011202001", "Apurar atuação sem autorização", "JOÃO SILVA", "Acusado envia defesa",
+                  "2020-03-10"):  # fmt: skip
+        assert parte in processo.trecho, parte
+    assert processo.artefato == "cvm_sancionador"
+    assert processo.extra["nome_curto"] is True and processo.extra["vinculo"] == "socio"
+    assert p.candidatos[2].extra["nome_curto"] is False
+
+
+def test_criterios_da_p_d1_explicam_os_processos_e_o_nome_curto():
+    c = DEFINICOES["P-D1"].criterios
+    assert "processo_cvm" in c and "nome_curto" in c and "homônimo" in c

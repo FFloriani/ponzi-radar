@@ -305,6 +305,32 @@ def test_dossie_cita_em_cada_item_a_evidencia_marcada_e_as_marcas_dela(tmp_path)
     assert "paga 5% ao mês" in b3[0] and "data_desconhecida" not in b3[0]
 
 
+PROCESSOS = [
+    {"nup": "19957000011202001", "objeto": "Apurar atuação sem autorização", "data_abertura": "2020-03-10",
+     "fase": "Julgamento", "acusado": "JOÃO SILVA", "situacao": "Acusado envia defesa", "vinculo": "socio",
+     "nome_curto": True},
+    {"nup": "19957000022201801", "objeto": "Apurar oferta irregular", "data_abertura": "2018-06-20",
+     "fase": "Finalizado", "acusado": "EXEMPLO INVESTIMENTOS LTDA", "situacao": "Condenado",
+     "vinculo": "razao_social", "nome_curto": False},
+]
+
+
+def test_dossie_lista_os_processos_sancionadores_na_secao_5(tmp_path):
+    # I7: o que o coletor achou na CVM aparece no dossiê, com o aviso de homônimo do nome curto
+    pasta = gravar(tmp_path, saidas={"cvm_sancionador": {"processos": PROCESSOS, "motivo": None}})
+    s5 = secao(dossie(pasta), 5)
+    assert "**Processos sancionadores da CVM (coletor)**" in s5
+    linhas = [linha for linha in s5.splitlines() if "1995700001120200" in linha or "1995700002220180" in linha]
+    assert len(linhas) == 2
+    assert "JOÃO SILVA" in linhas[0] and "sócio" in linhas[0] and "possível homônimo" in linhas[0]
+    assert "2020-03-10" in linhas[0] and "Acusado envia defesa" in linhas[0]
+    assert "razão social" in linhas[1] and "possível homônimo" not in linhas[1]
+
+
+def test_dossie_sem_processos_nao_mostra_a_lista(tmp_path):
+    assert "Processos sancionadores" not in secao(dossie(gravar(tmp_path)), 5)
+
+
 def test_dossie_sem_marcas_no_julgamento_nao_quebra(tmp_path):
     s3 = secao(dossie(gravar(tmp_path)), 3)  # os julgamentos da fixture não têm a chave `marcas`
     a1 = next(linha for linha in s3.splitlines() if linha.startswith("| A1"))

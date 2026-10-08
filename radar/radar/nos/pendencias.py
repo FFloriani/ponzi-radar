@@ -17,7 +17,7 @@ categorias que a definição lista) e:
 | `pend_a3` | `pend_a1` (`extracao`) | P-A1 `confirmado`/`corrigido` com `pct_mes` > 0 ou `taxa_diaria`, ou candidato `investimento` |
 | `pend_c` | (`extracao`, `cnpj`) | sempre; a empresa do `cnpj`, se há, é o candidato `empresa` |
 | `pend_c4` | (`cvm_alertas`, `cnpj`) | sempre; candidato `empresa` e as correspondências só por nome |
-| `pend_d1` | (`extracao`, `cnpj`) | sempre; os sócios do `cnpj`, se há, são os candidatos |
+| `pend_d1` | (`extracao`, `cnpj`, `cvm_sancionador`) | sempre; os sócios do `cnpj` e os processos da CVM são os candidatos |
 | `pend_e` | todos os coletores, opcionais | sempre |
 
 O `cnpj` é opcional da P-C, da P-C4 e da P-D1 porque a pendência abre depois dele (a P-CNPJ pode estar aguardando)
@@ -154,6 +154,24 @@ def _entrou_depois(socio: dict, as_of: date) -> bool:
         return False
 
 
+def _candidato_do_processo(processo: dict) -> Candidato:
+    """Um processo sancionador da CVM que o `cvm_sancionador` ligou à empresa ou a um sócio (I7)."""
+    partes = [
+        f"Processo sancionador CVM {processo.get('nup')}",
+        processo.get("objeto"),
+        f"acusado: {processo.get('acusado')}" + (f" ({processo['situacao']})" if processo.get("situacao") else ""),
+        f"aberto em {processo.get('data_abertura')}",
+    ]
+    extra = {
+        chave: processo.get(chave)
+        for chave in ("acusado", "vinculo", "nome_curto", "fase", "situacao", "data_abertura")
+    }
+    return Candidato(
+        categoria="processo_cvm", valor=str(processo.get("nup")), trecho=" — ".join(p for p in partes if p),
+        artefato="cvm_sancionador", posicao=0, extra=extra,
+    )  # fmt: skip
+
+
 def _preparar_d1(ctx: Contexto, entradas: dict[str, dict], s: Servicos) -> list[Candidato]:
     """A P-D1 é sempre gerada. Os sócios do quadro da Receita são os candidatos; sem eles (o `cnpj` não achou a
     empresa, falhou ou veio sem quadro) a pendência pede ao Claude que identifique os responsáveis.
@@ -165,7 +183,12 @@ def _preparar_d1(ctx: Contexto, entradas: dict[str, dict], s: Servicos) -> list[
     socios = (entradas.get("cnpj") or {}).get("socios") or []
     if ctx.retroativo:
         socios = [socio for socio in socios if not _entrou_depois(socio, ctx.as_of)]
-    return [_candidato_do_socio(socio) for socio in socios]
+    # os processos já vêm filtrados pelo `as_of` (abertos até ele)
+    processos = (entradas.get("cvm_sancionador") or {}).get("processos") or []
+    return [
+        *(_candidato_do_socio(socio) for socio in socios),
+        *(_candidato_do_processo(p) for p in processos if isinstance(p, dict)),
+    ]
 
 
 def _preparar_e(ctx: Contexto, entradas: dict[str, dict], s: Servicos) -> list[Candidato]:
@@ -189,7 +212,7 @@ _ESPECIFICACOES = {
     "pend_b": _Especificacao("P-B", (), ("extracao",), _candidatos_da_extracao("P-B")),
     "pend_c": _Especificacao("P-C", (), ("extracao", "cnpj"), _preparar_c),
     "pend_c4": _Especificacao("P-C4", (), ("cvm_alertas", "cnpj"), _preparar_c4),
-    "pend_d1": _Especificacao("P-D1", (), ("extracao", "cnpj"), _preparar_d1),
+    "pend_d1": _Especificacao("P-D1", (), ("extracao", "cnpj", "cvm_sancionador"), _preparar_d1),
     "pend_d4": _Especificacao("P-D4", (), ("extracao",), _candidatos_da_extracao("P-D4")),
     "pend_e": _Especificacao("P-E", (), _COLETORES, _preparar_e),
 }
