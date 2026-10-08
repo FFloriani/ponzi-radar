@@ -230,6 +230,12 @@ def test_carregar_matriz_de_outro_caminho(tmp_path):
         ('classe: "provável", condicoes', 'classe: "talvez", condicoes'),  # classe fora da ordem
         ("atraso_pagamento: E4", "atraso_pagamento: E9"),  # estágio sem janela
         ("{de: 5,  ate: 9,", "{de: 6,  ate: 9,"),  # faixas com buraco
+        ("reciclagem dos líderes\"", "reciclagem dos líderes\"\n  E9: \"depois\""),  # janelas fora de E0..En
+        ("recrutar_para_sacar: 3}", "recrutar_para_sacar: 4}"),  # B1 acima do máximo
+        ("10.0], taxa_diaria: 4}", "10.0], taxa_diaria: 5}"),  # taxa diária acima do máximo do A1
+        ("[1.2, 3.0, 10.0]", "[1.2, 1.2, 10.0]"),  # limites não estritamente crescentes
+        ("[1.2, 3.0, 10.0]", "[3.0, 1.2, 10.0]"),
+        ("[1.2, 3.0, 10.0]", "[1.2, 3.0]"),  # a fronteira do A1 é definida para três limites
     ],
 )
 def test_matriz_incoerente_recusada(tmp_path, de, para):
@@ -244,10 +250,12 @@ def test_matriz_incoerente_recusada(tmp_path, de, para):
 # ---------------------------------------------------------------------------- A1
 
 
+# R-T14-fronteira-a1: 1 se pct <= 1,2; 2 se 1,2 < pct < 3,0; 3 se 3,0 <= pct <= 10,0; 4 se pct > 10,0 ou taxa
+# diária (a R1 do relatório diz "3% ao mês ou mais (A1 >= 3)" e a tabela, "de 3% a 10% = 3")
 @pytest.mark.parametrize(
     "pct,diaria,esperado",
-    [(None, False, 0), (1.2, False, 1), (1.21, False, 2), (3.0, False, 2), (3.01, False, 3), (10.0, False, 3),
-     (10.01, False, 4), (0.5, True, 4), (0, False, 0), (None, True, 4)],
+    [(None, False, 0), (1.2, False, 1), (1.21, False, 2), (2.99, False, 2), (3.0, False, 3), (3.01, False, 3),
+     (10.0, False, 3), (10.01, False, 4), (0.5, True, 4), (0, False, 0), (-1.0, False, 0), (None, True, 4)],
 )  # fmt: skip
 def test_pontos_a1(pct, diaria, esperado, matriz):
     assert pontos_a1(pct, diaria, matriz) == esperado
@@ -269,45 +277,45 @@ def test_pontos_a1(pct, diaria, esperado, matriz):
     ],
 )
 def test_casos_ouro(pts, total, classe, matriz):
-    e = pontuar_eixo1(itens(**pts), matriz)
+    e = pontuar_eixo1(itens(**pts), matriz, sinais=[])
     assert (e.minimo, e.maximo, e.classe) == (total, total, classe)
     assert e.pode_chegar_a is None and e.regras_pendentes == []
 
 
 def test_regras_disparadas(matriz):
-    assert pontuar_eixo1(itens(**ATLAS_2019), matriz).regras_disparadas == ["R1"]
-    assert pontuar_eixo1(itens(A3=2, B4=3, C1=3, C3=2), matriz).regras_disparadas == ["R2"]
-    assert pontuar_eixo1(itens(**BOI_GORDO), matriz).regras_disparadas == []
+    assert pontuar_eixo1(itens(**ATLAS_2019), matriz, sinais=[]).regras_disparadas == ["R1"]
+    assert pontuar_eixo1(itens(A3=2, B4=3, C1=3, C3=2), matriz, sinais=[]).regras_disparadas == ["R2"]
+    assert pontuar_eixo1(itens(**BOI_GORDO), matriz, sinais=[]).regras_disparadas == []
     # GAS: a faixa já é "característico", mas a R1 também disparou
-    assert pontuar_eixo1(itens(**GAS), matriz).regras_disparadas == ["R1"]
+    assert pontuar_eixo1(itens(**GAS), matriz, sinais=[]).regras_disparadas == ["R1"]
 
 
 def test_sem_nada(matriz):
-    assert pontuar_eixo1(itens(), matriz) == Eixo1(
+    assert pontuar_eixo1(itens(), matriz, sinais=[]) == Eixo1(
         minimo=0, maximo=0, classe="sem sinal estrutural forte", pode_chegar_a=None,
         regras_disparadas=[], regras_pendentes=[],
     )  # fmt: skip
 
 
 def test_intervalo_com_nao_verificado(matriz):
-    e = pontuar_eixo1(itens(abertos=("D1",), **GAS), matriz)
+    e = pontuar_eixo1(itens(abertos=("D1",), **GAS), matriz, sinais=[])
     assert (e.minimo, e.maximo, e.classe, e.pode_chegar_a) == (18, 21, "característico", None)
 
 
 def test_inconclusivo_conta_como_aberto(matriz):
-    e = pontuar_eixo1(itens(inconclusivos=("D1",), **GAS), matriz)
+    e = pontuar_eixo1(itens(inconclusivos=("D1",), **GAS), matriz, sinais=[])
     assert (e.minimo, e.maximo) == (18, 21)
 
 
 def test_pode_chegar_a(matriz):
-    e = pontuar_eixo1(itens(abertos=("B2", "C4"), **ATLAS_2019), matriz)
+    e = pontuar_eixo1(itens(abertos=("B2", "C4"), **ATLAS_2019), matriz, sinais=[])
     assert (e.minimo, e.classe, e.maximo, e.pode_chegar_a) == (8, "provável", 13, None)
-    e = pontuar_eixo1(itens(abertos=("B2", "C4", "D1", "B4"), **ATLAS_2019), matriz)
+    e = pontuar_eixo1(itens(abertos=("B2", "C4", "D1", "B4"), **ATLAS_2019), matriz, sinais=[])
     assert (e.minimo, e.classe, e.maximo, e.pode_chegar_a) == (8, "provável", 19, "característico")
 
 
 def test_regra_pendente(matriz):
-    e = pontuar_eixo1(itens(abertos=("B4",), **BOI_GORDO), matriz)
+    e = pontuar_eixo1(itens(abertos=("B4",), **BOI_GORDO), matriz, sinais=[])
     assert "R2 dispara se B4 se confirmar" in e.regras_pendentes
     # a R1 não fica pendente: A1=2 está confirmado e não chega a 3
     assert not any(r.startswith("R1") for r in e.regras_pendentes)
@@ -315,24 +323,35 @@ def test_regra_pendente(matriz):
 
 
 def test_regra_pendente_por_item_faltante(matriz):
-    e = pontuar_eixo1(itens(abertos=("C1",), A1=3, A3=2), matriz)
+    e = pontuar_eixo1(itens(abertos=("C1",), A1=3, A3=2), matriz, sinais=[])
     assert e.regras_pendentes == ["R1 dispara se C1 se confirmar"]
-    e = pontuar_eixo1(itens(inconclusivos=("A1",), C1=3), matriz)
+    e = pontuar_eixo1(itens(inconclusivos=("A1",), C1=3), matriz, sinais=[])
     assert e.regras_pendentes == ["R1 dispara se A1 se confirmar"]
     # as duas condições da R1 em aberto: falta mais de um item, nenhuma frase
-    e = pontuar_eixo1(itens(abertos=("A1", "C1")), matriz)
+    e = pontuar_eixo1(itens(abertos=("A1", "C1")), matriz, sinais=[])
     assert e.regras_pendentes == []
     # item nao_se_aplica não fica pendente
-    assert pontuar_eixo1(itens(A1=3), matriz).regras_pendentes == []
+    assert pontuar_eixo1(itens(A1=3), matriz, sinais=[]).regras_pendentes == []
 
 
 def test_r3_classe_fixa_pelo_sinal(matriz):
     prova = Sinal(tipo="prova_aportes_novos", estagio=None, data=date(2020, 1, 5), tipo_fonte="oficial")
-    e = pontuar_eixo1(itens(**BOI_GORDO), matriz, [prova])
+    e = pontuar_eixo1(itens(**BOI_GORDO), matriz, sinais=[prova])
     assert e.classe == "confirmado" and e.regras_disparadas == ["R3"]
     assert e.pode_chegar_a is None
     outro = Sinal(tipo="atraso_pagamento", estagio="E4", data=None, tipo_fonte="relato")
-    assert pontuar_eixo1(itens(**BOI_GORDO), matriz, [outro]).classe == "suspeito"
+    assert pontuar_eixo1(itens(**BOI_GORDO), matriz, sinais=[outro]).classe == "suspeito"
+
+
+def test_sinais_e_anterior_sao_obrigatorios(matriz):
+    # sem os sinais a R3 sumiria em silêncio; sem a anterior, o E6 por duas falhas de captura
+    with pytest.raises(TypeError):
+        pontuar_eixo1(itens(**BOI_GORDO), matriz)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        pontuar_eixo1(itens(**BOI_GORDO), matriz, [])  # type: ignore[misc]  # só por nome
+    with pytest.raises(TypeError):
+        sinais_da_execucao(execucao(), matriz)  # type: ignore[call-arg]
+    assert sinais_da_execucao(execucao(), matriz, None) == ([], [])  # None explícito vale
 
 
 # ---------------------------------------------------------------------------- itens: estados das pendências
@@ -354,7 +373,7 @@ def test_execucao_base(matriz):
         "C3": ("nao_se_aplica", 0), "C4": ("nao_se_aplica", 0), "D1": ("nao_se_aplica", 0),
         "D2": ("nao_verificado", 0), "D3": ("nao_se_aplica", 0), "D4": ("nao_se_aplica", 0),
     }  # fmt: skip
-    e = pontuar_eixo1(resultado, matriz)
+    e = pontuar_eixo1(resultado, matriz, sinais=[])
     assert (e.minimo, e.maximo, e.classe, e.regras_disparadas) == (8, 10, "provável", ["R1"])
 
 
@@ -478,13 +497,39 @@ def test_origem(matriz):
     ex = execucao(pendencias={"P-A1": {"candidatos": _candidatos("garantido"), "aberta": False}})
     assert item(ex, "A1").origem == "claude"
     assert item(execucao(), "A1").origem == "claude"
-    # P-B: a categoria de cada subitem
-    ex = execucao(pendencias={"P-B": {"candidatos": _candidatos("indicacao", "saque"), "aberta": False}})
+    # P-B: a categoria de cada subitem, com os quatro confirmados
+    b_todos = resp(
+        valor={"indicacao": "indicacao_remunerada", "token_proprio": True, "carencia_com_multa": True, "taxa_para_sacar": True}
+    )
+    ex = execucao({"pend_b": b_todos}, pendencias={"P-B": {"candidatos": _candidatos("indicacao", "saque"), "aberta": False}})
     resultado = itens_da_execucao(ex, matriz)
     assert [resultado[b].origem for b in ("B1", "B2", "B3", "B4")] == ["regex_confirmada", "claude", "claude", "regex_confirmada"]
-    ex = execucao(pendencias={"P-B": {"candidatos": _candidatos("token", "carencia", "saque"), "aberta": False}})
-    resultado = itens_da_execucao(ex, matriz)
+    candidatos = {"P-B": {"candidatos": _candidatos("token", "carencia", "saque"), "aberta": False}}
+    resultado = itens_da_execucao(execucao({"pend_b": b_todos}, pendencias=candidatos), matriz)
     assert [resultado[b].origem for b in ("B1", "B2", "B3", "B4")] == ["claude", *["regex_confirmada"] * 3]
+
+
+@pytest.mark.parametrize(
+    "saida",
+    [
+        resp(valor={"pct_mes": None, "taxa_diaria": False, "garantido": True}),  # nao_se_aplica
+        resp("nao_encontrado"),
+        resp("inconclusivo"),
+    ],
+)
+def test_regex_confirmada_so_com_item_confirmado(saida, matriz):
+    # a regex achou candidato, mas o Claude não confirmou o item: a origem do estado é o julgamento dele
+    ex = execucao({"pend_a1": saida}, pendencias={"P-A1": {"candidatos": _candidatos("percentual"), "aberta": False}})
+    assert item(ex, "A1").origem == "claude"
+
+
+def test_regex_confirmada_so_com_item_confirmado_b_e_c3(matriz):
+    # B1 "nenhuma" com candidato de indicação
+    ex = execucao(pendencias={"P-B": {"candidatos": _candidatos("indicacao"), "aberta": False}})
+    assert item(ex, "B1").origem == "claude"
+    # C3 que não marcou, com candidato de pix
+    ex = execucao(pendencias={"P-C": {"candidatos": _candidatos("pix"), "aberta": False}})
+    assert item(ex, "C3").origem == "claude"
     # a P-C4 não tem candidato de regex (alerta_cvm_nome vem do índice da CVM)
     ex = execucao(pendencias={"P-C4": {"candidatos": _candidatos("alerta_cvm_nome"), "aberta": False}})
     assert item(ex, "C4").origem == "claude"
@@ -535,6 +580,15 @@ def test_c1_depende_da_oferta(matriz):
     assert item(ex, "C1").estado == "nao_verificado"
 
 
+@pytest.mark.parametrize("status", ["erro", "bloqueado", "pendente"])
+def test_c1_sem_oferta_dispensa_os_registros(status, matriz):
+    # A1 e A3 verificados sem pontos: não há oferta de investimento, e o registro não importa
+    sem_retorno = resp(valor={"pct_mes": None, "taxa_diaria": False, "garantido": False})
+    ex = execucao({"pend_a1": sem_retorno}, {"pend_a3": ("pulado", "sem oferta de investimento"), "registros": status})
+    c1 = item(ex, "C1")
+    assert (c1.estado, c1.pontos) == ("nao_se_aplica", 0)
+
+
 def test_c1_sem_cnpj(matriz):
     ex = execucao(
         {
@@ -573,6 +627,9 @@ def test_c3_sem_cnpj(matriz):
         (6201501, "confirmado"),  # 62: TI
         (650000, "confirmado"),  # 0650000 (fictício): a seção é "06", não "65" — o zero à esquerda conta
         (None, "nao_verificado"),
+        (0, "nao_verificado"),  # código 0000000 não existe: desconhecido, não "fora da seção K"
+        (-4751201, "nao_verificado"),
+        (47512010, "nao_verificado"),  # mais de 7 dígitos
     ],
 )
 def test_c3_cnae(cnae, estado, matriz):
@@ -679,6 +736,10 @@ def test_retroativo_base(matriz):
     resultado = itens_da_execucao(retroativa(), matriz)
     # C1 marca: sem registro na CVM no as_of e nada no BCB (o BCB vazado só pesa quando sustenta o registro)
     assert (resultado["C1"].estado, resultado["C1"].pontos) == ("confirmado", 3)
+    # a ausência no BCB sustenta a conclusão, e a lista consultada é a de hoje: a nota diz isso
+    assert "(lista do BCB é a de hoje)" in resultado["C1"].nota
+    # em modo atual, não
+    assert "lista do BCB" not in item(execucao(), "C1").nota
     # o CNAE de hoje é da seção K, mas não conta: o do as_of é desconhecido e a P-C é negativa
     assert (resultado["C3"].estado, resultado["C3"].pontos) == ("nao_verificado", 0)
     # D3 usa as datas de registro e de abertura, que valem em qualquer as_of: 2015 e 2014, anos antes de 2019
@@ -692,10 +753,11 @@ def test_retroativo_c1_so_pelo_bcb(matriz):
     }  # fmt: skip
     c1 = item(retroativa({"registros": registros}), "C1")
     assert (c1.estado, c1.pontos) == ("nao_verificado", 0)
-    assert "vazamento temporal" in c1.nota
-    # com registro na CVM no as_of, o BCB de hoje não faz falta
+    assert "vazamento temporal" in c1.nota and "(lista do BCB é a de hoje)" in c1.nota
+    # com registro na CVM no as_of, o BCB de hoje não faz falta (e a nota não fala dele)
     registros = {**registros, "cvm": [{"cnpj": PETROBRAS}]}
-    assert item(retroativa({"registros": registros}), "C1").estado == "nao_se_aplica"
+    c1 = item(retroativa({"registros": registros}), "C1")
+    assert c1.estado == "nao_se_aplica" and "lista do BCB" not in c1.nota
     # em modo atual o BCB vale
     assert item(execucao({"registros": {**registros, "cvm": [], "vazamento_temporal": []}}), "C1").estado == "nao_se_aplica"
 
@@ -774,7 +836,7 @@ def test_prova_aportes_novos_dispara_a_r3(matriz):
     sinais, modificadores = sinais_da_execucao(ex, matriz, None)
     assert [(s.tipo, s.estagio) for s in sinais] == [("prova_aportes_novos", None)]
     assert pontuar_eixo2(sinais, modificadores, matriz).estagio is None  # não é estágio
-    e1 = pontuar_eixo1(itens_da_execucao(ex, matriz), matriz, sinais)
+    e1 = pontuar_eixo1(itens_da_execucao(ex, matriz), matriz, sinais=sinais)
     assert e1.classe == "confirmado" and "R3" in e1.regras_disparadas
 
 
@@ -827,7 +889,87 @@ def test_e0_nao_com_outro_sinal(matriz):
     assert [s.estagio for s in sinais] == ["E2"]
 
 
+def test_e0_prova_aportes_novos_nao_suprime(matriz):
+    # o prova_aportes_novos não é estágio: não conta como "outro sinal" para o E0
+    rdap = {**base()["rdap"], "registro": (HOJE - timedelta(days=10)).isoformat()}
+    pe = _pe([{"tipo": "prova_aportes_novos", "data": None, "evidencia": 1}])
+    sinais, _ = sinais_da_execucao(
+        execucao({"rdap": rdap, "cnpj": {"cnpj": None, "motivo": "x"}, "pend_e": pe}), matriz, None
+    )
+    assert [(s.tipo, s.estagio) for s in sinais] == [("prova_aportes_novos", None), ("registro_recente", "E0")]
+
+
+@pytest.mark.parametrize(
+    "saidas,status",
+    [
+        ({}, {"cnpj": "erro"}),  # empresa desconhecida: o CNPJ pode ser antigo
+        ({}, {"cnpj": "bloqueado"}),
+        ({}, {"cnpj": "aguardando"}),  # P-CNPJ aberta
+        ({"cnpj": {**base()["cnpj"], "abertura": None}}, {}),  # empresa sem data de abertura
+        ({"cnpj": {**base()["cnpj"], "abertura": "2026-12-01"}}, {}),  # abertura depois do as_of
+    ],
+)
+def test_e0_exige_datas_conhecidas(saidas, status, matriz):
+    rdap = {**base()["rdap"], "registro": (HOJE - timedelta(days=10)).isoformat()}
+    sinais, _ = sinais_da_execucao(execucao({"rdap": rdap, **saidas}, status), matriz, None)
+    assert sinais == []
+
+
+def test_e0_sem_data_do_dominio(matriz):
+    sem_cnpj = {"cnpj": {"cnpj": None, "motivo": "x"}}
+    assert sinais_da_execucao(execucao(sem_cnpj, {"rdap": "erro"}), matriz, None)[0] == []
+    rdap = {**base()["rdap"], "registro": None}
+    assert sinais_da_execucao(execucao({"rdap": rdap, **sem_cnpj}), matriz, None)[0] == []
+
+
+def test_retroativo_descarta_sinal_depois_do_as_of(matriz):
+    pe = _pe(
+        [
+            {"tipo": "fuga_operador", "data": "2021-03-10", "evidencia": 1},  # depois do as_of (2019-07-01)
+            {"tipo": "atraso_pagamento", "data": "2019-06-20", "evidencia": 0},
+            {"tipo": "limite_saque", "data": None, "evidencia": 0},  # sem data: não dá para dizer que é depois
+        ]
+    )
+    sinais, _ = sinais_da_execucao(retroativa({"pend_e": pe}), matriz, None)
+    assert [s.tipo for s in sinais] == ["atraso_pagamento", "limite_saque"]
+    assert pontuar_eixo2(sinais, [], matriz).estagio == "E4"
+
+
 FALHA = ("erro", "captura falhou: net::ERR_CONNECTION_REFUSED")
+# R-T14-e6: só conta como site fora do ar a falha de navegação sem resposta HTTP e a página inicial com 5xx
+# (inclusive os 52x da Cloudflare), 404 ou 410. Recusa ao visitante (401, 403, 407, 429, 451...) não é queda
+_FALHAS_QUE_CONTAM = [
+    "captura falhou: Page.goto: net::ERR_NAME_NOT_RESOLVED at https://exemplo.com.br/",
+    "captura falhou: Page.goto: net::ERR_CONNECTION_REFUSED at https://exemplo.com.br/",
+    "captura falhou: Page.goto: Timeout 30000ms exceeded.",
+    "captura falhou: HTTP 500", "captura falhou: HTTP 502", "captura falhou: HTTP 503",
+    "captura falhou: HTTP 520", "captura falhou: HTTP 522", "captura falhou: HTTP 526",
+    "captura falhou: HTTP 404", "captura falhou: HTTP 410",
+]  # fmt: skip
+_RECUSAS = [
+    "captura falhou: HTTP 401", "captura falhou: HTTP 403", "captura falhou: HTTP 407",
+    "captura falhou: HTTP 429", "captura falhou: HTTP 451", "captura falhou: HTTP 400",
+    "captura falhou: HTTP 418",
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("motivo", _FALHAS_QUE_CONTAM)
+def test_e6_falhas_que_contam(motivo, matriz):
+    falha = {"captura": ("erro", motivo)}
+    sinais, _ = sinais_da_execucao(execucao(status=falha), matriz, execucao(status=falha))
+    assert [s.tipo for s in sinais] == ["site_fora_do_ar"]
+    # misturada com uma falha de outra classe que também conta
+    sinais, _ = sinais_da_execucao(execucao(status=falha), matriz, execucao(status={"captura": FALHA}))
+    assert [s.tipo for s in sinais] == ["site_fora_do_ar"]
+
+
+@pytest.mark.parametrize("motivo", _RECUSAS)
+def test_e6_recusa_ao_visitante_nao_e_queda(motivo, matriz):
+    recusa = {"captura": ("erro", motivo)}
+    assert sinais_da_execucao(execucao(status=recusa), matriz, execucao(status=recusa))[0] == []
+    # numa execução só, com uma queda de verdade na outra, também não
+    assert sinais_da_execucao(execucao(status=recusa), matriz, execucao(status={"captura": FALHA}))[0] == []
+    assert sinais_da_execucao(execucao(status={"captura": FALHA}), matriz, execucao(status=recusa))[0] == []
 
 
 def test_e6_duas_falhas_de_captura(matriz):

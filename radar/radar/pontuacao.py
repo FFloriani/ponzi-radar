@@ -21,6 +21,7 @@ from __future__ import annotations
 import calendar
 import hashlib
 import operator
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import date
@@ -47,11 +48,18 @@ TIPO_FORA_DO_AR = "site_fora_do_ar"
 _ESTAGIO_E0 = "E0"
 _DIAS_E0 = 90
 _FONTE_COLETOR = "coletor"
+# o motivo de erro da captura (radar/nos/captura.py) e os códigos HTTP da página inicial que dizem "site fora do ar"
+_PREFIXO_FALHA_CAPTURA = "captura falhou:"
+_HTTP_DA_CAPTURA = re.compile(r"HTTP (\d{3})")
+_HTTP_SITE_SUMIU = frozenset({404, 410})  # além dos 5xx
 
 _SEM_PONTOS = frozenset({"nao_se_aplica", "nao_encontrado"})
 _EM_ABERTO = frozenset({"nao_verificado", "inconclusivo"})
 _SECAO_K = ("64", "65", "66")  # atividades financeiras no CNAE
 _FONTES_DE_REGISTRO = ("cvm", "bcb", "bcb_dominio")
+_FONTES_BCB = frozenset({"bcb", "bcb_dominio"})
+_NOTA_BCB_DE_HOJE = " (lista do BCB é a de hoje)"
+_MAIOR_CNAE = 9_999_999  # o código tem 7 dígitos
 _OPERADORES: dict[str, Callable[[int, int], bool]] = {
     ">=": operator.ge, ">": operator.gt, "==": operator.eq, "!=": operator.ne, "<=": operator.le, "<": operator.lt,
 }  # fmt: skip
@@ -73,7 +81,10 @@ class Faixa(_Estrito):
 class ItemMatriz(_Estrito):
     nome: str
     max: int = Field(gt=0)
-    limites_pct_mes: list[float] | None = None  # A1: teto de cada faixa de pontos, em % ao mês
+    # A1, em % ao mês, três valores [l1, l2, l3] estritamente crescentes (R-T14-fronteira-a1): 1 ponto se pct <= l1;
+    # 2 se l1 < pct < l2; 3 se l2 <= pct <= l3; o máximo se pct > l3. O l2 (3,0) abre a faixa de cima porque a R1
+    # do relatório diz "3% ao mês ou mais (A1 >= 3)" e a tabela, "de 3% a 10% = 3"
+    limites_pct_mes: list[float] | None = None
     taxa_diaria: int | None = None  # A1: pontos do retorno por dia
     valores: dict[str, int] | None = None  # B1: pontos de cada forma de indicação
     meses_limite: int | None = None  # D3
@@ -124,14 +135,9 @@ class Matriz(BaseModel):
         erros = []
         if set(self.itens) != set(IDS_ITENS):
             erros.append(f"os itens têm de ser {', '.join(IDS_ITENS)}")
-        a1, b1, d3 = self.itens.get("A1"), self.itens.get("B1"), self.itens.get("D3")
-        if a1 is not None and (a1.limites_pct_mes is None or a1.taxa_diaria is None):
-            erros.append("A1 precisa de limites_pct_mes e taxa_diaria")
-        if b1 is not None and b1.valores is None:
-            erros.append("B1 precisa de valores")
-        if d3 is not None and d3.meses_limite is None:
-            erros.append("D3 precisa de meses_limite")
-        erros += self._erros_das_faixas() + self._erros_das_regras()
+        erros += self._erros_dos_parametros() + self._erros_das_faixas() + self._erros_das_regras()
+        if list(self.janelas) != [f"E{n}" for n in range(len(self.janelas))]:
+            erros.append("as janelas têm de ser E0, E1, ... En, nessa ordem")
         if fora := sorted(set(self.estagios.values()) - set(self.janelas)):
             erros.append(f"estágios sem janela: {', '.join(fora)}")
         if fora := sorted(m for m, d in self.modificadores.items() if d["origem"] not in {*self.itens, "P-E"}):
@@ -139,6 +145,27 @@ class Matriz(BaseModel):
         if erros:
             raise ValueError("; ".join(erros))
         return self
+
+    def _erros_dos_parametros(self) -> list[str]:
+        """Os parâmetros de A1, B1 e D3 existem e nenhum dá mais pontos que o máximo do item."""
+        erros = []
+        a1, b1, d3 = self.itens.get("A1"), self.itens.get("B1"), self.itens.get("D3")
+        if a1 is not None:
+            limites = a1.limites_pct_mes
+            if limites is None or a1.taxa_diaria is None:
+                erros.append("A1 precisa de limites_pct_mes e taxa_diaria")
+            elif len(limites) != 3 or not limites[0] < limites[1] < limites[2]:
+                erros.append("A1.limites_pct_mes precisa de três valores estritamente crescentes")
+            elif a1.taxa_diaria > a1.max or a1.max <= len(limites):
+                erros.append("A1: taxa_diaria e as faixas de limites_pct_mes têm de caber no máximo")
+        if b1 is not None:
+            if b1.valores is None:
+                erros.append("B1 precisa de valores")
+            elif any(pontos > b1.max for pontos in b1.valores.values()):
+                erros.append("B1: valores acima do máximo")
+        if d3 is not None and d3.meses_limite is None:
+            erros.append("D3 precisa de meses_limite")
+        return erros
 
     def _erros_das_faixas(self) -> list[str]:
         """As faixas cobrem de 0 ao total dos máximos, sem buraco nem sobreposição, com classes conhecidas."""
@@ -175,16 +202,21 @@ def carregar_matriz(caminho: Path | None = None) -> Matriz:
 
 
 def pontos_a1(pct_mes: float | None, taxa_diaria: bool, matriz: Matriz) -> int:
-    """Pontos do A1 pelo retorno prometido em % ao mês: sem retorno (`None` ou <= 0) e sem taxa diária, 0; até cada
-    limite de `limites_pct_mes` (1,2; 3,0; 10,0), 1, 2 e 3; acima do último, o máximo; taxa diária, `taxa_diaria`."""
+    """Pontos do A1 pelo retorno prometido em % ao mês (R-T14-fronteira-a1, com `limites_pct_mes` = [1,2; 3,0; 10,0]):
+    sem retorno (`None` ou <= 0) e sem taxa diária, 0; pct <= 1,2: 1; 1,2 < pct < 3,0: 2; 3,0 <= pct <= 10,0: 3;
+    pct > 10,0: o máximo (4); taxa diária: `taxa_diaria` (4)."""
     a1 = matriz.itens["A1"]
     if taxa_diaria:
         return a1.taxa_diaria
     if pct_mes is None or pct_mes <= 0:
         return 0
-    for pontos, limite in enumerate(a1.limites_pct_mes, start=1):
-        if pct_mes <= limite:
-            return pontos
+    baixo, meio, alto = a1.limites_pct_mes
+    if pct_mes <= baixo:
+        return 1
+    if pct_mes < meio:
+        return 2
+    if pct_mes <= alto:
+        return 3
     return a1.max
 
 
@@ -289,9 +321,13 @@ _CATEGORIAS_DO_ITEM: dict[str, tuple[str, ...]] = {
 }  # fmt: skip
 
 
-def _origem(ex: ExecucaoSalva, item_id: str, pendencia: str, leitura: _Leitura) -> str:
+def _origem(ex: ExecucaoSalva, item_id: str, pendencia: str, leitura: _Leitura, confirmado: bool) -> str:
+    """`regex_confirmada` só com o item `confirmado`: se o Claude não confirmou o candidato, o estado vem do
+    julgamento dele."""
     if leitura.resposta is None:
         return "nenhuma"
+    if not confirmado:
+        return "claude"
     candidatos = (ex.pendencias.get(pendencia) or {}).get("candidatos") or []
     categorias = _CATEGORIAS_DO_ITEM[item_id]
     if any(isinstance(c, dict) and c.get("categoria") in categorias for c in candidatos):
@@ -337,16 +373,20 @@ _PELA_PENDENCIA = {
 def _item_da_pendencia(ex: ExecucaoSalva, item_id: str, matriz: Matriz) -> Item:
     fonte = _PELA_PENDENCIA[item_id]
     leitura = _ler_pendencia(ex, fonte.no, fonte.pendencia, fonte.modelo)
-    comum = {
-        "id": item_id,
-        "maximo": matriz.itens[item_id].max,
-        "origem": _origem(ex, item_id, fonte.pendencia, leitura),
-        "evidencias": leitura.resposta.evidencias if leitura.resposta is not None else [],
-    }
     if leitura.valor is None:
-        return Item(**comum, estado=leitura.estado, pontos=0, nota=leitura.nota)
-    pontos = fonte.pontos(leitura.valor, matriz)
-    return Item(**comum, estado="confirmado" if pontos > 0 else "nao_se_aplica", pontos=pontos)
+        estado, pontos = leitura.estado, 0
+    else:
+        pontos = fonte.pontos(leitura.valor, matriz)
+        estado = "confirmado" if pontos > 0 else "nao_se_aplica"
+    return Item(
+        id=item_id,
+        estado=estado,
+        pontos=pontos,
+        maximo=matriz.itens[item_id].max,
+        origem=_origem(ex, item_id, fonte.pendencia, leitura, confirmado=estado == "confirmado"),
+        evidencias=leitura.resposta.evidencias if leitura.resposta is not None else [],
+        nota=leitura.nota,
+    )
 
 
 def _oferta(a1: Item, a3: Item) -> bool | None:
@@ -359,13 +399,15 @@ def _oferta(a1: Item, a3: Item) -> bool | None:
 
 
 def _item_c1(ex: ExecucaoSalva, matriz: Matriz, oferta: bool | None) -> Item:
-    """Oferta de investimento sem registro na CVM nem no BCB. Registro sustentado só por dado de hoje (o BCB no
-    retroativo) não decide: fica `nao_verificado`."""
+    """Oferta de investimento sem registro na CVM nem no BCB. Sem oferta, o registro não importa. Registro sustentado
+    só por dado de hoje (o BCB no retroativo) não decide: fica `nao_verificado`."""
     maximo = matriz.itens["C1"].max
 
     def item(estado: EstadoItem, nota: str, pontos: int = 0, origem: str = "coletor") -> Item:
         return Item(id="C1", estado=estado, pontos=pontos, maximo=maximo, origem=origem, nota=nota)
 
+    if oferta is False:
+        return item("nao_se_aplica", "sem oferta de investimento (A1 e A3 sem pontos)")
     saida = _feito(ex, "registros")
     if saida is None:
         return item("nao_verificado", _sem_resultado(ex, "registros"), origem="nenhuma")
@@ -377,16 +419,18 @@ def _item_c1(ex: ExecucaoSalva, matriz: Matriz, oferta: bool | None) -> Item:
         validas = [f for f in sustentam if f not in vazados]
         if sustentam and not validas:
             nota = f"registro só em dado de hoje ({', '.join(sustentam)}: vazamento temporal)"
+            if set(sustentam) & _FONTES_BCB:
+                nota += _NOTA_BCB_DE_HOJE
             return item("nao_verificado", nota, origem="nenhuma")
         return item("nao_se_aplica", f"registrado ({', '.join(validas) or 'registros'})")
     if oferta is None:
         nota = "sem registro, mas a oferta de investimento não foi verificada (A1/A3)"
         return item("nao_verificado", nota, origem="nenhuma")
-    if not oferta:
-        return item("nao_se_aplica", "sem oferta de investimento (A1 e A3 sem pontos)")
     nota = "oferta de investimento sem registro na CVM nem no BCB"
     if saida.get("motivo"):
         nota += f" ({saida['motivo']}: só o domínio foi consultado)"
+    if vazados & _FONTES_BCB:
+        nota += _NOTA_BCB_DE_HOJE  # a ausência no BCB é a de hoje: o Olinda não tem datas
     return item("confirmado", nota, pontos=maximo)
 
 
@@ -443,7 +487,7 @@ def _c3_pelo_cnae(ex: ExecucaoSalva, oferta: bool | None) -> _Parte:
     if "cnae" in _vazados(saida):
         return _Parte(None, "CNAE de hoje, não o do as_of (vazamento temporal)")
     cnae = saida.get("cnae")
-    if not isinstance(cnae, int) or isinstance(cnae, bool):
+    if not isinstance(cnae, int) or isinstance(cnae, bool) or not 0 < cnae <= _MAIOR_CNAE:
         return _Parte(None, "CNAE desconhecido")
     codigo = f"{cnae:07d}"  # o int perde o zero à esquerda do código de 7 dígitos
     if codigo[:2] in _SECAO_K:
@@ -460,14 +504,17 @@ def _item_c3(ex: ExecucaoSalva, matriz: Matriz, oferta: bool | None) -> Item:
     automaticas = (_c3_sem_cnpj(ex), _c3_pelo_cnae(ex, oferta))
     partes = (pela_pc, *automaticas)
     maximo = matriz.itens["C3"].max
-    origem_pc = _origem(ex, "C3", "P-C", leitura)
     evidencias_pc = leitura.resposta.evidencias if leitura.resposta is not None else []
     if disparadas := [p for p in partes if p.dispara]:
+        if any(p.dispara for p in automaticas):
+            origem = "coletor"
+        else:
+            origem = _origem(ex, "C3", "P-C", leitura, confirmado=True)
         return Item(
-            id="C3", estado="confirmado", pontos=maximo, maximo=maximo,
-            origem="coletor" if any(p.dispara for p in automaticas) else origem_pc,
+            id="C3", estado="confirmado", pontos=maximo, maximo=maximo, origem=origem,
             evidencias=evidencias_pc if pela_pc.dispara else [], nota="; ".join(p.nota for p in disparadas),
         )  # fmt: skip
+    origem_pc = _origem(ex, "C3", "P-C", leitura, confirmado=False)
     if abertas := [p for p in partes if p.dispara is None]:
         estado = "nao_verificado" if any(p.estado == "nao_verificado" for p in abertas) else "inconclusivo"
         return Item(
@@ -599,11 +646,13 @@ def _situacao(condicao: Condicao, item: Item) -> bool | None:
     return comparar(item.pontos if item.estado == "confirmado" else 0, condicao.valor)
 
 
-def pontuar_eixo1(itens: dict[str, Item], matriz: Matriz, sinais: Iterable[Sinal] = ()) -> Eixo1:
+def pontuar_eixo1(itens: dict[str, Item], matriz: Matriz, *, sinais: Iterable[Sinal]) -> Eixo1:
     """Intervalo, classe e regras de corte (spec 8.2).
 
-    A classe parte da faixa do mínimo, sobe para a de cada regra `classe_minima` disparada e vira a de uma regra
-    `classe_fixa` cujo sinal está em `sinais`. `pode_chegar_a` é a classe da faixa do máximo, quando é mais alta.
+    `sinais` são os de `sinais_da_execucao` e são obrigatórios (sem eles a R3 sumiria em silêncio); `[]` só quando
+    não há sinal mesmo. A classe parte da faixa do mínimo, sobe para a de cada regra `classe_minima` disparada e
+    vira a de uma regra `classe_fixa` cujo sinal está em `sinais`. `pode_chegar_a` é a classe da faixa do máximo,
+    quando é mais alta.
     Uma regra fica pendente ("R1 dispara se C1 se confirmar") quando só falta um item, em aberto, e as outras
     condições já valem.
     """
@@ -660,8 +709,10 @@ class Eixo2(BaseModel):
 
 def _da_pe(ex: ExecucaoSalva, matriz: Matriz) -> tuple[list[Sinal], list[ModificadorAplicado]]:
     """Sinais e modificadores da P-E respondida com `confirmado`/`corrigido`. O tipo de fonte do sinal é o da
-    evidência que ele cita. Tipo ou modificador que a matriz não conhece (execução antiga pontuada com a matriz
-    atual) fica de fora, como o que cita evidência inexistente."""
+    evidência que ele cita. Ficam de fora:
+    - o sinal datado depois do `as_of`: é fato posterior, vazamento temporal (sem data, não dá para dizer que é);
+    - o tipo ou modificador que a matriz não conhece (execução antiga pontuada com a matriz atual);
+    - o que cita evidência inexistente."""
     leitura = _ler_pendencia(ex, "pend_e", "P-E", ValorE)
     if leitura.valor is None:
         return [], []
@@ -670,6 +721,8 @@ def _da_pe(ex: ExecucaoSalva, matriz: Matriz) -> tuple[list[Sinal], list[Modific
     sinais = []
     for s in leitura.valor.sinais:
         if s.evidencia >= len(evidencias) or (s.tipo not in matriz.estagios and s.tipo not in de_regra):
+            continue
+        if s.data is not None and s.data > ex.ctx.as_of:
             continue
         evidencia = evidencias[s.evidencia]
         sinais.append(
@@ -691,11 +744,20 @@ def _da_pe(ex: ExecucaoSalva, matriz: Matriz) -> tuple[list[Sinal], list[Modific
     return sinais, modificadores
 
 
-def _captura_falhou(ex: ExecucaoSalva) -> bool:
-    """A captura caiu em erro ao acessar o site ("captura falhou: ..."). Bloqueio anti-bot termina `feito` e não é
-    falha; erro do código ("erro inesperado: ...") não diz nada do site."""
+def _site_nao_respondeu(ex: ExecucaoSalva) -> bool:
+    """A captura caiu em erro porque o site não está no ar (R-T14-e6). O nó levanta "captura falhou: <motivo>":
+    - falha de navegação sem resposta HTTP (DNS, conexão recusada, timeout) conta;
+    - "HTTP <código>" na página inicial conta só com 5xx (inclusive os 52x da Cloudflare), 404 e 410. 401, 403, 407,
+      429, 451 e os outros 4xx são o site recusando o visitante (WAF, bloqueio geográfico), não o site fora do ar.
+    Desafio anti-bot termina `feito` (`bloqueada=True`) e não é falha; erro do código ("erro inesperado: ...") não
+    diz nada do site."""
     status, motivo = _status(ex, "captura")
-    return status == "erro" and isinstance(motivo, str) and motivo.startswith("captura falhou")
+    if status != "erro" or not isinstance(motivo, str) or not motivo.startswith(_PREFIXO_FALHA_CAPTURA):
+        return False
+    if (http := _HTTP_DA_CAPTURA.fullmatch(motivo[len(_PREFIXO_FALHA_CAPTURA) :].strip())) is None:
+        return True
+    codigo = int(http.group(1))
+    return 500 <= codigo <= 599 or codigo in _HTTP_SITE_SUMIU
 
 
 def _site_fora_do_ar(ex: ExecucaoSalva, matriz: Matriz, anterior: ExecucaoSalva | None) -> Sinal | None:
@@ -704,25 +766,28 @@ def _site_fora_do_ar(ex: ExecucaoSalva, matriz: Matriz, anterior: ExecucaoSalva 
         return None
     dns = _feito(ex, "dns")
     nxdomain = dns is not None and "nxdomain" not in _vazados(dns) and dns.get("nxdomain") is True
-    duas_falhas = anterior is not None and _captura_falhou(ex) and _captura_falhou(anterior)
+    duas_falhas = anterior is not None and _site_nao_respondeu(ex) and _site_nao_respondeu(anterior)
     if not (nxdomain or duas_falhas):
         return None
     return Sinal(tipo=TIPO_FORA_DO_AR, estagio=estagio, data=ex.ctx.as_of, tipo_fonte=_FONTE_COLETOR)
 
 
 def _registro_recente(ex: ExecucaoSalva) -> Sinal | None:
-    """E0: domínio registrado menos de 90 dias antes do `as_of` e, se há empresa com data de abertura conhecida,
-    CNPJ aberto também há menos de 90 dias."""
+    """E0: só com datas conhecidas. O domínio foi registrado menos de 90 dias antes do `as_of` e o nó `cnpj` terminou
+    `feito`: sem empresa identificada, basta o domínio; com ela, a abertura também precisa ser conhecida e de menos de
+    90 dias. `cnpj` em erro, bloqueado ou aguardando, ou empresa sem abertura conhecida: o CNPJ pode ser antigo."""
     as_of = ex.ctx.as_of
-    rdap = _feito(ex, "rdap")
-    registro = _data_no_as_of(rdap, "registro", as_of) if rdap is not None else None
-    if registro is None or (as_of - registro).days >= _DIAS_E0:
+
+    def recente(saida: dict | None, campo: str) -> date | None:
+        data = _data_no_as_of(saida, campo, as_of) if saida is not None else None
+        return data if data is not None and (as_of - data).days < _DIAS_E0 else None
+
+    if (registro := recente(_feito(ex, "rdap"), "registro")) is None:
         return None
-    cnpj = _feito(ex, "cnpj")
-    if cnpj is not None and cnpj.get("cnpj") is not None:
-        abertura = _data_no_as_of(cnpj, "abertura", as_of)
-        if abertura is not None and (as_of - abertura).days >= _DIAS_E0:
-            return None
+    if (cnpj := _feito(ex, "cnpj")) is None:
+        return None
+    if cnpj.get("cnpj") is not None and recente(cnpj, "abertura") is None:
+        return None
     return Sinal(tipo=TIPO_E0, estagio=_ESTAGIO_E0, data=registro, tipo_fonte=_FONTE_COLETOR)
 
 
@@ -741,15 +806,18 @@ def _modificadores_dos_itens(itens: dict[str, Item], matriz: Matriz) -> list[Mod
 
 
 def sinais_da_execucao(
-    ex: ExecucaoSalva, matriz: Matriz, anterior: ExecucaoSalva | None = None
+    ex: ExecucaoSalva, matriz: Matriz, anterior: ExecucaoSalva | None
 ) -> tuple[list[Sinal], list[ModificadorAplicado]]:
-    """Os sinais do eixo 2 (os confirmados da P-E, o E6 e, sem nenhum outro, o E0) e os modificadores (os dos itens
-    e os da P-E, sem repetir id). `anterior` é a execução anterior do alvo (`execucao.execucao_anterior`), para o E6
-    por duas falhas de captura."""
+    """Os sinais do eixo 2 (os confirmados da P-E, o E6 e, sem nenhum outro sinal de estágio, o E0) e os
+    modificadores (os dos itens e os da P-E, sem repetir id).
+
+    `anterior` é obrigatório: a execução anterior do alvo (`execucao.execucao_anterior`, carregada), para o E6 por
+    duas falhas de captura, ou `None` explícito quando não há."""
     sinais, da_pe = _da_pe(ex, matriz)
     if (fora := _site_fora_do_ar(ex, matriz, anterior)) is not None:
         sinais.append(fora)
-    if not sinais and (recente := _registro_recente(ex)) is not None:
+    # o prova_aportes_novos (sem estágio) não conta como outro sinal
+    if not any(s.estagio for s in sinais) and (recente := _registro_recente(ex)) is not None:
         sinais.append(recente)
     modificadores: dict[str, ModificadorAplicado] = {}
     for m in (*_modificadores_dos_itens(itens_da_execucao(ex, matriz), matriz), *da_pe):
