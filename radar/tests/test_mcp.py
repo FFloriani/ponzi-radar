@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import itertools
+import time
 import json
 import socket
 from contextlib import AsyncExitStack
@@ -25,7 +27,7 @@ from radar.config import Config
 from radar.custodia import verificar
 from radar.mcp_server import AVISO_NAO_CONFIAVEL, LIMITE_TEXTO, criar_servidor
 from radar.modelos import Aguardando, Candidato, ErroNo, Feito
-from radar.motor import NoBase
+from radar.motor import Motor, NoBase
 from radar.nos.alvo import AlvoNo
 from radar.pendencias.definicoes import CABECALHO_NAO_CONFIAVEL, DEFINICOES, nova_pendencia
 from radar.pontuacao import CLASSES
@@ -45,7 +47,6 @@ TEXTO = "Contato: suporte@exemplo.com.br, atendimento todos os dias."
 _BARRA = chr(92)
 # o domínio com os pontos escapados no JSON (u002e): só casa com a máscara depois de decodificado
 JSON_ESCAPADO = ('{"site": "exemplo' + _BARRA + "u002ecom" + _BARRA + 'u002ebr", "planos": [1, 2]}').encode()
-SLUG_CEGO = "cego-" + hashlib.sha256(ALVO.encode()).hexdigest()[:12]
 COLETA = {"em_andamento": True, "mensagem": "a coleta continua; consulte status(run_id)"}
 GRAVACAO = {"em_andamento": True, "mensagem": "validada; gravação em andamento — confira em status(run_id)"}
 MUDOU = "a pendência mudou durante a validação; consulte ver_pendencia de novo"
@@ -61,10 +62,11 @@ class Coleta(NoBase):
     nome = "coleta"
     entradas = ("alvo",)
 
-    def __init__(self, texto: str = TEXTO, png: bytes = PNG) -> None:
+    def __init__(self, texto: str = TEXTO, png: bytes = PNG, json_: bytes = JSON_ESCAPADO) -> None:
         super().__init__()
         self.texto = texto
         self.png = png
+        self.json = json_
 
     async def executar(self, ctx, entradas, respostas, s):
         guardar = s.custodia.guardar
@@ -73,7 +75,7 @@ class Coleta(NoBase):
             "png": guardar(self.png, "png", tipo="screenshot", origem=ctx.url_inicial),
             "har": guardar(HAR, "har", tipo="har", origem=ctx.url_inicial),
             "txt": guardar(self.texto.encode(), "txt", tipo="texto", origem=ctx.url_inicial),
-            "json": guardar(JSON_ESCAPADO, "json", tipo="dados", origem=ctx.url_inicial),
+            "json": guardar(self.json, "json", tipo="dados", origem=ctx.url_inicial),
         })  # fmt: skip
 
 
@@ -183,8 +185,8 @@ class PendGrande(NoBase):
         return Aguardando([nova_pendencia("P-B", ctx, candidatos, self.nome, s.matriz)])
 
 
-def nos_padrao(*extras: NoBase, texto: str = TEXTO, png: bytes = PNG) -> list[NoBase]:
-    return [AlvoNo(), Coleta(texto, png), Dns(), Pend("pend_a1", "P-A1"), *extras]
+def nos_padrao(*extras: NoBase, texto: str = TEXTO, png: bytes = PNG, json_: bytes = JSON_ESCAPADO) -> list[NoBase]:
+    return [AlvoNo(), Coleta(texto, png, json_), Dns(), Pend("pend_a1", "P-A1"), *extras]
 
 
 # ---------------------------------------------------------------------------- apoio
@@ -223,6 +225,12 @@ async def chamar(srv, nome: str, **argumentos):
 
 async def abertas(srv, run_id: str) -> list[str]:
     return [p["id"] for p in (await chamar(srv, "listar_pendencias", run_id=run_id))["pendencias"]]
+
+
+def slug_cego(tmp_path: Path, alvo: str = ALVO) -> str:
+    """O slug opaco que o servidor deu ao alvo: HMAC com o segredo que ele criou em `casos/`."""
+    segredo = (tmp_path / "casos" / ".segredo_cego").read_bytes()
+    return "cego-" + hmac.new(segredo, alvo.encode(), hashlib.sha256).hexdigest()[:16]
 
 
 def pasta(tmp_path: Path, run_id: str) -> Path:
@@ -676,6 +684,28 @@ def test_truncar_so_o_que_passa_do_limite():
     assert limitado["x"][0].endswith("1 caracteres omitidos]") and limitado["x"][1]["y"] == limitado["x"][0]
 
 
+async def test_json_profundo_nao_amplifica(abrir, tmp_path):
+    # 100 KB com 800 níveis: indentado, cada um dos 50 mil itens levaria 1600 espaços (80 MB)
+    profundo = ("[" * 800 + ",".join(["1"] * 50_000) + "]" * 800).encode()
+    srv = await abrir(nos_padrao(json_=profundo))
+    run_id = await iniciar(srv)
+    inicio = time.perf_counter()
+    texto = (await chamar(srv, "ver_artefato", run_id=run_id, sha256=artefatos(tmp_path, run_id)["json"]))["texto"]
+    assert time.perf_counter() - inicio < 2
+    assert texto.startswith(f"{CABECALHO_NAO_CONFIAVEL}\n[[[") and "1, 1, 1" in texto
+    sufixo = texto[LIMITE_TEXTO:]
+    assert sufixo.startswith("\n[... truncado: ") and sufixo.endswith(" caracteres omitidos]")
+
+
+def test_mascara_aplicada_de_novo_nao_muda_o_texto():
+    # um termo que é a palavra de um marcador ("Alvo") não pode trocar o marcador que já está no texto
+    mascara = {ALVO: "[ALVO]", "Alvo": "[EMPRESA]"}
+    uma = mcp_server._mascarar_texto("Alvo Invest, em exemplo.com.br", mascara)
+    assert uma == "[EMPRESA] Invest, em [ALVO]"
+    assert mcp_server._mascarar_texto(uma, mascara) == uma
+    assert mcp_server._mascarar_em({"x": [uma, "alvo"]}, mascara) == {"x": [uma, "[EMPRESA]"]}
+
+
 # ---------------------------------------------------------------------------- modo cego
 
 
@@ -712,10 +742,11 @@ async def test_modo_cego_mascara_e_sem_imagem(abrir, tmp_path):
 async def test_modo_cego_run_id_opaco(abrir, tmp_path):
     srv = await abrir()
     r = await chamar(srv, "iniciar_analise", alvo=f"https://{ALVO}/", modo_cego=True)
-    assert r["run_id"].startswith(f"{SLUG_CEGO}/") and "exemplo" not in json.dumps(r)
+    assert r["run_id"].startswith(f"{slug_cego(tmp_path)}/") and "exemplo" not in json.dumps(r)
+    assert not r["run_id"].startswith("cego-" + hashlib.sha256(ALVO.encode()).hexdigest()[:16])
     assert (tmp_path / "casos" / r["run_id"] / "estado.json").is_file()
-    assert await chamar(srv, "listar_casos") == {"casos": {SLUG_CEGO: [r["run_id"].split("/")[1]]}}
-    assert await chamar(srv, "comparar_execucoes", alvo=SLUG_CEGO) == {"erro": "indisponível no modo cego"}
+    assert await chamar(srv, "listar_casos") == {"casos": {slug_cego(tmp_path): [r["run_id"].split("/")[1]]}}
+    assert await chamar(srv, "comparar_execucoes", alvo=slug_cego(tmp_path)) == {"erro": "indisponível no modo cego"}
     assert await chamar(srv, "comparar_execucoes", alvo=ALVO) == {"erro": "nenhuma execução deste alvo"}
     # a entrada inválida não é ecoada
     assert await chamar(srv, "iniciar_analise", alvo="exemplo com espaço", modo_cego=True) == {"erro": "alvo inválido"}
@@ -735,7 +766,7 @@ async def test_modo_cego_mascara_toda_saida(abrir, tmp_path, respx_mock, dns_pub
     assert (await chamar(srv, "responder_pendencia", run_id=run_id, id="P-E", resposta=resposta_e))["aceita"] is True
     d = await chamar(srv, "gerar_dossie", run_id=run_id, forcar=True)
     assert d["eixo2"]["sinal"]["evidencia"]["trecho"] == "suporte@[ALVO], atendimento todos"
-    assert "exemplo" not in json.dumps(d, ensure_ascii=False) and SLUG_CEGO in d["caminho"]
+    assert "exemplo" not in json.dumps(d, ensure_ascii=False) and slug_cego(tmp_path) in d["caminho"]
     # a mensagem de erro que repete a URL pedida também passa pela máscara
     respx_mock.get(f"https://noticia.example/{ALVO}").mock(return_value=httpx.Response(403))
     r = await chamar(srv, "arquivar_fonte", run_id=run_id, url=f"https://noticia.example/{ALVO}")
@@ -819,6 +850,15 @@ async def test_modo_cego_corte_que_encolhe_mascara_tudo(abrir, tmp_path):
     run_id = await iniciar(srv, modo_cego=True)
     texto = (await chamar(srv, "ver_artefato", run_id=run_id, sha256=artefatos(tmp_path, run_id)["txt"]))["texto"]
     assert texto.count("[ALVO]") == 5000 and texto.rstrip().endswith("[ALVO]") and "ex" not in texto.lower()[-20:]
+
+
+async def test_dominio_aberto_que_comeca_com_cego(abrir):
+    # só o slug cego exato (cego- e 16 hex) é recusado: um domínio de verdade que começa com "cego-" compara
+    srv = await abrir()
+    for _ in range(2):
+        await chamar(srv, "iniciar_analise", alvo="cego-loja.com.br")
+    r = await chamar(srv, "comparar_execucoes", alvo="cego-loja.com.br")
+    assert r["a"].startswith("cego-loja-com-br/") and "diff" in r
 
 
 # ---------------------------------------------------------------------------- arquivar_fonte
@@ -939,9 +979,98 @@ async def test_recusa_tardia_aparece_no_status_e_no_log(abrir, tmp_path, monkeyp
     liberar.set()
     monkeypatch.setattr(mcp_server, "ESPERA_S", 10)
     st = await chamar(srv, "status", run_id=run_id)
-    assert st["recusas_tardias"] == [{"pendencia": "P-A1", "motivo": MUDOU}]
+    [recusa] = st["recusas_tardias"]
+    assert {k: v for k, v in recusa.items() if k != "em"} == {
+        "pendencia": "P-A1", "motivo": MUDOU, "resposta": {"status": "nao_encontrado", "resumo": "{}"}
+    }  # fmt: skip
+    assert datetime.fromisoformat(recusa["em"]).tzinfo is not None
+    assert ler_json(pasta(tmp_path, run_id) / "recusas_tardias.json") == st["recusas_tardias"]
     assert [j["id"] for j in ler_json(pasta(tmp_path, run_id) / "julgamentos.json")] == ["P-A1#1"]
     assert f"P-A1 recusada depois de em_andamento: {MUDOU}" in caplog.text
+
+
+async def test_recusa_tardia_com_a_chamada_cancelada(abrir, tmp_path, monkeypatch):
+    # o cliente desiste da chamada (timeout dele, notifications/cancelled) enquanto ela espera a gravação: a recusa
+    # que vem depois ainda aparece no status
+    async def antes(resposta, pendencia):
+        await asyncio.sleep(0.1)
+
+    espiar_validar(monkeypatch, antes)
+    liberar = asyncio.Event()
+    srv = await abrir([AlvoNo(), Coleta(), Dns(), Pend("pend_a1", "P-A1", liberar)])
+    run_id = await iniciar(srv)
+    html = artefatos(tmp_path, run_id)["html"]
+    primeira = asyncio.create_task(
+        chamar(srv, "responder_pendencia", run_id=run_id, id="P-A1", resposta=resposta_a1(html))
+    )
+    segunda = asyncio.create_task(chamar(srv, "responder_pendencia", run_id=run_id, id="P-A1", resposta=NAO_ENCONTRADO))
+    await asyncio.sleep(0.3)  # as duas validaram; a segunda espera a gravação dela, atrás da primeira
+    segunda.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await segunda
+    liberar.set()
+    assert (await primeira)["aceita"] is True
+    st = await chamar(srv, "status", run_id=run_id)
+    assert [(r["pendencia"], r["motivo"]) for r in st["recusas_tardias"]] == [("P-A1", MUDOU)]
+
+
+async def test_recusa_tardia_por_falha_interna_fica_gravada(abrir, tmp_path, monkeypatch):
+    liberar = asyncio.Event()
+
+    async def responder_que_falha(self, *args, **kwargs):
+        await liberar.wait()
+        raise OSError("disco cheio")
+
+    srv = await abrir()
+    run_id = await iniciar(srv)
+    html = artefatos(tmp_path, run_id)["html"]
+    monkeypatch.setattr(Motor, "responder", responder_que_falha)
+    monkeypatch.setattr(mcp_server, "ESPERA_S", 0.05)
+    resposta = resposta_a1(html)
+    r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-A1", resposta=resposta)
+    assert r == {"run_id": run_id, **GRAVACAO, "aceita": None, "marcas": []}
+    liberar.set()
+    monkeypatch.setattr(mcp_server, "ESPERA_S", 10)
+    st = await chamar(srv, "status", run_id=run_id)
+    [recusa] = st["recusas_tardias"]
+    assert (recusa["pendencia"], recusa["motivo"]) == ("P-A1", "falha interna: OSError")
+    resumo = json.dumps(resposta["valor"], ensure_ascii=False)[:200]
+    assert recusa["resposta"] == {"status": "confirmado", "resumo": resumo}
+    assert st["pendencias_abertas"] == ["P-A1"]
+    # gravada em disco: outro servidor (outro processo) a mostra
+    outro = await abrir()
+    assert (await chamar(outro, "status", run_id=run_id))["recusas_tardias"] == st["recusas_tardias"]
+
+
+async def test_recusa_tardia_no_modo_cego_mascara_o_resumo(abrir, tmp_path, monkeypatch):
+    async def antes(resposta, pendencia):  # a resposta com o domínio valida por último e é a recusada
+        await asyncio.sleep(0.2 if resposta.status == "confirmado" else 0.1)
+
+    espiar_validar(monkeypatch, antes)
+    liberar = asyncio.Event()
+    srv = await abrir([AlvoNo(), Coleta(), Dns(), Pend("pend_c", "P-C", liberar)])
+    run_id = await iniciar(srv, modo_cego=True)
+    html = artefatos(tmp_path, run_id)["html"]
+    com_dominio = {
+        "status": "confirmado",
+        "valor": {"contrato_atipico": True, "tipo_contrato": f"mútuo assinado com a {ALVO}",
+                  "conta_pf_ou_terceiro": False, "offshore_alegado": False},
+        "evidencias": [{"fonte": html, "trecho": "paga 5% ao mês garantido", "data_fonte": "2026-10-01",
+                        "tipo_fonte": "operador"}],
+    }  # fmt: skip
+    monkeypatch.setattr(mcp_server, "ESPERA_S", 0.5)
+    respostas = await asyncio.gather(
+        chamar(srv, "responder_pendencia", run_id=run_id, id="P-C", resposta=NAO_ENCONTRADO),
+        chamar(srv, "responder_pendencia", run_id=run_id, id="P-C", resposta=com_dominio),
+    )
+    assert [r["aceita"] for r in respostas] == [None, None]
+    liberar.set()
+    monkeypatch.setattr(mcp_server, "ESPERA_S", 10)
+    st = await chamar(srv, "status", run_id=run_id)
+    [recusa] = st["recusas_tardias"]
+    assert "mútuo assinado com a [ALVO]" in recusa["resposta"]["resumo"]
+    assert "exemplo" not in json.dumps(st, ensure_ascii=False)
+    assert "exemplo" not in (pasta(tmp_path, run_id) / "recusas_tardias.json").read_text(encoding="utf-8")
 
 
 async def test_status_drena_o_motor_recarregado(abrir, tmp_path):

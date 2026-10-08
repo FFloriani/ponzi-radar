@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import os
 import re
+import secrets
+import time
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -19,7 +23,13 @@ from radar.rede import Rede
 
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}_\d{6}")
 _PASTA_INDICES = "_indices"
-PREFIXO_CEGO = "cego-"
+# o slug de uma execução cega; o de um domínio aberto sempre tem um "-" a mais (o do sufixo), então nunca casa
+PADRAO_SLUG_CEGO = re.compile(r"cego-[0-9a-f]{16}")
+NOME_DO_SEGREDO = ".segredo_cego"
+_BYTES_DO_SEGREDO = 32
+# outro processo pode ter acabado de criar o segredo e ainda estar escrevendo: até ~1 s de espera
+_LEITURAS_DO_SEGREDO = 20
+_ESPERA_DO_SEGREDO_S = 0.05
 
 
 def criar_contexto(
@@ -33,13 +43,11 @@ def criar_contexto(
     """Normaliza o alvo e cria a pasta `casos_dir/<slug>/<AAAA-MM-DD_HHMMSS>`.
 
     `as_of=None` vale hoje (`agora.date()`). Entrada inválida ou modo desconhecido levantam antes
-    de criar qualquer pasta; dois chamados no mesmo segundo para o mesmo alvo levantam
-    `FileExistsError` na segunda. No modo cego o slug é opaco (`slug_cego`): a pasta e o `run_id`
-    não dizem o alvo, que fica só no contexto.
+    de criar qualquer pasta (e o segredo do modo cego); dois chamados no mesmo segundo para o mesmo
+    alvo levantam `FileExistsError` na segunda. No modo cego o slug é opaco (`slug_cego`, com o
+    segredo de `casos_dir`): a pasta e o `run_id` não dizem o alvo, que fica só no contexto.
     """
     dominio, slug, url_inicial = normalizar_alvo(entrada)
-    if modo_cego:
-        slug = slug_cego(dominio)
     carimbo = agora.strftime("%Y-%m-%d_%H%M%S")
     ctx = Contexto(
         alvo=dominio,
@@ -52,13 +60,46 @@ def criar_contexto(
         run_id=f"{slug}/{carimbo}",
         pasta=Path(casos_dir) / slug / carimbo,
     )
+    if modo_cego:
+        slug = slug_cego(dominio, segredo_cego(casos_dir))
+        pasta = Path(casos_dir) / slug / carimbo
+        ctx = ctx.model_copy(update={"slug": slug, "run_id": f"{slug}/{carimbo}", "pasta": pasta})
     ctx.pasta.mkdir(parents=True, exist_ok=False)
     return ctx
 
 
-def slug_cego(dominio: str) -> str:
-    """`cego-` + os 12 primeiros hex do SHA-256 do domínio registrável: o mesmo alvo dá sempre o mesmo slug."""
-    return PREFIXO_CEGO + hashlib.sha256(dominio.encode("utf-8")).hexdigest()[:12]
+def segredo_cego(casos_dir: Path) -> bytes:
+    """O segredo local do slug cego: os 32 bytes de `casos_dir/.segredo_cego`, criado na primeira vez (com
+    `secrets.token_bytes` e permissão só do dono, onde o sistema permite). `casos/` fica fora do git.
+
+    Um arquivo com outro tamanho levanta `ValueError`: trocar o segredo em silêncio mudaria o slug das execuções
+    cegas do mesmo alvo.
+    """
+    caminho = Path(casos_dir) / NOME_DO_SEGREDO
+    if not caminho.exists():
+        caminho.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            descritor = os.open(caminho, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+        except FileExistsError:
+            pass  # outro processo criou agora: vale o dele
+        else:
+            with os.fdopen(descritor, "wb") as arquivo:
+                arquivo.write(secrets.token_bytes(_BYTES_DO_SEGREDO))
+                arquivo.flush()
+                os.fsync(arquivo.fileno())
+    for tentativa in range(_LEITURAS_DO_SEGREDO):
+        segredo = caminho.read_bytes()
+        if len(segredo) == _BYTES_DO_SEGREDO:
+            return segredo
+        if tentativa < _LEITURAS_DO_SEGREDO - 1:
+            time.sleep(_ESPERA_DO_SEGREDO_S)
+    raise ValueError(f"segredo do modo cego com {len(segredo)} bytes (esperados {_BYTES_DO_SEGREDO}): {caminho}")
+
+
+def slug_cego(dominio: str, segredo: bytes) -> str:
+    """`cego-` + os 16 primeiros hex do HMAC-SHA256 do domínio registrável com o segredo local: o mesmo alvo dá
+    sempre o mesmo slug, e sem o segredo uma lista de domínios não leva do slug ao alvo."""
+    return "cego-" + hmac.new(segredo, dominio.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
 
 
 def criar_servicos(

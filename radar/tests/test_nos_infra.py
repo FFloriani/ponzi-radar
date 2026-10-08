@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import hmac
 import json
+import os
+import re
 import shutil
+import stat
 from datetime import date, datetime
 from pathlib import Path
 
@@ -17,6 +21,7 @@ from radar.arquivos import gravar_json_atomico
 from radar.config import Config, RedeConfig
 from radar.custodia import Custodia, verificar
 from radar.execucao import (
+    PADRAO_SLUG_CEGO,
     ExecucaoSalva,
     carregar_execucao,
     criar_contexto,
@@ -24,6 +29,8 @@ from radar.execucao import (
     em_modo_atual,
     execucao_anterior,
     listar_casos,
+    segredo_cego,
+    slug_cego,
 )
 from radar.indices import Indices
 from radar.modelos import Aguardando, Contexto, ErroNo, Evidencia, Feito, Pendencia, Resposta
@@ -585,9 +592,14 @@ def test_criar_contexto_retroativo_e_modos(tmp_path):
 
 
 def test_criar_contexto_cego_tem_slug_opaco(tmp_path):
-    # R-T16-cego: no modo cego a pasta e o run_id não dizem o alvo; o mesmo alvo dá sempre o mesmo slug
-    opaco = "cego-" + hashlib.sha256(b"exemplo.com.br").hexdigest()[:12]
+    # R-T16-cego e R-T16-hmac: no modo cego a pasta e o run_id não dizem o alvo; o slug é um HMAC com o segredo local
+    # (sem ele, um dicionário de domínios desfaria um hash simples), e o mesmo alvo dá sempre o mesmo slug
     ctx = criar_contexto("https://www.Exemplo.com.br/promo", None, "captura", True, tmp_path, AGORA)
+    segredo = (tmp_path / ".segredo_cego").read_bytes()
+    assert len(segredo) == 32
+    opaco = "cego-" + hmac.new(segredo, b"exemplo.com.br", hashlib.sha256).hexdigest()[:16]
+    assert re.fullmatch(r"cego-[0-9a-f]{16}", opaco) and PADRAO_SLUG_CEGO.fullmatch(opaco)
+    assert not hashlib.sha256(b"exemplo.com.br").hexdigest().startswith(opaco.removeprefix("cego-"))
     assert (ctx.slug, ctx.run_id) == (opaco, f"{opaco}/2026-10-07_120000")
     assert ctx.pasta == tmp_path / opaco / "2026-10-07_120000" and ctx.pasta.is_dir()
     assert ctx.alvo == "exemplo.com.br"  # o contexto guarda o alvo de verdade, para os nós
@@ -599,6 +611,34 @@ def test_criar_contexto_cego_tem_slug_opaco(tmp_path):
         opaco: ["2026-10-07_120000", "2026-10-07_120001"],
         "exemplo-com-br": ["2026-10-07_120000"],
     }
+
+
+def test_segredo_cego(tmp_path):
+    casos = tmp_path / "casos"
+    assert slug_cego("exemplo.com.br", segredo_cego(casos)) == slug_cego("exemplo.com.br", segredo_cego(casos))
+    segredo = (casos / ".segredo_cego").read_bytes()
+    assert segredo_cego(casos) == segredo  # criado uma vez só
+    if os.name != "nt":  # no Windows o modo não restringe a leitura
+        assert stat.S_IMODE((casos / ".segredo_cego").stat().st_mode) & 0o077 == 0
+    # outro segredo (outra máquina, outro casos/): outro slug
+    outro = tmp_path / "outro"
+    assert segredo_cego(outro) != segredo
+    assert slug_cego("exemplo.com.br", segredo_cego(outro)) != slug_cego("exemplo.com.br", segredo)
+    assert slug_cego("exemplo.com.br", segredo) != slug_cego("exemplo.com", segredo)
+    # o segredo com o tamanho errado (arquivo truncado) não vira um segredo novo em silêncio
+    (outro / ".segredo_cego").write_bytes(b"curto")
+    with pytest.raises(ValueError, match="segredo do modo cego"):
+        segredo_cego(outro)
+    # o segredo não é criado nem a pasta, se a entrada é inválida
+    nada = tmp_path / "nada"
+    with pytest.raises(ValidationError):
+        criar_contexto("exemplo.com.br", None, "telepatia", True, nada, AGORA)
+    with pytest.raises(ErroNo):
+        criar_contexto("isso não é url", None, "captura", True, nada, AGORA)
+    assert not nada.exists()
+    # o segredo não é uma execução nem um alvo
+    criar_contexto("exemplo.com.br", None, "captura", True, casos, AGORA)
+    assert list(listar_casos(casos)) == [slug_cego("exemplo.com.br", segredo)]
 
 
 def test_em_modo_atual(tmp_path):
