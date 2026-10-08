@@ -327,6 +327,16 @@ def test_dossie_lista_os_processos_sancionadores_na_secao_5(tmp_path):
     assert "razão social" in linhas[1] and "possível homônimo" not in linhas[1]
 
 
+def test_dossie_mostra_os_parametros_de_indicacao_removidos(tmp_path):
+    alvo = {**saidas_base()["alvo"], "parametros_removidos": ["ref", "utm_source"]}
+    s1 = secao(dossie(gravar(tmp_path, saidas={"alvo": alvo})), 1)
+    assert "- **Parâmetros de indicação removidos da URL:** ref, utm_source" in s1
+
+
+def test_dossie_sem_parametros_removidos_nao_mostra_a_linha(tmp_path):
+    assert "Parâmetros de indicação" not in secao(dossie(gravar(tmp_path)), 1)
+
+
 def test_dossie_sem_processos_nao_mostra_a_lista(tmp_path):
     assert "Processos sancionadores" not in secao(dossie(gravar(tmp_path)), 5)
 

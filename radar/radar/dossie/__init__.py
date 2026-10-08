@@ -171,7 +171,14 @@ def _cabecalho(ex: ExecucaoSalva, matriz: Matriz, pasta: Path) -> dict:
         "matriz_hash": matriz.hash,
         "hash_custodia": hash_custodia,
         "custodia_ilegivel": custodia_ilegivel,
+        "parametros_removidos": _parametros_removidos(ex),
     }
+
+
+def _parametros_removidos(ex: ExecucaoSalva) -> list[str]:
+    """Os parâmetros de indicação tirados da URL dada: da saída do nó `alvo` ou, sem ela, do contexto."""
+    removidos = (saida(ex, "alvo") or {}).get("parametros_removidos", ex.ctx.parametros_removidos)
+    return [str(nome) for nome in removidos] if isinstance(removidos, list) else []
 
 
 def _regra(matriz: Matriz, id_: str) -> str:

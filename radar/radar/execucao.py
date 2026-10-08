@@ -98,12 +98,13 @@ def criar_contexto(
     alvo levantam `FileExistsError` na segunda. No modo cego o slug é opaco (`slug_cego`, com o
     segredo de `casos_dir`): a pasta e o `run_id` não dizem o alvo, que fica só no contexto.
     """
-    dominio, slug, url_inicial = normalizar_alvo(entrada)
+    dominio, slug, url_inicial, removidos = normalizar_alvo(entrada)
     carimbo = agora.strftime("%Y-%m-%d_%H%M%S")
     ctx = Contexto(
         alvo=dominio,
         slug=slug,
         url_inicial=url_inicial,
+        parametros_removidos=removidos,
         as_of=as_of if as_of is not None else agora.date(),
         data_execucao=agora,
         modo_contato=modo_contato,
@@ -307,7 +308,7 @@ def escolher_execucoes(casos_dir: Path, alvo: str, a: str | None, b: str | None)
     """
     casos = listar_casos(casos_dir)
     try:
-        dominio, slug, _ = normalizar_alvo(alvo)
+        dominio, slug = normalizar_alvo(alvo)[:2]
     except ErroNo:
         if alvo not in casos:  # o slug, como `listar_casos` mostra, também vale
             raise ErroComparacao("alvo inválido") from None

@@ -25,6 +25,8 @@ class Contexto(BaseModel):
     modo_cego: bool
     run_id: str
     pasta: Path
+    # os nomes dos parâmetros de indicação e rastreamento tirados da URL dada (`nos.alvo.normalizar_alvo`)
+    parametros_removidos: list[str] = Field(default_factory=list)
 
     @property
     def retroativo(self) -> bool:

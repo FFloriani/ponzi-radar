@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import urlsplit, urlunsplit
+from typing import NamedTuple
+from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
 import tldextract
 
@@ -39,6 +40,34 @@ def dominio_registravel(host: str) -> str:
     return _PSL(host).top_domain_under_public_suffix.lower()
 
 
+# parâmetros de indicação e de rastreamento: a captura não abre o link de afiliado de quem mandou o site (o operador
+# saberia quem indicou o analista)
+_PARAMETROS_DE_INDICACAO = frozenset(
+    {"ref", "indicacao", "indicador", "invite", "convite", "afiliado", "aff", "sponsor", "patrocinador"}
+)
+
+
+class AlvoNormalizado(NamedTuple):
+    dominio: str
+    slug: str
+    url_inicial: str
+    parametros_removidos: list[str]
+
+
+def _sem_parametros_de_indicacao(query: str) -> tuple[str, list[str]]:
+    """A query sem os parâmetros de indicação e `utm_*` (sem diferenciar maiúsculas), no resto como veio, e os nomes
+    tirados, na ordem."""
+    mantidos: list[str] = []
+    removidos: list[str] = []
+    for parte in query.split("&") if query else []:
+        nome = unquote_plus(parte.partition("=")[0])
+        if nome.lower() in _PARAMETROS_DE_INDICACAO or nome.lower().startswith("utm_"):
+            removidos.append(nome)
+        else:
+            mantidos.append(parte)
+    return "&".join(mantidos), removidos
+
+
 def e_plataforma(dominio: str) -> bool:
     """`dominio` (registrável) é de uma plataforma de conteúdo de `PLATAFORMAS`."""
     return dominio.strip().lower().rstrip(".") in PLATAFORMAS
@@ -48,12 +77,13 @@ def _invalido(entrada: str, motivo: str) -> ErroNo:
     return ErroNo(f"alvo inválido ({motivo}): {entrada!r}", permanente=True)
 
 
-def normalizar_alvo(entrada: str) -> tuple[str, str, str]:
-    """Devolve `(dominio, slug, url_inicial)`.
+def normalizar_alvo(entrada: str) -> AlvoNormalizado:
+    """Devolve `(dominio, slug, url_inicial, parametros_removidos)`.
 
     `dominio` é o registrável (`app.Exemplo.com.br.` → `exemplo.com.br`; IDN em punycode), `slug`
-    troca os pontos por hífen e `url_inicial` é a URL dada, com `https://` se faltar o esquema e
-    sem fragmento. Entrada que não é URL http(s) de um domínio registrável → `ErroNo` permanente; perfil numa
+    troca os pontos por hífen e `url_inicial` é a URL dada, com `https://` se faltar o esquema,
+    sem fragmento e sem os parâmetros de indicação e rastreamento (`ref`, `indicacao`, `convite`, `utm_*`...), cujos
+    nomes vão em `parametros_removidos`. Entrada que não é URL http(s) de um domínio registrável → `ErroNo` permanente; perfil numa
     plataforma de conteúdo (`PLATAFORMAS`) também, com a mensagem que manda analisar o site próprio do esquema.
     """
     bruta = entrada.strip()
@@ -82,16 +112,25 @@ def normalizar_alvo(entrada: str) -> tuple[str, str, str]:
         raise _invalido(entrada, "sem domínio registrável")
     if e_plataforma(dominio):
         raise ErroNo(f"alvo é uma plataforma ({dominio}); analise o site próprio do esquema", permanente=True)
-    return dominio, dominio.replace(".", "-"), urlunsplit(partes._replace(fragment=""))
+    query, removidos = _sem_parametros_de_indicacao(partes.query)
+    url_inicial = urlunsplit(partes._replace(query=query, fragment=""))
+    return AlvoNormalizado(dominio, dominio.replace(".", "-"), url_inicial, removidos)
 
 
 class AlvoNo(NoBase):
     """Repassa ao DAG o alvo já normalizado por `criar_contexto`."""
 
     nome = "alvo"
-    saidas = ("dominio", "slug", "url_inicial")
+    saidas = ("dominio", "slug", "url_inicial", "parametros_removidos")
 
     async def executar(
         self, ctx: Contexto, entradas: dict[str, dict], respostas: dict, s: Servicos
     ) -> Feito:
-        return Feito({"dominio": ctx.alvo, "slug": ctx.slug, "url_inicial": ctx.url_inicial})
+        return Feito(
+            {
+                "dominio": ctx.alvo,
+                "slug": ctx.slug,
+                "url_inicial": ctx.url_inicial,
+                "parametros_removidos": list(ctx.parametros_removidos),
+            }
+        )

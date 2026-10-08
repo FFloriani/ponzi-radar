@@ -144,7 +144,7 @@ def test_normalizar_alvo(entrada, dominio, slug):
 @pytest.mark.parametrize(
     "entrada,url_inicial",
     [
-        ("https://www.Exemplo.com.br/promo?ref=1#x", "https://www.Exemplo.com.br/promo?ref=1"),
+        ("https://www.Exemplo.com.br/promo?ref=1#x", "https://www.Exemplo.com.br/promo"),  # sem a indicação
         ("app.exemplo.com.br", "https://app.exemplo.com.br"),
         ("exemplo.com.br/a/b?c=1#topo", "https://exemplo.com.br/a/b?c=1"),
         ("http://xn--investimento-fcil-lsb.com/", "http://xn--investimento-fcil-lsb.com/"),
@@ -152,6 +152,36 @@ def test_normalizar_alvo(entrada, dominio, slug):
 )
 def test_normalizar_alvo_url_inicial(entrada, url_inicial):
     assert normalizar_alvo(entrada)[2] == url_inicial
+
+
+@pytest.mark.parametrize(
+    ("entrada", "url_inicial", "removidos"),
+    [
+        (
+            "https://golpe.com.br/cadastro?ref=JOAO123&plano=2&utm_source=zap&UTM_Campaign=x&Invite=abc#topo",
+            "https://golpe.com.br/cadastro?plano=2",
+            ["ref", "utm_source", "UTM_Campaign", "Invite"],
+        ),
+        (
+            "golpe.com.br/?indicacao=1&indicador=2&convite=3&afiliado=4&aff=5&sponsor=6&patrocinador=7",
+            "https://golpe.com.br/",
+            ["indicacao", "indicador", "convite", "afiliado", "aff", "sponsor", "patrocinador"],
+        ),
+        ("https://golpe.com.br/planos?id=7&referencia=x", "https://golpe.com.br/planos?id=7&referencia=x", []),
+        ("https://golpe.com.br/", "https://golpe.com.br/", []),
+    ],
+)
+def test_normalizar_alvo_tira_os_parametros_de_indicacao(entrada, url_inicial, removidos):
+    # a captura não abre o link de afiliado de quem mandou o site: isso exporia o informante ao operador
+    alvo = normalizar_alvo(entrada)
+    assert (alvo.url_inicial, alvo.parametros_removidos) == (url_inicial, removidos)
+
+
+async def test_no_alvo_registra_os_parametros_removidos(tmp_path, serv):
+    ctx = criar_contexto("https://golpe.com.br/?ref=JOAO&utm_medium=zap&x=1", None, "captura", False, tmp_path, AGORA)
+    assert (ctx.url_inicial, ctx.parametros_removidos) == ("https://golpe.com.br/?x=1", ["ref", "utm_medium"])
+    r = await AlvoNo().executar(ctx, {}, {}, serv)
+    assert r.saidas["parametros_removidos"] == ["ref", "utm_medium"]
 
 
 def test_normalizar_alvo_invalido():
@@ -252,11 +282,12 @@ def test_normalizar_alvo_invalido_e_permanente_com_mensagem(entrada):
 async def test_no_alvo_repassa_dominio_slug_e_url(ctx_hoje, serv):
     resultado = await AlvoNo().executar(ctx_hoje, {}, {}, serv)
     assert resultado == Feito(
-        {"dominio": "petrobras.com.br", "slug": "petrobras-com-br", "url_inicial": "https://petrobras.com.br/"}
-    )
+        {"dominio": "petrobras.com.br", "slug": "petrobras-com-br", "url_inicial": "https://petrobras.com.br/",
+         "parametros_removidos": []}
+    )  # fmt: skip
     no = AlvoNo()
     assert (no.nome, no.entradas, no.toca_alvo) == ("alvo", (), False)
-    assert set(no.saidas) == {"dominio", "slug", "url_inicial"}
+    assert set(no.saidas) == {"dominio", "slug", "url_inicial", "parametros_removidos"}
 
 
 # ---------------------------------------------------------------------------- rdap
@@ -871,7 +902,7 @@ async def test_carregar_execucao_le_o_que_o_motor_grava(tmp_path):
         assert aguardando.ctx == ctx
         assert aguardando.status["alvo"] == {"status": "feito", "motivo": None}
         assert aguardando.status["pergunta"]["status"] == "aguardando"
-        assert aguardando.saidas == {"alvo": {"dominio": "exemplo.com.br", "slug": "exemplo-com-br", "url_inicial": "https://exemplo.com.br"}}
+        assert aguardando.saidas == {"alvo": {"dominio": "exemplo.com.br", "slug": "exemplo-com-br", "url_inicial": "https://exemplo.com.br", "parametros_removidos": []}}
         assert aguardando.pendencias["P-X"]["aberta"] is True
         assert aguardando.pendencias["P-X"]["no_origem"] == "pergunta"
         assert aguardando.julgamentos == []

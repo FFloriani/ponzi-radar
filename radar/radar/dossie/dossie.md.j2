@@ -4,6 +4,9 @@
 ## 1. Identificação
 
 - **Alvo:** {{ cab.alvo|md }} ({{ cab.url_inicial|cod }})
+{% if cab.parametros_removidos %}
+- **Parâmetros de indicação removidos da URL:** {{ cab.parametros_removidos|join(", ")|md }}
+{% endif %}
 - **Execução:** {{ cab.data_execucao }} ({{ cab.run_id|cod }})
 - **as_of:** {{ cab.as_of }}{{ " (execução retroativa: o que o site e as fontes mostravam nessa data)" if cab.retroativo else "" }}
 - **Modo de contato:** {{ cab.modo_contato }}
