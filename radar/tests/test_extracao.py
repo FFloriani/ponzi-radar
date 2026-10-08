@@ -1222,8 +1222,8 @@ def test_atributos_do_no():
 
 def test_no_esta_no_nucleo_depois_do_wayback_snapshot():
     nomes = [n.nome for n in nos_do_nucleo()]
-    assert nomes[-2:] == ["wayback_snapshot", "extracao"]
-    assert isinstance(nos_do_nucleo()[-1], ExtracaoNo)
+    assert nomes[-3:-1] == ["wayback_snapshot", "extracao"]  # o `cnpj` (T10) vem logo depois
+    assert isinstance(nos_do_nucleo()[-2], ExtracaoNo)
 
 
 async def test_no_usa_a_captura(ctx, serv):

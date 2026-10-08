@@ -28,6 +28,7 @@ from radar.motor import Motor, NoBase, Servicos
 from radar.nos import nos_do_nucleo
 from radar.nos.alvo import AlvoNo, normalizar_alvo
 from radar.nos.captura import CapturaNo
+from radar.nos.cnpj import CnpjNo
 from radar.nos.ct import CtNo
 from radar.nos.dns import DnsNo
 from radar.nos.extracao import ExtracaoNo
@@ -41,6 +42,7 @@ URL_DOH = "https://cloudflare-dns.com/dns-query"
 URL_CRTSH = "https://crt.sh/"
 URL_CDX = "https://web.archive.org/cdx/search/cdx"
 URL_SNAPSHOTS = "https://web.archive.org/web/"
+URL_BRASILAPI_PETROBRAS = "https://brasilapi.com.br/api/cnpj/v1/33000167000101"
 AGORA = datetime(2026, 10, 7, 12, 0, 0)
 
 
@@ -732,10 +734,10 @@ async def test_carregar_execucao_aponta_para_a_pasta_atual(tmp_path):
 def test_nos_do_nucleo():
     nos = nos_do_nucleo()
     assert [type(n) for n in nos] == [
-        AlvoNo, RdapNo, DnsNo, CtNo, WaybackIndiceNo, CapturaNo, WaybackSnapshotNo, ExtracaoNo
+        AlvoNo, RdapNo, DnsNo, CtNo, WaybackIndiceNo, CapturaNo, WaybackSnapshotNo, ExtracaoNo, CnpjNo
     ]
     assert [n.nome for n in nos] == [
-        "alvo", "rdap", "dns", "ct", "wayback_indice", "captura", "wayback_snapshot", "extracao"
+        "alvo", "rdap", "dns", "ct", "wayback_indice", "captura", "wayback_snapshot", "extracao", "cnpj"
     ]
     assert nos is not nos_do_nucleo()  # lista nova a cada chamada
 
@@ -757,8 +759,16 @@ def _mocar_wayback(respx_mock, html: bytes | None = None) -> None:
     )
 
 
-def _mocar_apis(respx_mock, *, com_dns: bool, html: bytes | None = None) -> None:
+def _mocar_cnpj(respx_mock) -> None:
+    respx_mock.get(URL_BRASILAPI_PETROBRAS).mock(
+        return_value=httpx.Response(200, json=fixture("brasilapi_33000167000101"))
+    )
+
+
+def _mocar_apis(respx_mock, *, com_dns: bool, html: bytes | None = None, com_cnpj: bool = True) -> None:
     _mocar_wayback(respx_mock, html)
+    if com_cnpj:  # o respx falha a rota que ninguém chamou: sem titular nem CNPJ na página, o nó não consulta
+        _mocar_cnpj(respx_mock)
     respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(200, json=fixture("rdap_registrobr_petrobras")))
     respx_mock.get(URL_CRTSH, params={"q": "petrobras.com.br", "output": "json"}).mock(
         return_value=httpx.Response(200, json=fixture("crtsh"))
@@ -794,7 +804,7 @@ async def test_nucleo_ponta_a_ponta_em_modo_atual(respx_mock, tmp_path):
     ctx, motor = await _rodar_nucleo(tmp_path, None)
     assert motor.status() == {
         "alvo": "feito", "rdap": "feito", "dns": "feito", "ct": "feito", "wayback_indice": "feito",
-        "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito",
+        "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito", "cnpj": "feito",
     }
 
     ex = carregar_execucao(ctx.pasta)
@@ -809,8 +819,12 @@ async def test_nucleo_ponta_a_ponta_em_modo_atual(respx_mock, tmp_path):
     assert ex.saidas["wayback_indice"]["total"] == 22
     # a página do Wayback (example.com) não promete nada: sem candidatos, mas com a fonte
     assert ex.saidas["extracao"] == {"candidatos": [], "fonte": "wayback_snapshot", "truncado": {}}
-    # 1 RDAP + 5 DoH + 1 crt.sh + 2 CDX do Wayback (domínio e home) + snapshot da home (HTML e texto)
-    assert len(log_custodia(ctx.pasta)) == 12
+    # sem CNPJ na página, o titular do RDAP é o único candidato e dispensa a P-CNPJ
+    assert (ex.saidas["cnpj"]["cnpj"], ex.saidas["cnpj"]["fonte"]) == ("33000167000101", "brasilapi")
+    assert ex.saidas["cnpj"]["razao_social"] == "PETROLEO BRASILEIRO S A PETROBRAS"
+    assert motor.pendencias_abertas() == []
+    # 1 RDAP + 5 DoH + 1 crt.sh + 2 CDX do Wayback (domínio e home) + snapshot da home (HTML e texto) + 1 BrasilAPI
+    assert len(log_custodia(ctx.pasta)) == 13
     assert verificar(ctx.pasta) == []
 
 
@@ -828,6 +842,7 @@ async def test_nucleo_extrai_os_candidatos_do_texto_do_snapshot(respx_mock, tmp_
     _mocar_apis(respx_mock, com_dns=True, html=HTML_COM_PROMESSA)
     ctx, motor = await _rodar_nucleo(tmp_path, None)
     assert motor.status()["extracao"] == "feito"
+    assert motor.status()["cnpj"] == "feito"  # o CNPJ da página e o titular do RDAP são o mesmo: nada a perguntar
 
     ex = carregar_execucao(ctx.pasta)
     extracao = ex.saidas["extracao"]
@@ -862,12 +877,14 @@ async def test_nucleo_extrai_os_candidatos_do_texto_do_snapshot(respx_mock, tmp_
 
 
 async def test_nucleo_retroativo_pula_dns_e_esconde_o_titular(respx_mock, tmp_path):
-    _mocar_apis(respx_mock, com_dns=False)
+    _mocar_apis(respx_mock, com_dns=False, com_cnpj=False)
     ctx, motor = await _rodar_nucleo(tmp_path, date(2019, 6, 6))
+    # sem titular (o RDAP não o entrega no modo retroativo) e sem CNPJ na página: abre a P-CNPJ
     assert motor.status() == {
         "alvo": "feito", "rdap": "feito", "dns": "pulado", "ct": "feito", "wayback_indice": "feito",
-        "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito",
+        "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito", "cnpj": "aguardando",
     }
+    assert [(p.id, p.no_origem, p.candidatos) for p in motor.pendencias_abertas()] == [("P-CNPJ", "cnpj", [])]
 
     ex = carregar_execucao(ctx.pasta)
     assert ex.status["dns"] == {"status": "pulado", "motivo": "só atual"}
@@ -883,11 +900,12 @@ async def test_nucleo_dns_servfail_deixa_o_no_em_erro_e_sem_saidas(respx_mock, t
     respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(200, json=fixture("rdap_registrobr_petrobras")))
     respx_mock.get(URL_CRTSH).mock(return_value=httpx.Response(200, json=fixture("crtsh")))
     _mocar_wayback(respx_mock)
+    _mocar_cnpj(respx_mock)
     _rota_doh(respx_mock, dict.fromkeys(("A", "AAAA", "MX", "NS", "TXT"), _doh(2, 1)))
     ctx, motor = await _rodar_nucleo(tmp_path, None)
     assert motor.status() == {
         "alvo": "feito", "rdap": "feito", "dns": "erro", "ct": "feito", "wayback_indice": "feito",
-        "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito",
+        "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito", "cnpj": "feito",
     }
     ex = carregar_execucao(ctx.pasta)
     assert "Status 2 (SERVFAIL)" in ex.status["dns"]["motivo"]
@@ -900,9 +918,10 @@ async def test_nucleo_rdap_em_erro_nao_derruba_dns_e_ct(respx_mock, tmp_path):
     _mocar_wayback(respx_mock)
     _rota_doh(respx_mock, dict.fromkeys(("A", "AAAA", "MX", "NS", "TXT"), fixture("doh_nxdomain")))
     ctx, motor = await _rodar_nucleo(tmp_path, None)
+    # o `rdap` é opcional do `cnpj`: sem ele e sem CNPJ na página, o nó abre a P-CNPJ em vez de cair em erro
     assert motor.status() == {
         "alvo": "feito", "rdap": "erro", "dns": "feito", "ct": "feito", "wayback_indice": "feito",
-        "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito",
+        "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito", "cnpj": "aguardando",
     }
     ex = carregar_execucao(ctx.pasta)
     assert "404" in ex.status["rdap"]["motivo"]

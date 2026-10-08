@@ -1,0 +1,78 @@
+{
+  "cnpj": "33000167000101",
+  "razao_social": "PETROLEO BRASILEIRO S A PETROBRAS",
+  "nome_fantasia": "PETROBRAS - EDISE",
+  "data_inicio_atividade": "1966-09-28",
+  "cnae_fiscal": 600001,
+  "cnae_fiscal_descricao": "Extração de petróleo e gás natural",
+  "capital_social": 205431960000,
+  "situacao_cadastral": 2,
+  "descricao_situacao_cadastral": "ATIVA",
+  "data_situacao_cadastral": "2005-11-03",
+  "natureza_juridica": "Sociedade de Economia Mista",
+  "porte": "DEMAIS",
+  "identificador_matriz_filial": 1,
+  "descricao_identificador_matriz_filial": "MATRIZ",
+  "uf": "RJ",
+  "municipio": "RIO DE JANEIRO",
+  "cnaes_secundarios": [
+    {
+      "codigo": 1921700,
+      "descricao": "Fabricação de produtos do refino de petróleo"
+    },
+    {
+      "codigo": 3520401,
+      "descricao": "Produção de gás; processamento de gás natural"
+    }
+  ],
+  "qsa": [
+    {
+      "pais": null,
+      "nome_socio": "MAGDA MARIA DE REGINA CHAMBRIARD",
+      "codigo_pais": null,
+      "faixa_etaria": "Entre 61 a 70 anos",
+      "cnpj_cpf_do_socio": "***612937**",
+      "qualificacao_socio": "Presidente",
+      "codigo_faixa_etaria": 7,
+      "data_entrada_sociedade": "2024-06-07",
+      "identificador_de_socio": 2,
+      "cpf_representante_legal": "***000000**",
+      "nome_representante_legal": "",
+      "codigo_qualificacao_socio": 16,
+      "qualificacao_representante_legal": "Não informada",
+      "codigo_qualificacao_representante_legal": 0
+    },
+    {
+      "pais": null,
+      "nome_socio": "ANGELICA GARCIA COBAS LAUREANO",
+      "codigo_pais": null,
+      "faixa_etaria": "Entre 71 a 80 anos",
+      "cnpj_cpf_do_socio": "***912137**",
+      "qualificacao_socio": "Diretor",
+      "codigo_faixa_etaria": 8,
+      "data_entrada_sociedade": "2025-07-29",
+      "identificador_de_socio": 2,
+      "cpf_representante_legal": "***000000**",
+      "nome_representante_legal": "",
+      "codigo_qualificacao_socio": 10,
+      "qualificacao_representante_legal": "Não informada",
+      "codigo_qualificacao_representante_legal": 0
+    },
+    {
+      "pais": null,
+      "nome_socio": "CLARICE COPPETTI",
+      "codigo_pais": null,
+      "faixa_etaria": "Entre 61 a 70 anos",
+      "cnpj_cpf_do_socio": "***995240**",
+      "qualificacao_socio": "Diretor",
+      "codigo_faixa_etaria": 7,
+      "data_entrada_sociedade": "2023-04-17",
+      "identificador_de_socio": 2,
+      "cpf_representante_legal": "***000000**",
+      "nome_representante_legal": "",
+      "codigo_qualificacao_socio": 10,
+      "qualificacao_representante_legal": "Não informada",
+      "codigo_qualificacao_representante_legal": 0
+    }
+  ]
+}
