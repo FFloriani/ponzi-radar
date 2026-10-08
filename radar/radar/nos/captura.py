@@ -10,6 +10,14 @@ Opsec do analista (I5 da revisão final): o WebRTC só usa UDP pelo proxy (`ARGS
 coerente com o `sec-ch-ua` (o `ua_navegador` da config é o da `Rede`). Nada esconde a automação: não contornamos
 anti-bot. O site também não alcança endereços locais do analista (localhost, IP literal que não é global), a não ser
 o próprio host da `url_inicial` (o site de teste local), e as janelas que ele abre sozinho são fechadas sem navegar.
+
+Redirect para endereço local (R4): a rota do contexto só vê o primeiro pedido de cada cadeia de redirect. Por isso a
+navegação (documento) é buscada pela `_Guarda` com `route.fetch(max_redirects=0)`: um 3xx cujo `Location` é endereço
+local é abortado; o resto volta ao navegador com `route.fulfill`, que refaz o salto como pedido novo, de novo pela
+guarda. Os subrecursos seguem pela pilha do Chromium (`continue_`), para o site ver o navegador de sempre; os saltos
+deles para endereço local são barrados pelo bloqueio de URLs do DevTools na aba (`Network.setBlockedURLs`, por faixa
+de endereço). WebSocket passa por `route_web_socket`. E, por garantia, página cuja URL final é endereço local não vai
+para a custódia.
 """
 
 from __future__ import annotations
@@ -23,9 +31,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
-from playwright.async_api import BrowserContext, Page, Request, Route, async_playwright
+from playwright.async_api import BrowserContext, Page, Request, Route, WebSocketRoute, async_playwright
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 
@@ -151,13 +159,54 @@ def _endereco_local(url: str) -> bool:
     return bool(host) and _host_local(host)
 
 
+# As faixas que o bloqueio do DevTools barra nos subrecursos (os saltos de redirect que a rota não vê). O padrão é por
+# prefixo do host: aproxima `_host_local` (um nome como "10.exemplo.com" também cai), e isso só barra a mais.
+_FAIXAS_LOCAIS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("127.0.0.1", ("127.",)),
+    ("localhost", ("localhost/", "localhost:")),
+    ("x.localhost", ("*.localhost/", "*.localhost:")),
+    ("0.0.0.0", ("0.",)),
+    ("10.0.0.1", ("10.",)),
+    ("192.168.0.1", ("192.168.",)),
+    ("169.254.0.1", ("169.254.",)),
+    *((f"172.{n}.0.1", (f"172.{n}.",)) for n in range(16, 32)),
+    *((f"100.{n}.0.1", (f"100.{n}.",)) for n in range(64, 128)),
+    ("::1", ("[::1]",)),
+    ("fd00::1", ("[fc", "[fd")),
+    ("fe80::1", ("[fe80",)),
+)
+# erros do `route.fetch` (Node) e o código de abort que o Chromium mostra no lugar: a classificação da I2 continua
+# vendo `net::ERR_CONNECTION_REFUSED` e afins
+_ERROS_DO_FETCH = (
+    ("ECONNREFUSED", "connectionrefused"), ("ENOTFOUND", "namenotresolved"), ("EAI_AGAIN", "namenotresolved"),
+    ("ECONNRESET", "connectionreset"), ("EHOSTUNREACH", "addressunreachable"), ("ENETUNREACH", "addressunreachable"),
+    ("ECONNABORTED", "connectionaborted"), ("ETIMEDOUT", "timedout"), ("Timeout", "timedout"),
+)  # fmt: skip
+
+
+def _codigo_de_abort(erro: Exception) -> str:
+    texto = str(erro)
+    return next((codigo for marca, codigo in _ERROS_DO_FETCH if marca in texto), "failed")
+
+
+async def _abortar(rota: Route, codigo: str) -> None:
+    with contextlib.suppress(PlaywrightError):  # a aba pode ter fechado no meio
+        await rota.abort(codigo)
+
+
 class _Guarda:
     """O filtro de rede do contexto: nada de endereço local do analista (só o host da `url_inicial`, e o resto do
-    loopback quando ela mesma é local: o site de teste) e nada de requisição de janela que o site abriu sozinho."""
+    loopback quando ela mesma é local: o site de teste), nem direto nem por redirect, e nada de requisição de janela
+    que o site abriu sozinho. `bloqueios` guarda os destinos barrados (para dizer por que uma página falhou) e
+    `erros_de_rede` a falha do `route.fetch` de cada navegação que não chegou ao site."""
 
-    def __init__(self, url_inicial: str) -> None:
+    def __init__(self, url_inicial: str, timeout_ms: float = 30_000, com_proxy: bool = False) -> None:
         self._host_inicial = (urlsplit(url_inicial).hostname or "").lower()
+        self._timeout_ms = timeout_ms
+        self._com_proxy = com_proxy
         self.paginas: set[Page] = set()
+        self.bloqueios: list[str] = []
+        self.erros_de_rede: list[str] = []
 
     def permitido(self, url: str) -> bool:
         if not _endereco_local(url):
@@ -173,11 +222,53 @@ class _Guarda:
             # abas da captura já existem quando navegam) ou um service worker (já bloqueado no contexto)
             return not pedido.is_navigation_request()
 
+    def padroes_locais(self) -> list[str]:
+        """Os padrões do `Network.setBlockedURLs` para os subrecursos: as faixas locais, menos as que o host da
+        `url_inicial` usa (o site de teste local carrega o que é dele)."""
+        padroes = []
+        host = f"[{self._host_inicial}" if ":" in self._host_inicial else self._host_inicial
+        for exemplo, prefixos in _FAIXAS_LOCAIS:
+            permitida = self.permitido(f"http://{f'[{exemplo}]' if ':' in exemplo else exemplo}/")
+            da_url_inicial = any(host.startswith(p.rstrip("/:")) for p in prefixos if not p.startswith("*"))
+            if not (permitida or da_url_inicial):
+                padroes += [f"*://{prefixo}*" for prefixo in prefixos]
+        return padroes
+
     async def rotear(self, rota: Route) -> None:
-        if self.permitido(rota.request.url) and self._da_captura(rota.request):
-            await rota.continue_()
+        pedido = rota.request
+        if not (self.permitido(pedido.url) and self._da_captura(pedido)):
+            if self._da_captura(pedido):
+                self.bloqueios.append(pedido.url)
+            await _abortar(rota, "blockedbyclient")
+            return
+        if not pedido.is_navigation_request():
+            with contextlib.suppress(PlaywrightError):
+                await rota.continue_()
+            return
+        try:
+            resposta = await rota.fetch(
+                max_redirects=0, timeout=self._timeout_ms, headers=await pedido.all_headers()
+            )
+        except PlaywrightError as erro:
+            self.erros_de_rede.append(next((linha for linha in str(erro).splitlines() if linha.strip()), ""))
+            # pelo proxy, a falha é do caminho do analista (o proxy esconde a do site): nada de "site fora do ar"
+            await _abortar(rota, "failed" if self._com_proxy else _codigo_de_abort(erro))
+            return
+        destino = resposta.headers.get("location")
+        if 300 <= resposta.status < 400 and destino and not self.permitido(proximo := urljoin(pedido.url, destino)):
+            self.bloqueios.append(proximo)
+            await _abortar(rota, "blockedbyclient")
+            return
+        with contextlib.suppress(PlaywrightError):
+            await rota.fulfill(response=resposta)
+
+    async def rotear_websocket(self, ws: WebSocketRoute) -> None:
+        if self.permitido(ws.url):
+            ws.connect_to_server()  # a conexão sai do navegador, pelo proxy dele
         else:
-            await rota.abort("blockedbyclient")
+            self.bloqueios.append(ws.url)
+            with contextlib.suppress(PlaywrightError):
+                await ws.close(code=1008, reason="endereço local bloqueado")
 
 
 async def _fechar_janela(pagina: Page) -> None:
@@ -268,6 +359,11 @@ def _motivo(erro: Exception) -> str:
     return f"{type(erro).__name__}: {linha}" if linha else type(erro).__name__
 
 
+def _codigo_de_abort_do(erro: _FalhaDeNavegacao) -> str | None:
+    codigo = _ERRO_DO_CHROMIUM.search(str(erro.original))
+    return codigo.group(1) if codigo else None
+
+
 def _erro_da_captura(erro: Exception) -> ErroNo:
     """O `ErroNo` (não permanente) de uma falha da captura, na forma que o E6 lê (`pontuacao.site_nao_respondeu`):
 
@@ -326,6 +422,10 @@ async def _visitar(
     guarda.paginas.add(pagina)
     pagina.on("popup", _fechar_janela)
     try:
+        # os saltos de redirect dos subrecursos não passam pela rota: o bloqueio do DevTools os barra na aba
+        cdp = await contexto.new_cdp_session(pagina)
+        await cdp.send("Network.enable")
+        await cdp.send("Network.setBlockedURLs", {"urls": guarda.padroes_locais()})
         try:
             resposta = await pagina.goto(url, wait_until="domcontentloaded")
         except PlaywrightError as erro:
@@ -371,11 +471,11 @@ async def _percorrer(
 
     Falha na página inicial levanta: `_FalhaDeNavegacao` se o `goto` falhou, `PlaywrightError` se o resto da
     leitura falhou, `ErroNo` se o servidor respondeu com erro HTTP (o HTML da página de erro fica na custódia como
-    prova). Falha numa
-    subpágina, inclusive erro HTTP e erro inesperado ao processar o conteúdo do site, vai para
-    `falhas` e as outras seguem.
+    prova) ou se a guarda barrou a página (redirect ou URL final em endereço local: nada dela vai para a custódia).
+    Falha numa subpágina, inclusive erro HTTP, endereço local barrado e erro inesperado ao processar o conteúdo do
+    site, vai para `falhas` e as outras seguem.
     """
-    inicio = await _visitar(contexto, ctx.url_inicial, cfg, com_links=True, guarda=guarda)
+    inicio = await _visita_guardada(contexto, ctx.url_inicial, cfg, True, guarda)
     if inicio.e_desafio:
         _guardar_desafio(s, inicio)
         screenshot = s.custodia.guardar(inicio.screenshot, "png", tipo="screenshot", origem=inicio.url)
@@ -390,7 +490,7 @@ async def _percorrer(
     falhas: list[dict] = []
     for url in _escolher_links(inicio.links, ctx.url_inicial, inicio.url, ctx.alvo, cfg.max_subpaginas):
         try:
-            visita = await _visitar(contexto, url, cfg, com_links=False, guarda=guarda)
+            visita = await _visita_guardada(contexto, url, cfg, False, guarda)
             if visita.e_desafio:
                 _guardar_desafio(s, visita)
                 falhas.append({"url": url, "motivo": _MOTIVO_DESAFIO})
@@ -399,9 +499,32 @@ async def _percorrer(
                 falhas.append({"url": url, "motivo": f"HTTP {visita.status}"})
                 continue
             paginas.append(_guardar_pagina(s, visita))
+        except _EnderecoLocal as erro:
+            falhas.append({"url": url, "motivo": str(erro)})
         except Exception as erro:  # o conteúdo é do site investigado: nada dele derruba o nó
             falhas.append({"url": url, "motivo": _motivo(erro)})
     return paginas, False, falhas
+
+
+class _EnderecoLocal(Exception):
+    """A guarda barrou a página: o redirect ou a URL final é endereço local do analista."""
+
+
+async def _visita_guardada(
+    contexto: BrowserContext, url: str, cfg: CapturaConfig, com_links: bool, guarda: _Guarda
+) -> _Visita:
+    """`_visitar`, mas a página que a guarda barrou vira `_EnderecoLocal` (com o destino) e a que terminou num
+    endereço local, sem a guarda ter visto, nunca é devolvida (defesa em profundidade)."""
+    antes = len(guarda.bloqueios)
+    try:
+        visita = await _visitar(contexto, url, cfg, com_links=com_links, guarda=guarda)
+    except _FalhaDeNavegacao:
+        if len(guarda.bloqueios) > antes:
+            raise _EnderecoLocal(f"redirect para endereço local bloqueado: {guarda.bloqueios[antes]}") from None
+        raise
+    if not guarda.permitido(visita.url):
+        raise _EnderecoLocal(f"página em endereço local bloqueada: {visita.url}")
+    return visita
 
 
 async def _capturar(ctx: Contexto, dominio: str, s: Servicos) -> Feito:
@@ -416,9 +539,20 @@ async def _capturar(ctx: Contexto, dominio: str, s: Servicos) -> Feito:
                     contexto.set_default_timeout(cfg.timeout_pagina_s * 1000)
                     if s.config.rede.proxy:
                         await contexto.add_init_script(_SEM_WEBRTC)
-                    guarda = _Guarda(ctx.url_inicial)
+                    guarda = _Guarda(ctx.url_inicial, cfg.timeout_pagina_s * 1000, bool(s.config.rede.proxy))
                     await contexto.route("**/*", guarda.rotear)
-                    paginas, bloqueada, falhas = await _percorrer(contexto, ctx, cfg, s, guarda)
+                    await contexto.route_web_socket("**/*", guarda.rotear_websocket)
+                    try:
+                        paginas, bloqueada, falhas = await _percorrer(contexto, ctx, cfg, s, guarda)
+                    except _EnderecoLocal as erro:
+                        raise ErroNo(f"{PREFIXO_FALHA_CAPTURA} {erro}", permanente=False) from erro
+                    except _FalhaDeNavegacao as erro:
+                        if guarda.erros_de_rede and _codigo_de_abort_do(erro) == "ERR_FAILED":
+                            # o `route.fetch` da página inicial falhou de um jeito que o Chromium só vê como ERR_FAILED
+                            raise ErroNo(
+                                f"{PREFIXO_CAPTURA_INDISPONIVEL} {guarda.erros_de_rede[-1]}", permanente=False
+                            ) from erro
+                        raise
                 finally:
                     await contexto.close()  # o HAR só é gravado quando o contexto fecha
                 har = caminho_har.read_bytes()

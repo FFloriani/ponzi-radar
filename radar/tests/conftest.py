@@ -100,22 +100,44 @@ _PAGINAS_DO_PROXY = {
 }
 
 
+def _pagina_do_proxy(url: str) -> bytes:
+    miolo = next(
+        (pagina for caminho, pagina in _PAGINAS_DO_PROXY.items() if url.endswith(caminho)),
+        "Conteúdo servido pelo proxy.",
+    )
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'><title>Via proxy</title></head>"
+        f"<body>{miolo}</body></html>"
+    ).encode()
+
+
 class _HandlerDoProxy(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self.server.requisicoes.append(self.path)  # a URL absoluta, como um proxy HTTP a recebe
-        miolo = next(
-            (pagina for caminho, pagina in _PAGINAS_DO_PROXY.items() if self.path.endswith(caminho)),
-            "Conteúdo servido pelo proxy.",
-        )
-        corpo = (
-            "<!doctype html><html><head><meta charset='utf-8'><title>Via proxy</title></head>"
-            f"<body>{miolo}</body></html>"
-        ).encode()
+        corpo = _pagina_do_proxy(self.path)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(corpo)))
         self.end_headers()
         self.wfile.write(corpo)
+
+    def do_CONNECT(self) -> None:
+        # a navegação da captura sai pelo `route.fetch` do Playwright, que usa CONNECT até para http: o proxy de
+        # mentira abre o túnel e responde ele mesmo ao pedido de dentro, guardando a URL absoluta como no GET
+        host = self.path.rsplit(":", 1)[0]
+        self.send_response(200, "Connection established")
+        self.end_headers()
+        linha = self.rfile.readline().decode("latin-1").split()
+        while self.rfile.readline() not in (b"\r\n", b"\n", b""):
+            pass
+        url = f"http://{host}{linha[1] if len(linha) > 1 else '/'}"
+        self.server.requisicoes.append(url)
+        corpo = _pagina_do_proxy(url)
+        self.wfile.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\n"
+            b"Connection: close\r\n\r\n" % len(corpo) + corpo
+        )
+        self.close_connection = True
 
     def log_message(self, format: str, *args) -> None:  # noqa: A002 - assinatura da stdlib
         pass

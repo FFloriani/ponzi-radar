@@ -9,9 +9,13 @@ from __future__ import annotations
 import json
 import re
 import socket
+import threading
 import time
+from contextlib import contextmanager
 from datetime import date, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 from playwright.async_api import Browser, BrowserType
@@ -777,7 +781,8 @@ async def test_proxy_fora_do_ar_e_falha_do_analista_nao_do_site(tmp_path):
     with pytest.raises(ErroNo) as e:
         await capturar(tmp_path, "http://alvo-atras-do-proxy.test/", rede=rede, max_subpaginas=0)
     assert e.value.permanente is False
-    assert e.value.mensagem.startswith("captura indisponível: ") and "ERR_PROXY_CONNECTION_FAILED" in e.value.mensagem
+    # R4: a navegação sai pelo route.fetch, que diz a falha do proxy com o endereço dele
+    assert e.value.mensagem.startswith("captura indisponível: ") and f"127.0.0.1:{porta}" in e.value.mensagem
     assert "\n" not in e.value.mensagem
 
 
@@ -1017,3 +1022,227 @@ async def test_popup_aberto_pelo_site_nao_navega(servidor_local, pedidos_locais,
     r, _ = await capturar(tmp_path, servidor_local + "/popup.html", max_subpaginas=0)
     assert len(r.saidas["paginas"]) == 1
     assert caminhos(pedidos_locais) == ["/popup.html"]  # o /planos.html?popup=1 nunca foi pedido
+
+
+# ---------------------------------------------------------------------------- redirect para endereço local (R4)
+
+
+def _ip_da_lan() -> str:
+    """Um IPv4 da máquina que não é loopback: o "site" do teste precisa estar fora do loopback, senão a exceção do
+    site de teste local libera o 127.0.0.1."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.connect(("10.255.255.255", 1))  # UDP: nada sai, só escolhe a interface
+            ip = s.getsockname()[0]
+        except OSError:
+            ip = "127.0.0.1"
+    if ip.startswith("127."):
+        pytest.skip("sem endereço IPv4 fora do loopback")
+    return ip
+
+
+class _ServicoLocal(ThreadingHTTPServer):
+    """Um serviço do analista em 127.0.0.1: guarda cada pedido que recebe."""
+
+    daemon_threads = True
+
+    def __init__(self) -> None:
+        servidor = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                servidor.pedidos.append(self.path)
+                corpo = b"<html><body>servico local do analista</body></html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(corpo)))
+                self.end_headers()
+                self.wfile.write(corpo)
+
+            def log_message(self, *a) -> None:
+                pass
+
+        super().__init__(("127.0.0.1", 0), Handler)
+        self.pedidos: list[str] = []
+
+
+def _resposta(handler: BaseHTTPRequestHandler, status: int, corpo: bytes = b"", local: str | None = None) -> None:
+    handler.send_response(status)
+    if local:
+        handler.send_header("Location", local)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Content-Length", str(len(corpo)))
+    handler.send_header("Connection", "close")
+    handler.end_headers()
+    handler.wfile.write(corpo)
+
+
+def _pagina_do_site(caminho: str, local: str, porta_ws: int) -> tuple[int, bytes, str | None]:
+    """O site hostil: a home redireciona para o serviço local; a /pagina tem uma imagem que redireciona para ele."""
+    if caminho in ("/", "/redir"):
+        return 302, b"", f"{local}/segredo"
+    if caminho.endswith("/img-redir"):
+        return 302, b"", f"{local}/img"
+    if caminho.endswith("/ws"):
+        corpo = f"<html><body><p>conversa</p><script>new WebSocket('ws://127.0.0.1:{porta_ws}/');</script></body></html>"
+        return 200, corpo.encode(), None
+    return 200, b"<html><body><p>pagina publica</p><img src='/img-redir'></body></html>", None
+
+
+@contextmanager
+def _site_hostil(host: str, porta_ws: int = 9):
+    """O serviço local, o ouvinte de WebSocket e o site hostil (em `host`, fora do loopback)."""
+    servico = _ServicoLocal()
+    local = f"http://127.0.0.1:{servico.server_port}"
+
+    class Site(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            _resposta(self, *_pagina_do_site(self.path, local, porta_ws))
+
+        def log_message(self, *a) -> None:
+            pass
+
+    site = ThreadingHTTPServer((host, 0), Site)
+    site.daemon_threads = True
+    for servidor in (servico, site):
+        threading.Thread(target=servidor.serve_forever, daemon=True).start()
+    try:
+        yield servico, f"http://{host}:{site.server_port}"
+    finally:
+        for servidor in (servico, site):
+            servidor.shutdown()
+            servidor.server_close()
+
+
+@lento
+async def test_redirect_da_pagina_inicial_para_endereco_local_e_barrado(tmp_path):
+    with _site_hostil(_ip_da_lan()) as (servico, site):
+        with pytest.raises(ErroNo) as e:
+            await capturar(tmp_path, site + "/", max_subpaginas=0)
+    assert servico.pedidos == []  # o serviço local nunca recebeu o pedido
+    assert e.value.mensagem == (
+        f"captura falhou: redirect para endereço local bloqueado: http://127.0.0.1:{servico.server_port}/segredo"
+    )
+    assert e.value.permanente is False
+    assert not (tmp_path / "custodia.log").exists()  # nada do serviço local na custódia
+
+
+@lento
+async def test_redirect_de_imagem_para_endereco_local_e_barrado(tmp_path):
+    with _site_hostil(_ip_da_lan()) as (servico, site):
+        r, serv = await capturar(tmp_path, site + "/pagina", max_subpaginas=0)
+    assert servico.pedidos == []
+    (pagina,) = r.saidas["paginas"]
+    assert "pagina publica" in texto_de(serv, pagina)
+    assert b"servico local" not in serv.custodia.ler(pagina["har"])
+
+
+@lento
+async def test_websocket_para_endereco_local_e_barrado(tmp_path):
+    with socket.socket() as ouvinte:
+        ouvinte.bind(("127.0.0.1", 0))
+        ouvinte.listen()
+        ouvinte.settimeout(0.5)
+        with _site_hostil(_ip_da_lan(), porta_ws=ouvinte.getsockname()[1]) as (_, site):
+            r, _ = await capturar(tmp_path, site + "/ws", max_subpaginas=0)
+        assert len(r.saidas["paginas"]) == 1
+        with pytest.raises(TimeoutError):
+            ouvinte.accept()  # nenhuma conexão chegou ao ouvinte local
+
+
+class _ProxyHostil(ThreadingHTTPServer):
+    """Um proxy que responde pelo site hostil `alvo.test` (GET absoluto e CONNECT) e guarda o que recebeu."""
+
+    daemon_threads = True
+
+    def __init__(self, local: str) -> None:
+        servidor = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                servidor.vistos.append(self.path)
+                _resposta(self, *_pagina_do_site(urlsplit(self.path).path, local, 9))
+
+            def do_CONNECT(self) -> None:
+                servidor.vistos.append(f"CONNECT {self.path}")
+                self.send_response(200, "Connection established")
+                self.end_headers()
+                linha = self.rfile.readline().decode("latin-1").split()
+                while self.rfile.readline() not in (b"\r\n", b"\n", b""):
+                    pass
+                caminho = linha[1] if len(linha) > 1 else "/"
+                servidor.vistos.append(f"(túnel) {caminho}")
+                status, corpo, destino = _pagina_do_site(caminho, local, 9)
+                cabecalho = f"HTTP/1.1 {status} X\r\nContent-Type: text/html\r\nContent-Length: {len(corpo)}\r\n"
+                cabecalho += f"Location: {destino}\r\n" if destino else ""
+                self.wfile.write((cabecalho + "Connection: close\r\n\r\n").encode() + corpo)
+                self.close_connection = True
+
+            def log_message(self, *a) -> None:
+                pass
+
+        super().__init__(("127.0.0.1", 0), Handler)
+        self.vistos: list[str] = []
+
+
+@lento
+async def test_com_proxy_redirects_para_endereco_local_nao_saem_do_navegador(tmp_path):
+    servico = _ServicoLocal()
+    proxy = _ProxyHostil(f"http://127.0.0.1:{servico.server_port}")
+    for servidor in (servico, proxy):
+        threading.Thread(target=servidor.serve_forever, daemon=True).start()
+    rede = RedeConfig(proxy=f"http://127.0.0.1:{proxy.server_port}")
+    try:
+        with pytest.raises(ErroNo) as e:
+            await capturar(tmp_path / "a", "http://alvo.test/redir", rede=rede, max_subpaginas=0)
+        r, _ = await capturar(tmp_path / "b", "http://alvo.test/pagina", rede=rede, max_subpaginas=0)
+    finally:
+        for servidor in (servico, proxy):
+            servidor.shutdown()
+            servidor.server_close()
+    assert e.value.mensagem.startswith("captura falhou: redirect para endereço local bloqueado: http://127.0.0.1:")
+    assert len(r.saidas["paginas"]) == 1
+    # nem o serviço local nem o proxy viram um pedido para o 127.0.0.1: o navegador não seguiu os saltos
+    assert servico.pedidos == []
+    assert not [v for v in proxy.vistos if "127.0.0.1" in v], proxy.vistos
+
+
+@lento
+async def test_pagina_que_termina_em_endereco_local_nao_vai_para_a_custodia(tmp_path, monkeypatch):
+    # defesa em profundidade: mesmo que um salto escapasse da guarda, a página com URL final local não é guardada
+    async def visitar(contexto, url, cfg, com_links, guarda):
+        destino = "http://127.0.0.1:8080/segredo" if url.endswith("/") else "http://192.168.0.1/admin"
+        links = ["https://exemplo.com.br/termos"] if com_links else []
+        return modulo_captura._Visita(destino, 200, {}, "local", "<html>x</html>", "segredo", PNG, links)
+
+    monkeypatch.setattr(modulo_captura, "_visitar", visitar)
+    with pytest.raises(ErroNo) as e:
+        await capturar(tmp_path, "https://exemplo.com.br/", max_subpaginas=1)
+    assert e.value.mensagem == "captura falhou: página em endereço local bloqueada: http://127.0.0.1:8080/segredo"
+    assert not (tmp_path / "custodia.log").exists()
+
+
+@lento
+async def test_subpagina_que_termina_em_endereco_local_vai_para_falhas(tmp_path, monkeypatch):
+    async def visitar(contexto, url, cfg, com_links, guarda):
+        if url == "https://exemplo.com.br/":
+            return modulo_captura._Visita(url, 200, {}, "home", "<html>h</html>", "home", PNG,
+                                          ["https://exemplo.com.br/termos"])  # fmt: skip
+        return modulo_captura._Visita("http://192.168.0.1/admin", 200, {}, "x", "<html>x</html>", "x", PNG)
+
+    monkeypatch.setattr(modulo_captura, "_visitar", visitar)
+    r, serv = await capturar(tmp_path, "https://exemplo.com.br/", max_subpaginas=1)
+    assert [p["url"] for p in r.saidas["paginas"]] == ["https://exemplo.com.br/"]
+    assert r.saidas["falhas"] == [
+        {"url": "https://exemplo.com.br/termos", "motivo": "página em endereço local bloqueada: http://192.168.0.1/admin"}
+    ]
+
+
+def test_padroes_do_bloqueio_dos_subrecursos():
+    publico = modulo_captura._Guarda("https://exemplo.com.br/").padroes_locais()
+    assert {"*://127.*", "*://localhost/*", "*://10.*", "*://192.168.*", "*://172.20.*", "*://[::1]*"} <= set(publico)
+    # o site de teste local carrega o que é dele: o loopback sai da lista; o da LAN, a faixa dele
+    teste = modulo_captura._Guarda("http://127.0.0.1:5000/").padroes_locais()
+    assert "*://127.*" not in teste and "*://localhost/*" not in teste and "*://10.*" in teste
+    lan = modulo_captura._Guarda("http://192.168.15.5:8000/").padroes_locais()
+    assert "*://192.168.*" not in lan and "*://127.*" in lan
