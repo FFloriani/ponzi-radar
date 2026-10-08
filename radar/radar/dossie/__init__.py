@@ -42,7 +42,7 @@ from radar.diff import (
 from radar.execucao import ExecucaoSalva, carregar_execucao
 from radar.modelos import Evidencia, Item, Sinal
 from radar.pendencias.esquemas import ValorD1
-from radar.pontuacao import Matriz
+from radar.pontuacao import PREFIXO_CAPTURA_INDISPONIVEL, Matriz
 from radar.texto import codigo_md, escapar_md
 
 __all__ = ["PendenciasAbertas", "gerar_dossie"]
@@ -464,6 +464,8 @@ def _resolver_no(ex: ExecucaoSalva, no: str, status: str, motivo: str) -> str:
     if status == "aguardando":
         abertas = [pid for pid, p in ex.pendencias.items() if p.get("aberta") and p.get("no_origem") == no]
         return "; ".join(f"responder a {pid}" for pid in abertas)
+    if status == "erro" and motivo.startswith(PREFIXO_CAPTURA_INDISPONIVEL):
+        return "conferir o ambiente do analista (Chromium instalado, proxy no ar) e rodar de novo a análise"
     if status in ("erro", "pendente", "executando"):
         return "rodar de novo a análise"
     return ""

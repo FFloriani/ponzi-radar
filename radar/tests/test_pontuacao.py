@@ -946,6 +946,26 @@ _FALHAS_QUE_CONTAM = [
     "captura falhou: HTTP 520", "captura falhou: HTTP 522", "captura falhou: HTTP 526",
     "captura falhou: HTTP 404", "captura falhou: HTTP 410",
 ]  # fmt: skip
+# I2: a forma nova, que a captura grava desde a revisão final, para cada falha de alcance do site
+_FALHAS_DE_ALCANCE = [
+    "captura falhou: navegação: net::ERR_NAME_NOT_RESOLVED", "captura falhou: navegação: net::ERR_CONNECTION_REFUSED",
+    "captura falhou: navegação: net::ERR_CONNECTION_RESET", "captura falhou: navegação: net::ERR_CONNECTION_CLOSED",
+    "captura falhou: navegação: net::ERR_CONNECTION_TIMED_OUT", "captura falhou: navegação: net::ERR_ADDRESS_UNREACHABLE",
+    "captura falhou: navegação: net::ERR_TIMED_OUT", "captura falhou: navegação: timeout",
+]  # fmt: skip
+# falha do lado do analista (navegador ausente, proxy ou túnel fora, sem internet, TLS): nunca é "site fora do ar",
+# nem na forma nova nem na antiga ("captura falhou: <mensagem do Playwright>"), que execuções em disco ainda têm
+_FALHAS_DO_ANALISTA = [
+    "captura indisponível: BrowserType.launch: Executable doesn't exist at /ms-playwright/chromium",
+    "captura indisponível: Page.goto: net::ERR_PROXY_CONNECTION_FAILED at https://exemplo.com.br/",
+    "captura indisponível: ValueError: HAR ilegível",
+    "captura falhou: BrowserType.launch: Executable doesn't exist at /ms-playwright/chromium",
+    "captura falhou: Page.goto: net::ERR_PROXY_CONNECTION_FAILED at https://exemplo.com.br/",
+    "captura falhou: Page.goto: net::ERR_TUNNEL_CONNECTION_FAILED at https://exemplo.com.br/",
+    "captura falhou: Page.goto: net::ERR_INTERNET_DISCONNECTED at https://exemplo.com.br/",
+    "captura falhou: Page.goto: net::ERR_CERT_AUTHORITY_INVALID at https://exemplo.com.br/",
+    "captura falhou: Page.goto: net::ERR_SSL_PROTOCOL_ERROR at https://exemplo.com.br/",
+]  # fmt: skip
 _RECUSAS = [
     "captura falhou: HTTP 401", "captura falhou: HTTP 403", "captura falhou: HTTP 407",
     "captura falhou: HTTP 429", "captura falhou: HTTP 451", "captura falhou: HTTP 400",
@@ -953,7 +973,7 @@ _RECUSAS = [
 ]  # fmt: skip
 
 
-@pytest.mark.parametrize("motivo", _FALHAS_QUE_CONTAM)
+@pytest.mark.parametrize("motivo", _FALHAS_QUE_CONTAM + _FALHAS_DE_ALCANCE)
 def test_e6_falhas_que_contam(motivo, matriz):
     falha = {"captura": ("erro", motivo)}
     sinais, _ = sinais_da_execucao(execucao(status=falha), matriz, execucao(status=falha))
@@ -970,6 +990,13 @@ def test_e6_recusa_ao_visitante_nao_e_queda(motivo, matriz):
     # numa execução só, com uma queda de verdade na outra, também não
     assert sinais_da_execucao(execucao(status=recusa), matriz, execucao(status={"captura": FALHA}))[0] == []
     assert sinais_da_execucao(execucao(status={"captura": FALHA}), matriz, execucao(status=recusa))[0] == []
+
+
+@pytest.mark.parametrize("motivo", _FALHAS_DO_ANALISTA)
+def test_e6_falha_do_lado_do_analista_nao_e_queda(motivo, matriz):
+    falha = {"captura": ("erro", motivo)}
+    assert sinais_da_execucao(execucao(status=falha), matriz, execucao(status=falha))[0] == []
+    assert sinais_da_execucao(execucao(status=falha), matriz, execucao(status={"captura": FALHA}))[0] == []
 
 
 def test_e6_duas_falhas_de_captura(matriz):

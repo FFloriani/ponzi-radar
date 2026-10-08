@@ -27,6 +27,12 @@ from radar.modelos import Contexto, ErroNo, Feito, Pulado
 from radar.motor import NoBase, Servicos
 from radar.nos._paginas import Chave, chave_da_pagina, ordenar_paginas
 from radar.nos.alvo import dominio_registravel
+from radar.pontuacao import (
+    ERROS_DE_ALCANCE,
+    PREFIXO_CAPTURA_INDISPONIVEL,
+    PREFIXO_FALHA_CAPTURA,
+    PREFIXO_FALHA_NAVEGACAO,
+)
 
 # Desafio anti-bot (R-T8-desafio). O título da página de verificação basta. Marca no HTML sozinha não:
 # um login ou cadastro com reCAPTCHA tem `g-recaptcha` e pouco texto e é uma página de verdade, e
@@ -41,6 +47,15 @@ _MOTIVO_DESAFIO = "desafio anti-bot"
 # links para estes arquivos nunca são seguidos (não é página e abrir um download é contato demais)
 _EXTENSOES_DE_ARQUIVO = frozenset({"zip", "pdf", "exe", "apk", "rar", "7z", "dmg", "msi"})
 _JS_LINKS = "() => Array.from(document.links, (link) => link.href)"
+_ERRO_DO_CHROMIUM = re.compile(r"net::(ERR_[A-Z0-9_]+)")
+
+
+class _FalhaDeNavegacao(Exception):
+    """O `goto` falhou: o navegador não chegou à página. `original` é o erro do Playwright."""
+
+    def __init__(self, original: PlaywrightError) -> None:
+        super().__init__(str(original))
+        self.original = original
 
 
 def _e_desafio(
@@ -159,10 +174,29 @@ def _escolher_links(hrefs: list, url_inicial: str, url_final: str, alvo: str, li
 
 def _motivo(erro: Exception) -> str:
     """A primeira linha da mensagem: o Playwright anexa o log de chamadas nas seguintes."""
+    if isinstance(erro, _FalhaDeNavegacao):
+        erro = erro.original
     linha = next((linha.strip() for linha in str(erro).splitlines() if linha.strip()), "")
     if isinstance(erro, PlaywrightError):
         return linha or type(erro).__name__
     return f"{type(erro).__name__}: {linha}" if linha else type(erro).__name__
+
+
+def _erro_da_captura(erro: Exception) -> ErroNo:
+    """O `ErroNo` (não permanente) de uma falha da captura, na forma que o E6 lê (`pontuacao.site_nao_respondeu`):
+
+    - o `goto` da página inicial não alcançou o site (`ERROS_DE_ALCANCE` ou timeout): "captura falhou: navegação:
+      net::ERR_..." ou "captura falhou: navegação: timeout";
+    - qualquer outra falha é do lado do analista: "captura indisponível: <motivo>" (navegador ausente ou que não
+      inicia, proxy ou túnel fora, sem internet, certificado e TLS, erro inesperado do código).
+    """
+    if isinstance(erro, _FalhaDeNavegacao):
+        if isinstance(erro.original, PlaywrightTimeout):
+            return ErroNo(f"{PREFIXO_FALHA_NAVEGACAO} timeout", permanente=False)
+        codigo = _ERRO_DO_CHROMIUM.search(str(erro.original))
+        if codigo is not None and codigo.group(1) in ERROS_DE_ALCANCE:
+            return ErroNo(f"{PREFIXO_FALHA_NAVEGACAO} net::{codigo.group(1)}", permanente=False)
+    return ErroNo(f"{PREFIXO_CAPTURA_INDISPONIVEL} {_motivo(erro)}", permanente=False)
 
 
 def _bytes(texto: str) -> bytes:
@@ -201,7 +235,10 @@ async def _visitar(contexto: BrowserContext, url: str, cfg: CapturaConfig, com_l
     """Abre `url` numa aba nova (o travamento de uma não contamina as outras) e lê o que renderizou."""
     pagina = await contexto.new_page()
     try:
-        resposta = await pagina.goto(url, wait_until="domcontentloaded")
+        try:
+            resposta = await pagina.goto(url, wait_until="domcontentloaded")
+        except PlaywrightError as erro:
+            raise _FalhaDeNavegacao(erro) from erro
         try:
             await pagina.wait_for_load_state("networkidle", timeout=cfg.networkidle_s * 1000)
         except PlaywrightTimeout:
@@ -241,8 +278,9 @@ async def _percorrer(
 ) -> tuple[list[dict], bool, list[dict]]:
     """Visita a página inicial e as subpáginas. Devolve `(paginas sem o HAR, bloqueada, falhas)`.
 
-    Falha na página inicial levanta: `PlaywrightError` se a navegação falhou, `ErroNo` se o servidor
-    respondeu com erro HTTP (o HTML da página de erro fica na custódia como prova). Falha numa
+    Falha na página inicial levanta: `_FalhaDeNavegacao` se o `goto` falhou, `PlaywrightError` se o resto da
+    leitura falhou, `ErroNo` se o servidor respondeu com erro HTTP (o HTML da página de erro fica na custódia como
+    prova). Falha numa
     subpágina, inclusive erro HTTP e erro inesperado ao processar o conteúdo do site, vai para
     `falhas` e as outras seguem.
     """
@@ -255,7 +293,7 @@ async def _percorrer(
     if inicio.e_erro_http:
         # o site caiu ou recusou o visitante: sem conteúdo para analisar, o motor cai no Wayback
         s.custodia.guardar(_bytes(inicio.html), "html", tipo="pagina", origem=inicio.url)
-        raise ErroNo(f"captura falhou: HTTP {inicio.status}", permanente=False)
+        raise ErroNo(f"{PREFIXO_FALHA_CAPTURA} HTTP {inicio.status}", permanente=False)
 
     paginas = [_guardar_pagina(s, inicio)]
     falhas: list[dict] = []
@@ -310,6 +348,9 @@ class CapturaNo(NoBase):
     custódia), `terceiros` (domínios registráveis das requisições, diferentes do alvo), `bloqueada` e
     `falhas` (as subpáginas que não puderam ser capturadas, com o motivo).
 
+    Os erros do nó distinguem o site do analista (I2, ver `_erro_da_captura`): "captura falhou: HTTP <código>" e
+    "captura falhou: navegação: ..." falam do site; "captura indisponível: ..." é falha local e não conta para o E6.
+
     Se a página inicial é uma verificação anti-bot (ver `_e_desafio`), `bloqueada` é `True` e
     `paginas` só tem a `url`, o `status`, a screenshot e o HAR dela (sem `html` nem `texto`); nenhum
     link é seguido e o `wayback_snapshot` assume. Falha ao abrir a página inicial, ou resposta dela com
@@ -330,5 +371,7 @@ class CapturaNo(NoBase):
             return Pulado("modo_contato=nenhum")
         try:
             return await _capturar(ctx, entradas["alvo"]["dominio"], s)
-        except PlaywrightError as erro:
-            raise ErroNo(f"captura falhou: {_motivo(erro)}", permanente=False) from erro
+        except ErroNo:
+            raise
+        except Exception as erro:  # o navegador, a rede do analista ou o próprio código: ver `_erro_da_captura`
+            raise _erro_da_captura(erro) from erro

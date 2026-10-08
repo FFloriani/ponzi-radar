@@ -48,10 +48,26 @@ TIPO_FORA_DO_AR = "site_fora_do_ar"
 _ESTAGIO_E0 = "E0"
 _DIAS_E0 = 90
 _FONTE_COLETOR = "coletor"
-# o motivo de erro da captura (radar/nos/captura.py) e os códigos HTTP da página inicial que dizem "site fora do ar"
-_PREFIXO_FALHA_CAPTURA = "captura falhou:"
+# Os motivos de erro da captura (radar/nos/captura.py grava, o E6 lê; I2 da revisão final):
+# - "captura falhou: HTTP <código>": a página inicial respondeu com erro;
+# - "captura falhou: navegação: net::ERR_<código>" ou "...: navegação: timeout": o site não foi alcançado;
+# - "captura indisponível: <motivo>": falha do lado do analista (navegador, proxy, túnel, TLS, erro do código).
+PREFIXO_FALHA_CAPTURA = "captura falhou:"
+PREFIXO_FALHA_NAVEGACAO = "captura falhou: navegação:"
+PREFIXO_CAPTURA_INDISPONIVEL = "captura indisponível:"
+# os erros do Chromium que dizem que o site não foi alcançado (nome, conexão, rota, tempo); proxy, túnel, certificado,
+# TLS e "sem internet" são do lado do analista
+ERROS_DE_ALCANCE = frozenset(
+    {
+        "ERR_NAME_NOT_RESOLVED", "ERR_CONNECTION_REFUSED", "ERR_CONNECTION_RESET", "ERR_CONNECTION_CLOSED",
+        "ERR_CONNECTION_TIMED_OUT", "ERR_ADDRESS_UNREACHABLE", "ERR_TIMED_OUT",
+    }
+)  # fmt: skip
 _HTTP_DA_CAPTURA = re.compile(r"HTTP (\d{3})")
 _HTTP_SITE_SUMIU = frozenset({404, 410})  # além dos 5xx
+_ERRO_DO_CHROMIUM = re.compile(r"net::(ERR_[A-Z0-9_]+)")
+# o timeout de navegação: "timeout" na forma nova; "Page.goto: Timeout 30000ms exceeded." nas execuções antigas
+_TIMEOUT_DE_NAVEGACAO = re.compile(r"timeout|Page\.goto: Timeout \d+ms exceeded", re.IGNORECASE)
 
 _SEM_PONTOS = frozenset({"nao_se_aplica", "nao_encontrado"})
 _EM_ABERTO = frozenset({"nao_verificado", "inconclusivo"})
@@ -745,19 +761,25 @@ def _da_pe(ex: ExecucaoSalva, matriz: Matriz) -> tuple[list[Sinal], list[Modific
 
 
 def site_nao_respondeu(ex: ExecucaoSalva) -> bool:
-    """A captura caiu em erro porque o site não está no ar (R-T14-e6). O nó levanta "captura falhou: <motivo>":
-    - falha de navegação sem resposta HTTP (DNS, conexão recusada, timeout) conta;
-    - "HTTP <código>" na página inicial conta só com 5xx (inclusive os 52x da Cloudflare), 404 e 410. 401, 403, 407,
-      429, 451 e os outros 4xx são o site recusando o visitante (WAF, bloqueio geográfico), não o site fora do ar.
-    Desafio anti-bot termina `feito` (`bloqueada=True`) e não é falha; erro do código ("erro inesperado: ...") não
-    diz nada do site."""
+    """A captura caiu em erro porque o site não está no ar (R-T14-e6, I2). Contam:
+    - a falha de navegação que diz que o site não foi alcançado: "captura falhou: navegação: net::ERR_..." com um
+      código de `ERROS_DE_ALCANCE` (DNS, conexão recusada, reiniciada, fechada ou sem resposta, rota) ou o timeout;
+    - "captura falhou: HTTP <código>" na página inicial com 5xx (inclusive os 52x da Cloudflare), 404 e 410. 401, 403,
+      407, 429, 451 e os outros 4xx são o site recusando o visitante (WAF, bloqueio geográfico).
+    "captura indisponível: ..." é falha do lado do analista (navegador ausente, proxy ou túnel fora, sem internet,
+    certificado, erro do código) e não conta. A execução gravada antes da I2 tem "captura falhou: <mensagem do
+    Playwright>": vale pelo código `net::ERR_...` ou pelo timeout dela. Desafio anti-bot termina `feito`
+    (`bloqueada=True`) e não é falha; "erro inesperado: ..." não diz nada do site."""
     status, motivo = _status(ex, "captura")
-    if status != "erro" or not isinstance(motivo, str) or not motivo.startswith(_PREFIXO_FALHA_CAPTURA):
+    if status != "erro" or not isinstance(motivo, str) or not motivo.startswith(PREFIXO_FALHA_CAPTURA):
         return False
-    if (http := _HTTP_DA_CAPTURA.fullmatch(motivo[len(_PREFIXO_FALHA_CAPTURA) :].strip())) is None:
-        return True
-    codigo = int(http.group(1))
-    return 500 <= codigo <= 599 or codigo in _HTTP_SITE_SUMIU
+    resto = motivo[len(PREFIXO_FALHA_CAPTURA) :].strip()
+    if (http := _HTTP_DA_CAPTURA.fullmatch(resto)) is not None:
+        codigo = int(http.group(1))
+        return 500 <= codigo <= 599 or codigo in _HTTP_SITE_SUMIU
+    if (erro := _ERRO_DO_CHROMIUM.search(resto)) is not None:
+        return erro.group(1) in ERROS_DE_ALCANCE
+    return _TIMEOUT_DE_NAVEGACAO.search(resto) is not None
 
 
 def _site_fora_do_ar(ex: ExecucaoSalva, matriz: Matriz, anterior: ExecucaoSalva | None) -> Sinal | None:

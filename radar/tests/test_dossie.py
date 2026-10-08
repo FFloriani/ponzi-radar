@@ -520,6 +520,19 @@ def test_dossie_lacunas_listam_cada_no_que_nao_terminou_com_o_motivo(tmp_path):
     assert "`cvm_alertas` — aguardando" in s7
 
 
+def test_dossie_lacunas_dizem_como_resolver_a_captura_indisponivel(tmp_path):
+    # I2: falha do lado do analista aparece como lacuna, com o que conferir antes de rodar de novo
+    motivo = "captura indisponível: BrowserType.launch: Executable doesn't exist at /ms-playwright/chromium"
+    pasta = gravar(tmp_path, status={"captura": ("erro", motivo)})
+    s7 = secao(dossie(pasta), 7)
+    linha = next(linha for linha in s7.splitlines() if linha.startswith("- `captura`"))
+    assert "captura indisponível" in linha
+    assert (
+        "(para resolver: conferir o ambiente do analista (Chromium instalado, proxy no ar) e rodar de novo a análise)"
+        in linha
+    )
+
+
 def test_dossie_lacunas_so_listam_pulado_que_deixa_dado_sem_cobertura(tmp_path):
     pasta = gravar(
         tmp_path,

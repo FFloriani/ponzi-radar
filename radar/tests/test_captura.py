@@ -14,7 +14,8 @@ from datetime import date, datetime
 from pathlib import Path
 
 import pytest
-from playwright.async_api import Browser
+from playwright.async_api import Browser, BrowserType
+from playwright.async_api import Error as PlaywrightError
 
 from radar.config import UA_NAVEGADOR, CapturaConfig, Config, RedeConfig
 from radar.custodia import Custodia, verificar
@@ -713,8 +714,8 @@ async def test_falha_na_pagina_inicial_vira_erro_nao_permanente(tmp_path):
     with pytest.raises(ErroNo) as e:
         await capturar(tmp_path, f"http://127.0.0.1:{porta}/", max_subpaginas=0)
     assert e.value.permanente is False
-    assert e.value.mensagem.startswith("captura falhou: ")
-    assert "ERR_CONNECTION_REFUSED" in e.value.mensagem and "\n" not in e.value.mensagem
+    # falha de alcance do site: a forma que o E6 conta (I2)
+    assert e.value.mensagem == "captura falhou: navegação: net::ERR_CONNECTION_REFUSED"
     assert not (tmp_path / "custodia.log").exists()  # nada foi capturado
 
 
@@ -728,7 +729,74 @@ async def test_pagina_inicial_que_nao_responde_estoura_o_timeout_da_pagina(tmp_p
             await capturar(tmp_path, f"http://127.0.0.1:{mudo.getsockname()[1]}/", timeout_pagina_s=1.0)
     assert time.monotonic() - inicio < 20
     assert e.value.permanente is False
-    assert e.value.mensagem.startswith("captura falhou: ") and "Timeout" in e.value.mensagem
+    assert e.value.mensagem == "captura falhou: navegação: timeout"
+
+
+@lento
+async def test_proxy_fora_do_ar_e_falha_do_analista_nao_do_site(tmp_path):
+    # I2: o proxy (ou o Tor) do analista caído não diz nada do site
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        porta = s.getsockname()[1]  # ninguém escuta: o proxy está fora
+    rede = RedeConfig(proxy=f"http://127.0.0.1:{porta}")
+    with pytest.raises(ErroNo) as e:
+        await capturar(tmp_path, "http://alvo-atras-do-proxy.test/", rede=rede, max_subpaginas=0)
+    assert e.value.permanente is False
+    assert e.value.mensagem.startswith("captura indisponível: ") and "ERR_PROXY_CONNECTION_FAILED" in e.value.mensagem
+    assert "\n" not in e.value.mensagem
+
+
+async def test_navegador_que_nao_inicia_e_captura_indisponivel(tmp_path, monkeypatch):
+    # o Chromium não instalado (depois de um `pip install -U playwright`) não pode virar "site fora do ar"
+    async def sem_navegador(self, **kwargs):
+        raise PlaywrightError("BrowserType.launch: Executable doesn't exist at /ms-playwright/chromium\nlog")
+
+    monkeypatch.setattr(BrowserType, "launch", sem_navegador)
+    with pytest.raises(ErroNo) as e:
+        await capturar(tmp_path, "https://exemplo.com.br/", max_subpaginas=0)
+    assert e.value.permanente is False
+    assert e.value.mensagem == "captura indisponível: BrowserType.launch: Executable doesn't exist at /ms-playwright/chromium"
+
+
+@lento
+async def test_erro_inesperado_na_captura_e_captura_indisponivel(servidor_local, tmp_path, monkeypatch):
+    def quebra(har, dominio):
+        raise ValueError("HAR ilegível")
+
+    monkeypatch.setattr(modulo_captura, "_terceiros", quebra)
+    with pytest.raises(ErroNo) as e:
+        await capturar(tmp_path, servidor_local + "/index.html", max_subpaginas=0)
+    assert e.value.mensagem == "captura indisponível: ValueError: HAR ilegível"
+
+
+_NAVEGACAO = "captura falhou: navegação: net::"
+_LOCAL = "captura indisponível: Page.goto: net::"
+
+
+@pytest.mark.parametrize(
+    "codigo,esperado",
+    [
+        ("ERR_NAME_NOT_RESOLVED", _NAVEGACAO + "ERR_NAME_NOT_RESOLVED"),
+        ("ERR_CONNECTION_REFUSED", _NAVEGACAO + "ERR_CONNECTION_REFUSED"),
+        ("ERR_CONNECTION_RESET", _NAVEGACAO + "ERR_CONNECTION_RESET"),
+        ("ERR_CONNECTION_CLOSED", _NAVEGACAO + "ERR_CONNECTION_CLOSED"),
+        ("ERR_CONNECTION_TIMED_OUT", _NAVEGACAO + "ERR_CONNECTION_TIMED_OUT"),
+        ("ERR_ADDRESS_UNREACHABLE", _NAVEGACAO + "ERR_ADDRESS_UNREACHABLE"),
+        ("ERR_TIMED_OUT", _NAVEGACAO + "ERR_TIMED_OUT"),
+        ("ERR_PROXY_CONNECTION_FAILED", _LOCAL + "ERR_PROXY_CONNECTION_FAILED at https://x.com.br/"),
+        ("ERR_TUNNEL_CONNECTION_FAILED", _LOCAL + "ERR_TUNNEL_CONNECTION_FAILED at https://x.com.br/"),
+        ("ERR_CERT_AUTHORITY_INVALID", _LOCAL + "ERR_CERT_AUTHORITY_INVALID at https://x.com.br/"),
+        ("ERR_INTERNET_DISCONNECTED", _LOCAL + "ERR_INTERNET_DISCONNECTED at https://x.com.br/"),
+        ("ERR_SSL_PROTOCOL_ERROR", _LOCAL + "ERR_SSL_PROTOCOL_ERROR at https://x.com.br/"),
+    ],
+)
+def test_classificacao_da_falha_de_navegacao(codigo, esperado):
+    mensagem = f"Page.goto: net::{codigo} at https://x.com.br/"
+    erro = modulo_captura._erro_da_captura(modulo_captura._FalhaDeNavegacao(PlaywrightError(mensagem)))
+    assert (erro.mensagem, erro.permanente) == (esperado, False)
+    # a mesma mensagem fora do `goto` (screenshot, conteúdo) é do lado do analista
+    fora = modulo_captura._erro_da_captura(PlaywrightError(mensagem))
+    assert fora.mensagem == f"captura indisponível: {mensagem}"
 
 
 @lento
