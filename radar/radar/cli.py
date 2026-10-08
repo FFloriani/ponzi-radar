@@ -5,9 +5,10 @@ O `RUN_ID` é o caminho relativo a `casos_dir` (`<slug>/<AAAA-MM-DD_HHMMSS>`), v
 
 Saída: o resultado vai para o stdout (UTF-8); erros e avisos, para o stderr, em uma linha e sem traceback (`--debug`
 mostra o traceback das falhas inesperadas). Códigos de saída: 0 deu certo; 1 `verificar` achou problema na custódia
-ou houve falha inesperada; 2 o pedido não pode ser atendido (argumentos, `run_id`, `as_of`, pendências abertas, nada
-a comparar); 130 Ctrl+C. O `coletar` roda só os coletores: as pendências que ele deixa abertas são respondidas pelo
-servidor MCP (`radar mcp`) ou ficam como `não verificado` com `dossie --forcar`.
+(inclusive não ter registros a conferir) ou houve falha inesperada; 2 o pedido não pode ser atendido (argumentos,
+`run_id`, `as_of`, pendências abertas, nada a comparar); 130 Ctrl+C. O `coletar` roda só os coletores: as pendências
+que ele deixa abertas são respondidas pelo servidor MCP (`radar mcp`) ou ficam como `não verificado` com
+`dossie --forcar`.
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ import argparse
 import asyncio
 import sys
 import traceback
-from datetime import datetime
 from pathlib import Path
 
 from radar.config import Config, carregar_config
@@ -25,15 +25,15 @@ from radar.diff import comparar, renderizar_diff
 from radar.dossie import PendenciasAbertas, gerar_dossie
 from radar.execucao import (
     ErroComparacao,
+    ErroIniciar,
     carregar_execucao,
-    criar_contexto,
     criar_indices,
     criar_servicos,
     escolher_execucoes,
-    interpretar_as_of,
+    iniciar_execucao,
     pasta_do_run,
 )
-from radar.modelos import Contexto, ErroNo, Pendencia
+from radar.modelos import Contexto, Pendencia
 from radar.motor import Motor
 from radar.nos import nos_do_nucleo
 from radar.pontuacao import carregar_matriz
@@ -52,17 +52,29 @@ class _Erro(Exception):
         self.codigo = codigo
 
 
-def _agora() -> datetime:
-    return datetime.now()
-
-
 def _pasta_da_execucao(config: Config, run_id: str) -> Path:
+    """A pasta de uma execução que existe: `run_id` válido, pasta e `estado.json` presentes."""
     pasta = pasta_do_run(config.casos_dir, run_id)
     if pasta is None:
         raise _Erro("run_id inválido: use <slug>/<AAAA-MM-DD_HHMMSS>")
     if not pasta.is_dir():
         raise _Erro("execução não encontrada")
+    if not (pasta / "estado.json").is_file():
+        raise _Erro("execução sem estado.json")
     return pasta
+
+
+def _custodia_sem_registros(pasta: Path) -> list[str]:
+    """Os problemas de uma pasta sem registros de custódia (sem `custodia.log` ou com ele vazio), que
+    `custodia.verificar` não acusa: ela devolve `[]` quando não há o que conferir, e isso não é integridade. `[]` se
+    o log tem registros."""
+    log = pasta / "custodia.log"
+    if log.is_file() and log.stat().st_size > 0:
+        return []
+    artefatos = pasta / "artefatos"
+    if artefatos.is_dir() and any(artefatos.iterdir()):
+        return ["custodia.log vazio" if log.is_file() else "custodia.log ausente"]
+    return ["sem registros de custódia"]
 
 
 # ---------------------------------------------------------------------------- subcomandos
@@ -82,20 +94,11 @@ async def _rodar(config: Config, ctx: Contexto) -> list[Pendencia]:
 
 def _coletar(args: argparse.Namespace) -> int:
     config = carregar_config()
-    agora = _agora()
-    as_of = None
-    if args.as_of is not None:
-        try:
-            as_of = interpretar_as_of(args.as_of, agora.date())
-        except ValueError as erro:
-            raise _Erro(str(erro)) from None
     modo_contato = "nenhum" if args.sem_contato else "captura"
     try:
-        ctx = criar_contexto(args.url, as_of, modo_contato, args.cego, config.casos_dir, agora)
-    except ErroNo as erro:
-        raise _Erro("alvo inválido" if args.cego else erro.mensagem) from None  # o modo cego não repete o alvo
-    except FileExistsError:
-        raise _Erro("já existe uma execução deste alvo iniciada neste segundo; chame de novo") from None
+        ctx = iniciar_execucao(args.url, args.as_of, modo_contato, args.cego, config.casos_dir)
+    except ErroIniciar as erro:
+        raise _Erro(str(erro)) from None
     # o run_id sai antes de a coleta começar: ela leva minutos, e uma falha no meio não pode escondê-lo
     print(ctx.run_id, flush=True)
     for pendencia in asyncio.run(_rodar(config, ctx)):
@@ -105,7 +108,7 @@ def _coletar(args: argparse.Namespace) -> int:
 
 def _verificar(args: argparse.Namespace) -> int:
     pasta = _pasta_da_execucao(carregar_config(), args.run_id)
-    problemas = verificar(pasta)
+    problemas = _custodia_sem_registros(pasta) or verificar(pasta)
     if not problemas:
         print("custódia íntegra")
         return 0
@@ -116,8 +119,6 @@ def _verificar(args: argparse.Namespace) -> int:
 
 def _dossie(args: argparse.Namespace) -> int:
     pasta = _pasta_da_execucao(carregar_config(), args.run_id)
-    if not (pasta / "estado.json").is_file():
-        raise _Erro("execução sem estado.json")
     try:
         caminho = gerar_dossie(pasta, carregar_matriz(), args.forcar)
     except PendenciasAbertas as erro:
@@ -135,11 +136,10 @@ def _diff(args: argparse.Namespace) -> int:
         anterior, atual = escolher_execucoes(config.casos_dir, args.slug, args.a, args.b)
     except ErroComparacao as erro:
         raise _Erro(str(erro)) from None
-    print(f"comparando {anterior} com {atual}", file=sys.stderr)
     diff = comparar(
         carregar_execucao(config.casos_dir / anterior), carregar_execucao(config.casos_dir / atual), carregar_matriz()
     )
-    sys.stdout.write(renderizar_diff(diff))
+    sys.stdout.write(f"# Mudanças de {anterior} para {atual}\n\n{renderizar_diff(diff)}")
     return 0
 
 
@@ -190,7 +190,8 @@ def _parser() -> argparse.ArgumentParser:
         parents=[comum],
         help="gera o dossiê e imprime o caminho",
         description="Gera o dossiê e imprime o caminho do dossie.md. Com pendências abertas e sem --forcar, imprime "
-        "as pendências no stderr e sai com 2.",
+        "as pendências no stderr e sai com 2. Para terminar uma execução interrompida, use `radar mcp` e a "
+        "ferramenta gerar_dossie.",
     )
     dossie.add_argument("run_id", metavar="RUN_ID", help="<slug>/<AAAA-MM-DD_HHMMSS>, dentro de casos/")
     dossie.add_argument("--forcar", action="store_true", help="gera com pendências abertas (viram não verificado)")

@@ -21,7 +21,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from radar import mcp_server
+from radar import execucao, mcp_server
 from radar.arquivos import ler_json
 from radar.config import Config
 from radar.custodia import verificar
@@ -197,7 +197,7 @@ def relogio(monkeypatch):
     """Um segundo a mais a cada execução criada: duas execuções do mesmo alvo nunca caem no mesmo carimbo."""
     inicio = datetime.now().replace(microsecond=0)
     segundos = itertools.count()
-    monkeypatch.setattr(mcp_server, "_agora", lambda: inicio + timedelta(seconds=next(segundos)))
+    monkeypatch.setattr(execucao, "agora", lambda: inicio + timedelta(seconds=next(segundos)))
 
 
 @pytest.fixture
@@ -319,6 +319,16 @@ async def test_iniciar_recusa_entrada_invalida(abrir, tmp_path):
         "modo_contato inválido"
     )
     assert not (tmp_path / "casos").exists()  # nada foi criado
+
+
+async def test_iniciar_no_mesmo_segundo_recusa_a_segunda(abrir, monkeypatch):
+    monkeypatch.setattr(execucao, "agora", lambda: datetime(2026, 10, 8, 12, 0, 0))
+    srv = await abrir()
+    await iniciar(srv)
+    esperado = {"erro": "já existe uma execução deste alvo iniciada neste segundo; chame de novo"}
+    assert await chamar(srv, "iniciar_analise", alvo=ALVO) == esperado
+    await iniciar(srv, modo_cego=True)  # o slug opaco é outro: esta passa, e a repetição dela é recusada igual
+    assert await chamar(srv, "iniciar_analise", alvo=ALVO, modo_cego=True) == esperado
 
 
 async def test_iniciar_retroativo_guarda_o_as_of(abrir, tmp_path):
@@ -599,7 +609,7 @@ async def test_listar_casos_e_comparar_execucoes(abrir, tmp_path, monkeypatch):
     srv = await abrir()
     assert await chamar(srv, "listar_casos") == {"casos": {}}
     horarios = iter([datetime(2026, 10, 1, 9, 0, 0), datetime(2026, 10, 7, 9, 0, 0), datetime(2026, 10, 8, 9, 0, 0)])
-    monkeypatch.setattr(mcp_server, "_agora", lambda: next(horarios))
+    monkeypatch.setattr(execucao, "agora", lambda: next(horarios))
     primeira = await iniciar(srv)
     assert (await chamar(srv, "comparar_execucoes", alvo=ALVO))["erro"].startswith("são necessárias duas execuções")
     segunda = await iniciar(srv)

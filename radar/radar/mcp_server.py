@@ -51,12 +51,12 @@ from radar.dossie import PendenciasAbertas
 from radar.dossie import gerar_dossie as escrever_dossie
 from radar.execucao import (
     ErroComparacao,
+    ErroIniciar,
     carregar_execucao,
-    criar_contexto,
     criar_indices,
     criar_servicos,
     escolher_execucoes,
-    interpretar_as_of,
+    iniciar_execucao,
     pasta_do_run,
 )
 from radar.execucao import listar_casos as casos_em_disco
@@ -103,13 +103,8 @@ _FOLGA_DO_CORTE = 2000
 _MIN_CANDIDATOS = 5  # por categoria, quando a pendência não cabe no teto
 _RESERVA_DO_AVISO = 64  # caracteres para o "aviso" que a pendência cortada ganha
 _POSICAO_DA_PENDENCIA = {pid: i for i, pid in enumerate(DEFINICOES)}  # P-CNPJ, eixo 1 na ordem da spec, P-E
-_MODOS_DE_CONTATO = ("captura", "nenhum")
 
 _log = logging.getLogger(__name__)
-
-
-def _agora() -> datetime:
-    return datetime.now()
 
 
 # ---------------------------------------------------------------------------- saída
@@ -531,21 +526,10 @@ class _Radar:
     # --- ferramentas ---------------------------------------------------------------------------
 
     async def iniciar_analise(self, alvo: str, as_of: str | None, modo_contato: str, modo_cego: bool) -> dict:
-        if modo_contato not in _MODOS_DE_CONTATO:
-            return {"erro": "modo_contato inválido: use 'captura' ou 'nenhum'"}
-        agora = _agora()
-        data = None
-        if as_of is not None:
-            try:
-                data = interpretar_as_of(as_of, agora.date())
-            except ValueError as erro:
-                return {"erro": str(erro)}
         try:
-            ctx = criar_contexto(alvo, data, modo_contato, modo_cego, self.config.casos_dir, agora)
-        except ErroNo as erro:
-            return {"erro": "alvo inválido" if modo_cego else erro.mensagem}  # o modo cego não ecoa o alvo
-        except FileExistsError:
-            return {"erro": "já existe uma execução deste alvo iniciada neste segundo; chame de novo"}
+            ctx = iniciar_execucao(alvo, as_of, modo_contato, modo_cego, self.config.casos_dir)
+        except ErroIniciar as erro:
+            return {"erro": str(erro)}
         servicos = criar_servicos(self.config, ctx.pasta, self.rede, self.indices, self.matriz)
         ex = _Execucao(Motor(ctx, self._nos(), servicos), servicos)
         self._execucoes[ctx.run_id] = ex

@@ -1,4 +1,13 @@
-"""Execuções em disco: criar a pasta e o contexto, montar os serviços, listar e carregar o que o motor gravou."""
+"""Execuções em disco: o que o motor grava em `casos/<slug>/<AAAA-MM-DD_HHMMSS>` e o que a CLI e o servidor MCP
+precisam para criá-las, achá-las e compará-las. Nada aqui fala com a rede.
+
+- Criar: `iniciar_execucao` (valida `modo_contato` e `as_of`, cria a pasta e o `Contexto` e só devolve erros que podem
+  ser mostrados: no modo cego não repetem o alvo), `criar_contexto` (o slug opaco do modo cego vem do segredo local),
+  `criar_servicos` e `criar_indices`.
+- Achar: `pasta_do_run` (valida o `run_id`), `listar_casos`, `em_modo_atual`, `execucao_anterior`, `execucao_cega`.
+- Carregar: `carregar_execucao` (o que o motor gravou, sem interpretação).
+- Comparar: `escolher_execucoes` (o par do diff e o bloqueio do modo cego).
+"""
 
 from __future__ import annotations
 
@@ -34,19 +43,28 @@ _BYTES_DO_SEGREDO = 32
 # outro processo pode ter acabado de criar o segredo e ainda estar escrevendo: até ~1 s de espera
 _LEITURAS_DO_SEGREDO = 20
 _ESPERA_DO_SEGREDO_S = 0.05
+MODOS_DE_CONTATO = ("captura", "nenhum")
 
 
-def interpretar_as_of(texto: str, hoje: date) -> date:
-    """`AAAA-MM-DD` como data, nunca posterior a `hoje`. O que não serve levanta `ValueError` com a mensagem a
-    mostrar."""
+class ErroIniciar(ValueError):
+    """A execução não pôde ser criada. A mensagem pode ser mostrada como está: no modo cego ela não repete o alvo."""
+
+
+def agora() -> datetime:
+    """O instante em que a execução começa (carimbo da pasta e `data_execucao`). Os testes trocam."""
+    return datetime.now()
+
+
+def _interpretar_as_of(texto: str, hoje: date) -> date:
+    """`AAAA-MM-DD` como data, nunca posterior a `hoje`; senão `ErroIniciar`."""
     try:
         if not _DATA_ISO.fullmatch(texto):  # `fromisoformat` também aceitaria `20260101` e `2026-W41-4`
             raise ValueError(texto)
         data = date.fromisoformat(texto)
     except (TypeError, ValueError):
-        raise ValueError("as_of inválido: use AAAA-MM-DD") from None
+        raise ErroIniciar("as_of inválido: use AAAA-MM-DD") from None
     if data > hoje:
-        raise ValueError("as_of posterior a hoje")
+        raise ErroIniciar("as_of posterior a hoje")
     return data
 
 
@@ -99,6 +117,25 @@ def criar_contexto(
         ctx = ctx.model_copy(update={"slug": slug, "run_id": f"{slug}/{carimbo}", "pasta": pasta})
     ctx.pasta.mkdir(parents=True, exist_ok=False)
     return ctx
+
+
+def iniciar_execucao(entrada: str, as_of: str | None, modo_contato: str, modo_cego: bool, casos_dir: Path) -> Contexto:
+    """`criar_contexto` para quem recebe o pedido do usuário (a CLI e o servidor MCP), na hora de `agora()`.
+
+    Confere `modo_contato` (`MODOS_DE_CONTATO`) e `as_of` (texto `AAAA-MM-DD`, nunca depois de hoje; `None` vale hoje)
+    e traduz as falhas em `ErroIniciar`: alvo inválido (`alvo inválido` no modo cego, que não repete o alvo; no modo
+    aberto, a mensagem do `normalizar_alvo`) e outra execução do mesmo alvo no mesmo segundo.
+    """
+    if modo_contato not in MODOS_DE_CONTATO:
+        raise ErroIniciar("modo_contato inválido: use 'captura' ou 'nenhum'")
+    momento = agora()
+    data = None if as_of is None else _interpretar_as_of(as_of, momento.date())
+    try:
+        return criar_contexto(entrada, data, modo_contato, modo_cego, casos_dir, momento)
+    except ErroNo as erro:
+        raise ErroIniciar("alvo inválido" if modo_cego else erro.mensagem) from None
+    except FileExistsError:
+        raise ErroIniciar("já existe uma execução deste alvo iniciada neste segundo; chame de novo") from None
 
 
 def segredo_cego(casos_dir: Path) -> bytes:

@@ -8,19 +8,20 @@ from __future__ import annotations
 
 import io
 import re
+import shutil
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
-from radar import cli, mcp_server
+from radar import cli, execucao, mcp_server
 from radar.arquivos import ler_json
 from radar.config import Config
 from radar.diff import comparar, renderizar_diff
 from radar.execucao import carregar_execucao
 from radar.indices import Indices
-from radar.modelos import Aguardando
+from radar.modelos import Aguardando, Feito
 from radar.motor import NoBase
 from radar.nos.alvo import AlvoNo
 from radar.pendencias.definicoes import DEFINICOES, nova_pendencia
@@ -51,6 +52,17 @@ class PendFalsa(NoBase):
         return Aguardando([nova_pendencia("P-A1", ctx, [], self.nome, s.matriz)])
 
 
+class ColetaFalsa(NoBase):
+    """Guarda uma página na custódia, como a captura faria."""
+
+    nome = "coleta"
+    entradas = ("alvo",)
+
+    async def executar(self, ctx, entradas, respostas, s):
+        html = s.custodia.guardar(b"<html>pagina</html>", "html", tipo="pagina", origem=ctx.url_inicial)
+        return Feito({"html": html})
+
+
 @pytest.fixture
 def casos(tmp_path, monkeypatch) -> Path:
     """A `casos/` desta execução de teste: é a que a CLI lê."""
@@ -63,7 +75,7 @@ def casos(tmp_path, monkeypatch) -> Path:
 def relogio(monkeypatch):
     """Um segundo a mais a cada execução criada: duas coletas do mesmo alvo nunca caem no mesmo carimbo."""
     segundos = iter(range(10_000))
-    monkeypatch.setattr(cli, "_agora", lambda: HOJE + timedelta(seconds=next(segundos)))
+    monkeypatch.setattr(execucao, "agora", lambda: HOJE + timedelta(seconds=next(segundos)))
 
 
 @pytest.fixture
@@ -128,6 +140,38 @@ def test_verificar_um_problema_por_linha(casos, capsys):
     ]
 
 
+def test_verificar_execucao_coletada(casos, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "nos_do_nucleo", lambda: [AlvoNo(), ColetaFalsa()])
+    run_id = coletar(capsys, "exemplo.com.br")
+    assert cli.main(["verificar", run_id]) == 0
+    assert capsys.readouterr().out == "custódia íntegra\n"
+
+    (artefato,) = (casos / run_id / "artefatos").glob("*.html")
+    artefato.write_bytes(b"adulterado")
+    assert cli.main(["verificar", run_id]) == 1
+    assert capsys.readouterr().out == f"artefato alterado: sha256:{artefato.stem}\n"
+
+
+def test_verificar_sem_custodia_log_nao_e_integra(casos, capsys):
+    """`custodia.verificar` devolve `[]` sem log: a CLI não pode chamar isso de íntegro."""
+    pasta = gravar(casos)
+    (pasta / "custodia.log").unlink()  # os artefatos ficam
+    assert cli.main(["verificar", run_id_de(pasta)]) == 1
+    saida = capsys.readouterr()
+    assert (saida.out, saida.err) == ("custodia.log ausente\n", "")
+
+    (pasta / "custodia.log").write_bytes(b"")  # log esvaziado, artefatos ainda lá
+    assert cli.main(["verificar", run_id_de(pasta)]) == 1
+    assert capsys.readouterr().out == "custodia.log vazio\n"
+
+    shutil.rmtree(pasta / "artefatos")  # nada para conferir
+    assert cli.main(["verificar", run_id_de(pasta)]) == 1
+    assert capsys.readouterr().out == "sem registros de custódia\n"
+    (pasta / "custodia.log").unlink()
+    assert cli.main(["verificar", run_id_de(pasta)]) == 1
+    assert capsys.readouterr().out == "sem registros de custódia\n"
+
+
 # ---------------------------------------------------------------------------- dossie
 
 
@@ -158,11 +202,13 @@ def test_dossie_sem_pendencias_imprime_o_caminho(casos, capsys):
     assert (pasta / "dossie.md").is_file()
 
 
-def test_dossie_de_pasta_sem_estado(casos, capsys):
-    (casos / "exemplo-com-br" / "2026-10-07_120000").mkdir(parents=True)
-    assert cli.main(["dossie", "exemplo-com-br/2026-10-07_120000"]) == 2
+@pytest.mark.parametrize("comando", ["verificar", "dossie"])
+def test_pasta_sem_estado_sai_com_2(casos, capsys, comando):
+    pasta = gravar(casos)  # com custódia e artefatos, mas sem o estado.json: não é uma execução
+    (pasta / "estado.json").unlink()
+    assert cli.main([comando, run_id_de(pasta)]) == 2
     saida = capsys.readouterr()
-    assert saida.out == "" and "sem estado.json" in saida.err
+    assert (saida.out, saida.err) == ("", "erro: execução sem estado.json\n")
 
 
 # ---------------------------------------------------------------------------- run_id
@@ -285,7 +331,7 @@ def test_coletar_alvo_invalido_sai_com_2(casos, nos_falsos, capsys):
 
 
 def test_coletar_no_mesmo_segundo_sai_com_2(casos, nos_falsos, monkeypatch, capsys):
-    monkeypatch.setattr(cli, "_agora", lambda: HOJE)
+    monkeypatch.setattr(execucao, "agora", lambda: HOJE)
     assert cli.main(["coletar", "exemplo.com.br"]) == 0
     capsys.readouterr()
     assert cli.main(["coletar", "exemplo.com.br"]) == 2
@@ -328,9 +374,9 @@ def test_diff_padrao_compara_as_duas_ultimas_em_modo_atual(casos, capsys):
 
     assert cli.main(["diff", "exemplo-com-br"]) == 0
     saida = capsys.readouterr()
-    assert saida.out == esperado
+    assert saida.out == f"# Mudanças de {run_id_de(a)} para {run_id_de(b)}\n\n{esperado}"
     assert "- Itens que mudaram:\n  - A1: confirmado (3) → não encontrado (0)" in saida.out
-    assert saida.err == f"comparando {run_id_de(a)} com {run_id_de(b)}\n"
+    assert saida.err == ""
 
 
 def test_diff_com_a_e_b(casos, capsys):
@@ -342,10 +388,11 @@ def test_diff_com_a_e_b(casos, capsys):
     # o alvo pode ser o domínio; a e b valem como run_id ou como carimbo, em qualquer ordem
     assert cli.main(["diff", "https://exemplo.com.br/", "--a", b.name, "--b", run_id_de(a)]) == 0
     saida = capsys.readouterr()
-    assert saida.out == esperado and saida.err == f"comparando {run_id_de(a)} com {run_id_de(b)}\n"
+    assert saida.out == f"# Mudanças de {run_id_de(a)} para {run_id_de(b)}\n\n{esperado}" and saida.err == ""
     # só b: a anterior a ele em modo atual
     assert cli.main(["diff", "exemplo-com-br", "--b", c.name]) == 0
-    assert capsys.readouterr().err == f"comparando {run_id_de(b)} com {run_id_de(c)}\n"
+    saida = capsys.readouterr()
+    assert saida.out.splitlines()[0] == f"# Mudanças de {run_id_de(b)} para {run_id_de(c)}" and saida.err == ""
 
     assert cli.main(["diff", "exemplo-com-br", "--a", "2020-01-01_000000"]) == 2
     assert capsys.readouterr().err == "erro: execução não encontrada: 2020-01-01_000000\n"
