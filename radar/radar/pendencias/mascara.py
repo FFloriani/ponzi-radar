@@ -17,6 +17,7 @@ from functools import lru_cache
 from html.parser import HTMLParser
 from typing import Any
 
+from radar.nos.alvo import dominio_registravel
 from radar.texto import decodificar, normalizar
 
 # trocar um termo curto mudaria palavras comuns do texto
@@ -29,6 +30,8 @@ _PARTES_DO_TERMO = re.compile(r"[\s.\-/]+")
 # o hífen só separa partes do título quando está solto ("Marca - Slogan"): em "pré-venda" ele é da palavra
 _SEPARADORES_DO_TITULO = re.compile(r"\s*[|–—·:]\s*|\s+-\s+")
 _CNPJ = re.compile(r"[0-9a-z]{12}[0-9]{2}")
+# os marcadores que `montar_mascara` produz
+MARCADOR = re.compile(r"\[(?:alvo|empresa|cnpj|pessoa_\d+)\]", re.IGNORECASE)
 
 
 class _Identidade(HTMLParser):
@@ -60,13 +63,28 @@ class _Identidade(HTMLParser):
             self._buffer = None
 
 
-def _identidade_da_pagina(html: str) -> list[str]:
+def _identidade_da_pagina(html: str) -> tuple[list[str], str | None]:
     """As partes do título (partido nos separadores) e o `og:site_name`."""
     identidade = _Identidade()
     identidade.feed(html)
     identidade.close()
     partes = _SEPARADORES_DO_TITULO.split(identidade.titulo) if identidade.titulo else []
-    return [*partes, *([identidade.site_name] if identidade.site_name else [])]
+    return partes, identidade.site_name
+
+
+def _palavras(texto: Any) -> set[str]:
+    """As palavras do texto dobrado (sem acento nem caixa) com 4 caracteres ou mais."""
+    if not isinstance(texto, str):
+        return set()
+    return {p for p in re.findall(r"[^\W_]+", normalizar(texto)) if len(p) >= _MINIMO_DE_CARACTERES}
+
+
+def _parte_do_titulo_vale(parte: str, referencias: set[str]) -> bool:
+    """Uma parte do título só vira `[EMPRESA]` se ligar ao site: sem número nem "%" (uma promessa no título não
+    é o nome de ninguém) e com ao menos uma palavra das `referencias`."""
+    if "%" in parte or any(c.isdigit() for c in parte):
+        return False
+    return not _palavras(parte).isdisjoint(referencias)
 
 
 def _formas_idn(dominio: str) -> list[str]:
@@ -76,6 +94,19 @@ def _formas_idn(dominio: str) -> list[str]:
     except UnicodeError:  # rótulo inválido: fica só o que veio
         return [dominio]
     return [dominio, outra]
+
+
+def _palavras_do_rotulo(dominio: str) -> set[str]:
+    """As palavras do rótulo do domínio registrável (`exemplo` em `app.exemplo.com.br`; o sufixo público não
+    conta), nas grafias punycode e Unicode."""
+    ascii_ = next((forma for forma in _formas_idn(dominio) if forma.isascii()), "")
+    registravel = dominio_registravel(ascii_) if ascii_ else ""
+    if not registravel:
+        return set()
+    palavras: set[str] = set()
+    for forma in _formas_idn(registravel.split(".")[0]):
+        palavras |= _palavras(forma)
+    return palavras
 
 
 def _no(saidas: dict[str, dict], nome: str) -> dict:
@@ -92,8 +123,11 @@ def montar_mascara(saidas: dict[str, dict], ler_artefato: Callable[[str], bytes]
     `Custodia.ler`) só é chamado para o HTML da página inicial, de onde saem o `<title>` e o `og:site_name`.
 
     - `alvo.dominio` e `ct.sans` (o domínio e os subdomínios), nas duas grafias se forem IDN -> `[ALVO]`;
-    - `cnpj.razao_social`, `cnpj.nome_fantasia`, cada parte do título da página inicial (partido em `| – — - · :`)
-      e o `og:site_name` -> `[EMPRESA]`;
+    - `cnpj.razao_social`, `cnpj.nome_fantasia` e o `og:site_name` da página inicial -> `[EMPRESA]`;
+    - cada parte do título da página inicial (partido em `| – — · :` e em " - ") que tenha uma palavra (4
+      caracteres ou mais, dobrada) em comum com o rótulo do domínio, o `og:site_name`, a razão social ou o nome
+      fantasia, e nenhum dígito nem "%" -> `[EMPRESA]`. Um título como "Marca | Rendimento de 1,5% ao dia" ou
+      "Investimentos - Marca" não faz da promessa ou da palavra genérica o nome da empresa;
     - `cnpj.cnpj`, formatado e só com os caracteres (numérico ou alfanumérico) -> `[CNPJ]`;
     - `cnpj.socios[].nome` -> `[PESSOA_n]`, com n a posição do sócio no quadro.
 
@@ -112,23 +146,32 @@ def montar_mascara(saidas: dict[str, dict], ler_artefato: Callable[[str], bytes]
         vistos.add(termo.casefold())
         mascara[termo] = marcador
 
+    referencias: set[str] = set()  # as palavras que ligam uma parte do título ao site
     dominios = [_no(saidas, "alvo").get("dominio")]
     sans = _no(saidas, "ct").get("sans")
     for dominio in [*dominios, *(sans if isinstance(sans, list) else [])]:
         if isinstance(dominio, str):
+            referencias |= _palavras_do_rotulo(dominio.strip())
             for forma in _formas_idn(dominio.strip()):
                 adicionar(forma, "[ALVO]")
 
     cnpj = _no(saidas, "cnpj")
-    adicionar(cnpj.get("razao_social"), "[EMPRESA]")
-    adicionar(cnpj.get("nome_fantasia"), "[EMPRESA]")
+    for nome_da_empresa in (cnpj.get("razao_social"), cnpj.get("nome_fantasia")):
+        referencias |= _palavras(nome_da_empresa)
+        adicionar(nome_da_empresa, "[EMPRESA]")
+    partes_do_titulo: list[str] = []
     for nome in _NOS_DE_PAGINAS:
         paginas = _no(saidas, nome).get("paginas")
         inicial = paginas[0] if isinstance(paginas, list) and paginas else None
         ref = inicial.get("html") if isinstance(inicial, dict) else None
         if isinstance(ref, str) and ref:  # a captura barrada por anti-bot não tem HTML
-            for termo in _identidade_da_pagina(decodificar(ler_artefato(ref), "text/html")):
-                adicionar(termo, "[EMPRESA]")
+            partes, site_name = _identidade_da_pagina(decodificar(ler_artefato(ref), "text/html"))
+            referencias |= _palavras(site_name)
+            adicionar(site_name, "[EMPRESA]")
+            partes_do_titulo.extend(partes)
+    for parte in partes_do_titulo:
+        if _parte_do_titulo_vale(parte, referencias):
+            adicionar(parte, "[EMPRESA]")
 
     numero = cnpj.get("cnpj")
     if isinstance(numero, str):

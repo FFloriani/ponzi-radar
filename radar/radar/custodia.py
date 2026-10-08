@@ -113,6 +113,22 @@ class Custodia:
     def ler(self, ref: str) -> bytes:
         return self.caminho(ref).read_bytes()
 
+    def tipos(self, ref: str) -> set[str]:
+        """Os `tipo` com que o conteúdo de `ref` foi registrado no log. O arquivo é um só, mas o mesmo conteúdo
+        pode ter sido guardado mais de uma vez, com tipos diferentes. Linha ilegível do log é ignorada."""
+        hex_ = _hex_de(ref)
+        if not self._log.exists():
+            return set()
+        tipos: set[str] = set()
+        for linha in _ler_linhas(self._log):
+            try:
+                registro = json.loads(linha)
+            except ValueError:
+                continue
+            if isinstance(registro, dict) and registro.get("sha256") == hex_ and isinstance(registro.get("tipo"), str):
+                tipos.add(registro["tipo"])
+        return tipos
+
     def _proxima_posicao(self) -> tuple[int, str]:
         """`seq` e `prev` da próxima linha, a partir da última do log."""
         if not self._log.exists():

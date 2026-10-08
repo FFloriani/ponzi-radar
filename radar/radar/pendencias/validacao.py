@@ -4,20 +4,21 @@
 
 1. esquema do `valor` (e, na P-E, tipos de sinal, modificadores e índices de evidência contra a matriz);
 2. fonte de cada evidência: `sha256:<hex>` da custódia ou URL http(s), que `arquivar_fonte` baixa;
-3. trecho: com pelo menos 12 caracteres e 2 palavras, e existente no texto da fonte, comparado sem caixa, acento,
-   aspas curvas nem espaços repetidos (PDF: sem nenhum espaço, porque a extração parte palavras). No modo cego,
-   o trecho também pode citar os marcadores da máscara (`[EMPRESA] paga 1% ao mês`);
+3. trecho: com pelo menos 12 caracteres e 2 palavras (os marcadores da máscara não contam; no PDF os caracteres
+   são contados sem espaços), e existente no texto da fonte, comparado sem caixa, acento, aspas curvas nem
+   espaços repetidos (PDF: sem nenhum espaço, porque a extração parte palavras). No modo cego, o trecho também
+   pode citar os marcadores da máscara (`[EMPRESA] paga 1% ao mês`);
 4. data: no modo retroativo, nem a `data_fonte` nem a data que a página declara ter sido publicada passam do `as_of`.
 
 A evidência cuja fonte não dá para conferir (rede indisponível, corpo grande demais, imagem sem OCR, binário, PDF
 sem texto) entra com a marca `trecho_nao_conferido`; a sem data, com `data_desconhecida`.
 
 `arquivar_fonte` é o único lugar por onde uma URL dada pelo Claude chega à rede. Ele recusa o que não é fonte
-pública: esquema que não é http(s), `localhost`, IP ou nome que resolve para IP não global, o alvo (só o nó
-`captura` o visita) e serviços que fazem um terceiro visitar o alvo. Cada salto de redirect passa pelas mesmas
-regras: sem isso, um endereço público que redireciona para `http://127.0.0.1/` passaria. Com proxy configurado o
-nome não é resolvido aqui (quem resolve é o proxy). A resolução e a conexão são consultas separadas: um nome que
-muda de IP entre elas (DNS rebinding) não é detectado.
+pública: esquema que não é http(s), `localhost`, nome malformado, IP ou nome que resolve para IP não global, o
+alvo e o IP dele (só o nó `captura` o visita) e serviços que fazem um terceiro visitar o alvo. Cada salto de
+redirect passa pelas mesmas regras: sem isso, um endereço público que redireciona para `http://127.0.0.1/`
+passaria. Com proxy configurado o nome não é resolvido aqui (quem resolve é o proxy). A resolução e a conexão são
+consultas separadas: um nome que muda de IP entre elas (DNS rebinding) não é detectado.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from radar.motor import Servicos
 from radar.nos.alvo import dominio_registravel
 from radar.pendencias.definicoes import DEFINICOES, validos_da_matriz
 from radar.pendencias.esquemas import ValorE
-from radar.pendencias.mascara import mascarar
+from radar.pendencias.mascara import MARCADOR, mascarar
 from radar.rede import ErroRede
 from radar.texto import decodificar, normalizar, texto_de_html, texto_de_pdf
 
@@ -53,6 +54,11 @@ _SALVAR_NO_WAYBACK = re.compile(r"/+save(?:/|$)", re.IGNORECASE)
 _MAX_REDIRECTS = 10  # como a Rede
 _MAX_BYTES = 10_000_000  # corpo maior que isto não é guardado nem lido
 _MAX_ERROS_NO_MOTIVO = 3
+_MAX_HOST = 253  # tamanho máximo de um nome de host, e de cada rótulo dele, em caracteres
+_MAX_ROTULO = 63
+_BOM_UTF8 = b"\xef\xbb\xbf"
+# o nome não existe (e não é falha passageira do resolvedor): `EAI_NONAME` e, onde existe, `EAI_NODATA`
+_NOME_INEXISTENTE = frozenset(c for c in (socket.EAI_NONAME, getattr(socket, "EAI_NODATA", None)) if c is not None)
 _MIN_CARACTERES_DO_TRECHO = 12
 _MIN_PALAVRAS_DO_TRECHO = 2
 
@@ -107,9 +113,34 @@ class Validacao:
     marcas: list[str] = field(default_factory=list)
 
 
+def _ext_pelo_conteudo(corpo: bytes) -> str:
+    """Tipo ausente, desconhecido ou `octet-stream`: o conteúdo diz. `<` no começo (depois de BOM e espaços) é
+    HTML; UTF-8 válido e sem NUL é texto; o resto é binário."""
+    if corpo.removeprefix(_BOM_UTF8).lstrip().startswith(b"<"):
+        return "html"
+    if b"\x00" in corpo:
+        return "bin"
+    try:
+        corpo.decode("utf-8")
+    except UnicodeDecodeError:
+        return "bin"
+    return "txt"
+
+
+def _tipo_para_decodificar(content_type: str, ext: str) -> str:
+    """O `Content-Type` com que `decodificar` lê o corpo: o HTML farejado sem tipo de HTML é lido como tal (o
+    `<meta charset>` vale) e o texto farejado sem tipo é UTF-8."""
+    base, _, parametros = content_type.partition(";")
+    if ext == "html" and "html" not in base.lower():
+        return "text/html" + (f";{parametros}" if parametros else "")
+    if ext == "txt" and not base.strip():
+        return "text/plain"
+    return content_type
+
+
 def _ext_do_tipo(content_type: str, corpo: bytes) -> str:
     """A extensão do artefato: `pdf` se o corpo começa por `%PDF-` (seja qual for o tipo declarado), senão a mais
-    próxima do `Content-Type`; tipo ausente ou desconhecido é `bin`."""
+    próxima do `Content-Type`; tipo ausente ou desconhecido, pelo conteúdo (`html`, `txt` ou `bin`)."""
     if corpo.startswith(b"%PDF-"):
         return "pdf"
     tipo = content_type.partition(";")[0].strip().lower()
@@ -123,7 +154,7 @@ def _ext_do_tipo(content_type: str, corpo: bytes) -> str:
         return "img"
     if tipo.startswith("text/"):
         return "txt"
-    return "bin"
+    return _ext_pelo_conteudo(corpo)
 
 
 # --- data de publicação -----------------------------------------------------------------------------------
@@ -233,14 +264,30 @@ def _classe_nao_publica(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> st
     return classe or (None if ip.is_global else "não global")
 
 
+def _rotulos_validos(host: str) -> bool:
+    """Nome de host com 1 a 63 caracteres por rótulo e até 253 no total. O resto o `idna` do `getaddrinfo` não
+    codifica (`UnicodeError`) e a conexão da `Rede` também não faria."""
+    return len(host) <= _MAX_HOST and all(0 < len(rotulo) <= _MAX_ROTULO for rotulo in host.split("."))
+
+
 async def _enderecos_do_nome(host: str, timeout: float) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
-    """Os endereços do nome. Nome que não resolve (ou resolução que demora demais) devolve `[]`: quem falha em
-    seguida é a conexão da `Rede`, com `ErroRede`."""
+    """Os endereços do nome. `ErroNo` se o nome é inválido para o resolvedor ou não existe. Outra falha de
+    resolução (ou resolução que demora demais) devolve `[]`: quem falha em seguida é a conexão da `Rede`, com
+    `ErroRede`."""
     try:
         infos = await asyncio.wait_for(
             asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM), timeout
         )
-    except (OSError, TimeoutError):  # `socket.gaierror` é um `OSError`
+    except ValueError as erro:  # inclui `UnicodeError`, do codec `idna`: "label empty", "label too long"
+        raise _recusa("host inválido") from erro
+    except socket.gaierror as erro:
+        if erro.errno in _NOME_INEXISTENTE:
+            raise ErroNo(
+                "fonte não encontrada (domínio inexistente); cite uma URL existente ou o snapshot do Wayback",
+                permanente=True,
+            ) from erro
+        return []
+    except (OSError, TimeoutError):
         return []
     enderecos = []
     for info in infos:
@@ -251,8 +298,31 @@ async def _enderecos_do_nome(host: str, timeout: float) -> list[ipaddress.IPv4Ad
     return enderecos
 
 
-async def _checar_destino(url: str, ctx: Contexto, s: Servicos) -> None:
-    """`ErroNo` permanente "fonte recusada: ..." se `url` não é uma fonte pública que se possa visitar."""
+def _forma_canonica(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
+    return str(getattr(ip, "ipv4_mapped", None) or ip)
+
+
+def _canonicos(ips: set[str] | None) -> frozenset[str]:
+    """Os IPs na forma canônica (`2606:2800:0220::1` e `2606:2800:220::1` são o mesmo); o que não é IP sai."""
+    canonicos = set()
+    for ip in ips or ():
+        try:
+            canonicos.add(_forma_canonica(ipaddress.ip_address(str(ip).strip())))
+        except ValueError:
+            continue
+    return frozenset(canonicos)
+
+
+def _recusa_do_alvo(ctx: Contexto) -> ErroNo:
+    if ctx.modo_cego:
+        return _recusa(_MOTIVO_ALVO_CEGO)
+    return _recusa(_MOTIVO_ALVO_NENHUM if ctx.modo_contato == "nenhum" else _MOTIVO_ALVO)
+
+
+async def _checar_destino(url: str, ctx: Contexto, s: Servicos, ips_do_alvo: frozenset[str]) -> None:
+    """`ErroNo` permanente se `url` não é uma fonte pública que se possa visitar: "fonte recusada: ..." ou, para
+    um nome que não existe, "fonte não encontrada (domínio inexistente)...". `ips_do_alvo` são os IPs do alvo
+    (na forma canônica): um IP literal deles é o próprio alvo."""
     try:
         destino = httpx.URL(url)
         # o host de rede (IDNA/punycode), não o `.host`, que vem em Unicode e não bateria com `ctx.alvo`
@@ -261,7 +331,7 @@ async def _checar_destino(url: str, ctx: Contexto, s: Servicos) -> None:
     except httpx.InvalidURL as erro:
         raise _recusa(f"URL inválida ({erro})") from erro
     except UnicodeError as erro:
-        raise _recusa(f"host inválido ({erro})") from erro
+        raise _recusa("host inválido") from erro
     if destino.scheme not in ("http", "https"):
         raise _recusa(f"esquema não permitido ({destino.scheme or 'nenhum'}); use http ou https")
     if not host:
@@ -276,10 +346,10 @@ async def _checar_destino(url: str, ctx: Contexto, s: Servicos) -> None:
     ip = _ip_literal(host)
     if ip is not None and (classe := _classe_nao_publica(ip)):
         raise _recusa(f"IP não público ({classe}): {host}")
-    if dominio_registravel(host) == ctx.alvo:
-        if ctx.modo_cego:
-            raise _recusa(_MOTIVO_ALVO_CEGO)
-        raise _recusa(_MOTIVO_ALVO_NENHUM if ctx.modo_contato == "nenhum" else _MOTIVO_ALVO)
+    if ip is None and not _rotulos_validos(host):
+        raise _recusa("host inválido")
+    if (ip is not None and _forma_canonica(ip) in ips_do_alvo) or dominio_registravel(host) == ctx.alvo:
+        raise _recusa_do_alvo(ctx)
     if ip is None and not s.config.rede.proxy:
         for endereco in await _enderecos_do_nome(host, s.config.rede.timeout_s):
             if classe := _classe_nao_publica(endereco):
@@ -305,10 +375,10 @@ class _Arquivo:
     data_forte: date | None
 
 
-async def _arquivar(url: str, ctx: Contexto, s: Servicos) -> _Arquivo:
+async def _arquivar(url: str, ctx: Contexto, s: Servicos, ips_do_alvo: frozenset[str]) -> _Arquivo:
     atual = url
     for _ in range(_MAX_REDIRECTS + 1):
-        await _checar_destino(atual, ctx, s)
+        await _checar_destino(atual, ctx, s, ips_do_alvo)
         # sem cache: a fonte arquivada tem de ser a página de agora
         resposta = await s.rede.get(atual, tipo="navegador", seguir_redirect=False, usar_cache=False)
         location = resposta.headers.get("location")
@@ -332,20 +402,23 @@ async def _arquivar(url: str, ctx: Contexto, s: Servicos) -> _Arquivo:
         return _Arquivo(FonteArquivada(ref, "", None), ext, None)
     if ext == "pdf":
         return _Arquivo(FonteArquivada(ref, await asyncio.to_thread(texto_de_pdf, conteudo), None), ext, None)
-    texto = decodificar(conteudo, tipo)
+    texto = decodificar(conteudo, _tipo_para_decodificar(tipo, ext))
     if ext == "html":
         forte, qualquer = _datas_de_publicacao(texto)
         return _Arquivo(FonteArquivada(ref, texto_de_html(texto), qualquer), ext, forte)
     return _Arquivo(FonteArquivada(ref, texto, None), ext, None)
 
 
-async def arquivar_fonte(url: str, ctx: Contexto, s: Servicos) -> FonteArquivada:
+async def arquivar_fonte(
+    url: str, ctx: Contexto, s: Servicos, ips_do_alvo: set[str] | None = None
+) -> FonteArquivada:
     """Baixa `url` pela `Rede` e guarda na custódia (`tipo="fonte"`, `origem=url`).
 
-    `ErroNo` permanente "fonte recusada: ..." se o destino (da URL ou de qualquer redirect) não é permitido;
-    `ErroRede` se a página não pôde ser baixada ou o corpo passa de 10 MB.
+    `ErroNo` permanente "fonte recusada: ..." se o destino (da URL ou de qualquer redirect) não é permitido, ou
+    "fonte não encontrada (domínio inexistente)..."; `ErroRede` se a página não pôde ser baixada ou o corpo passa
+    de 10 MB. `ips_do_alvo`: os endereços A/AAAA do alvo (saída do nó `dns`); um IP literal deles é recusado.
     """
-    return (await _arquivar(url, ctx, s)).fonte
+    return (await _arquivar(url, ctx, s, _canonicos(ips_do_alvo))).fonte
 
 
 # --- validar ----------------------------------------------------------------------------------------------
@@ -366,7 +439,7 @@ class _Fonte:
         normal = normalizar(texto)
         return "".join(normal.split()) if self.pdf else normal
 
-    def contem(self, procurado: str, mascara: dict[str, str] | None) -> bool:
+    async def contem(self, procurado: str, mascara: dict[str, str] | None) -> bool:
         """O trecho (já normalizado) está no texto? PDF: sem espaços dos dois lados. Com `mascara`, também vale o
         que o Claude enxergaria: o texto com os termos trocados pelos marcadores."""
         assert self.texto is not None
@@ -379,7 +452,7 @@ class _Fonte:
         if not mascara:
             return False
         if self._mascarada is None:
-            self._mascarada = self._chave(mascarar(self.texto, mascara))
+            self._mascarada = self._chave(await asyncio.to_thread(mascarar, self.texto, mascara))
         return procurado in self._mascarada
 
 
@@ -439,6 +512,8 @@ async def _fonte_da_custodia(ref: str, s: Servicos) -> _Fonte:
         conteudo = caminho.read_bytes()
     except FileNotFoundError:
         raise ErroNo("fonte não encontrada na custódia", permanente=True) from None
+    if "julgamento" in s.custodia.tipos(ref):  # o que o Claude respondeu antes não prova o que ele responde agora
+        raise ErroNo("fonte inválida: julgamento não é fonte", permanente=True)
     ext = caminho.suffix.lstrip(".").lower()
     if ext == "har":
         raise ErroNo("fonte .har não é citável: cite o html ou o texto da página", permanente=True)
@@ -450,9 +525,9 @@ async def _fonte_da_custodia(ref: str, s: Servicos) -> _Fonte:
     return _Fonte(texto_de_html(texto) if ext == "html" else texto)
 
 
-async def _fonte_da_url(url: str, ctx: Contexto, s: Servicos) -> _Fonte:
+async def _fonte_da_url(url: str, ctx: Contexto, s: Servicos, ips_do_alvo: frozenset[str]) -> _Fonte:
     try:
-        arquivo = await _arquivar(url, ctx, s)
+        arquivo = await _arquivar(url, ctx, s, ips_do_alvo)
     except ErroRede as erro:
         if erro.status in (404, 410):
             raise ErroNo(
@@ -466,12 +541,12 @@ async def _fonte_da_url(url: str, ctx: Contexto, s: Servicos) -> _Fonte:
     return _Fonte(texto, arquivo.fonte.data_publicacao, arquivo.data_forte, pdf=arquivo.ext == "pdf")
 
 
-async def _carregar_fonte(fonte: str, ctx: Contexto, s: Servicos) -> _Fonte:
+async def _carregar_fonte(fonte: str, ctx: Contexto, s: Servicos, ips_do_alvo: frozenset[str]) -> _Fonte:
     """`ErroNo` com o motivo exato da rejeição quando a fonte é inválida, não existe ou foi recusada."""
     if _HASH.fullmatch(fonte):
         return await _fonte_da_custodia(fonte, s)
     if fonte.lower().startswith(("http://", "https://")):
-        return await _fonte_da_url(fonte, ctx, s)
+        return await _fonte_da_url(fonte, ctx, s, ips_do_alvo)
     raise ErroNo("fonte inválida: use sha256:<hex> ou URL http(s)", permanente=True)
 
 
@@ -486,24 +561,27 @@ async def validar(
     ctx: Contexto,
     s: Servicos,
     mascara: dict[str, str] | None = None,
+    ips_do_alvo: set[str] | None = None,
 ) -> Validacao:
     """Confere a resposta do Claude à `pendencia` (spec 7.4). Ver o docstring do módulo para a ordem.
 
     `nao_encontrado` e `inconclusivo` sem evidências pulam os passos 2 a 4; com evidências, elas são
     validadas como as de qualquer outra resposta. `mascara` (a de `montar_mascara`) só vale com `ctx.modo_cego`.
+    `ips_do_alvo`: os endereços A/AAAA do alvo (saída do nó `dns`), cujo IP literal não é fonte.
     """
     if (rejeicao := _validar_valor(resposta, pendencia, s)) is not None:
         return rejeicao
     if not resposta.evidencias:
         return Validacao(True)
 
+    ips = _canonicos(ips_do_alvo)
     fontes: list[_Fonte] = []
     carregadas: dict[str, _Fonte] = {}
     for i, evidencia in enumerate(resposta.evidencias):
         fonte = evidencia.fonte.strip()
         try:
             if fonte not in carregadas:
-                carregadas[fonte] = await _carregar_fonte(fonte, ctx, s)
+                carregadas[fonte] = await _carregar_fonte(fonte, ctx, s, ips)
         except ErroNo as erro:
             return _rejeitar(erro.mensagem, f"evidencias[{i}].fonte")
         fontes.append(carregadas[fonte])
@@ -512,15 +590,18 @@ async def validar(
     marcas: list[str] = []
     for i, (evidencia, fonte) in enumerate(zip(resposta.evidencias, fontes, strict=True)):
         procurado = normalizar(evidencia.trecho)
-        # um trecho de uma letra, de "%" ou de uma palavra comum está em qualquer página
-        if len(procurado) < _MIN_CARACTERES_DO_TRECHO or len(procurado.split()) < _MIN_PALAVRAS_DO_TRECHO:
+        # um trecho de uma letra, de "%" ou de uma palavra comum está em qualquer página. O tamanho é o do que a
+        # fonte de fato confere: sem os marcadores da máscara (que não são texto da fonte) e, no PDF, sem espaços
+        util = " ".join(MARCADOR.sub(" ", procurado).split())
+        caracteres = len("".join(util.split())) if fonte.pdf else len(util)
+        if caracteres < _MIN_CARACTERES_DO_TRECHO or len(util.split()) < _MIN_PALAVRAS_DO_TRECHO:
             return _rejeitar(
                 f"trecho curto demais: cite ao menos {_MIN_CARACTERES_DO_TRECHO} caracteres literais da fonte",
                 f"evidencias[{i}].trecho",
             )
         if fonte.texto is None:
             _marcar(marcas, MARCA_TRECHO_NAO_CONFERIDO)
-        elif not fonte.contem(procurado, mascara_ativa):
+        elif not await fonte.contem(procurado, mascara_ativa):
             return _rejeitar("trecho não encontrado na fonte", f"evidencias[{i}].trecho")
 
     for i, (evidencia, fonte) in enumerate(zip(resposta.evidencias, fontes, strict=True)):

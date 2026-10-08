@@ -276,3 +276,30 @@ def test_guardar_concorrente_mantem_a_cadeia(tmp_path):
     assert erros == []
     assert [json.loads(linha)["seq"] for linha in _linhas(tmp_path)] == list(range(30))
     assert verificar(tmp_path) == []
+
+
+def test_tipos_do_conteudo(tmp_path):
+    c = Custodia(tmp_path)
+    ref = c.guardar(b"abc", "txt", tipo="pagina", origem="a")
+    assert c.tipos(ref) == {"pagina"}
+    # o mesmo conteúdo guardado de novo, com outro tipo: o arquivo é um só, o log registra os dois
+    c.guardar(b"abc", "txt", tipo="julgamento", origem="b")
+    assert c.tipos(ref) == {"pagina", "julgamento"}
+    assert c.tipos(f"sha256:{ZEROS}") == set()
+
+
+def test_tipos_sem_log_e_vazio(tmp_path):
+    assert Custodia(tmp_path / "nada").tipos(f"sha256:{ABC}") == set()
+
+
+def test_tipos_ignora_linha_ilegivel(tmp_path):
+    c = Custodia(tmp_path)
+    ref = c.guardar(b"abc", "txt", tipo="pagina", origem="a")
+    with (tmp_path / "custodia.log").open("a", encoding="utf-8", newline="\n") as f:
+        f.write("isto nao e json\n[1, 2]\n")
+    assert c.tipos(ref) == {"pagina"}
+
+
+def test_tipos_recusa_ref_invalida(tmp_path):
+    with pytest.raises(ValueError):
+        Custodia(tmp_path).tipos("../etc/passwd")

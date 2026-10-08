@@ -30,9 +30,19 @@ def sem_artefatos(ref: str) -> bytes:
     raise AssertionError(f"não devia ler artefato: {ref}")
 
 
-def com_titulo(titulo: str) -> dict[str, str]:
+def com_titulo(titulo: str, **saidas: dict) -> dict[str, str]:
+    """A máscara de um site de domínio `exemplo.com.br`, razão social "Exemplo Invest Ltda" e esse título."""
     html = f"<html><head><title>{titulo}</title></head><body></body></html>".encode()
-    return montar_mascara({"captura": {"paginas": [{"html": "sha256:aa"}]}}, {"sha256:aa": html}.__getitem__)
+    base = {
+        "alvo": {"dominio": "exemplo.com.br"},
+        "cnpj": {"razao_social": "Exemplo Invest Ltda"},
+        "captura": {"paginas": [{"html": "sha256:aa"}]},
+    }
+    return montar_mascara({**base, **saidas}, {"sha256:aa": html}.__getitem__)
+
+
+def termos_da_empresa(mascara: dict[str, str]) -> set[str]:
+    return {termo for termo, marcador in mascara.items() if marcador == "[EMPRESA]"}
 
 
 # --- montar_mascara ---------------------------------------------------------------------------------------
@@ -114,30 +124,92 @@ def test_titulo_e_og_site_name_da_pagina_inicial():
     saidas = {"captura": {"paginas": [{"url": "https://exemplo.com.br/", "html": "sha256:aa"}, {"html": "sha256:bb"}]}}
     # só a página inicial é lida: pedir a "sha256:bb" daria KeyError
     mascara = montar_mascara(saidas, artefatos.__getitem__)
-    # o título é partido no " — ": cada parte vale sozinha
-    assert mascara == {
-        "Exemplo Invest": "[EMPRESA]",
-        "Rendimento diário": "[EMPRESA]",
-        "Exemplo Invest Brasil": "[EMPRESA]",
-    }
+    # o título é partido no " — ": "Exemplo Invest" tem palavra em comum com o og:site_name; "Rendimento diário", não
+    assert mascara == {"Exemplo Invest": "[EMPRESA]", "Exemplo Invest Brasil": "[EMPRESA]"}
 
 
 @pytest.mark.parametrize(
     ("titulo", "partes"),
     [
-        ("Exemplo Invest | Investimentos Seguros", {"Exemplo Invest", "Investimentos Seguros"}),
-        ("Exemplo Invest – Rendimento diário", {"Exemplo Invest", "Rendimento diário"}),
-        ("Exemplo Invest — Rendimento diário", {"Exemplo Invest", "Rendimento diário"}),
-        ("Exemplo Invest - Rendimento diário", {"Exemplo Invest", "Rendimento diário"}),
-        ("Exemplo Invest · Início", {"Exemplo Invest", "Início"}),
-        ("Exemplo Invest: o melhor jeito", {"Exemplo Invest", "o melhor jeito"}),
+        ("Exemplo Invest | Exemplo Brasil", {"Exemplo Invest", "Exemplo Brasil"}),
+        ("Exemplo Invest – Exemplo Rendimentos", {"Exemplo Invest", "Exemplo Rendimentos"}),
+        ("Exemplo Invest — Invest Brasil", {"Exemplo Invest", "Invest Brasil"}),
+        ("Exemplo Invest - Exemplo", {"Exemplo Invest", "Exemplo"}),
+        ("Exemplo Invest · Início", {"Exemplo Invest"}),
+        ("Exemplo Invest: o melhor jeito", {"Exemplo Invest"}),
         ("A | B | Exemplo Invest | Sim", {"Exemplo Invest"}),  # partes com menos de 4 caracteres ficam de fora
         ("Pré-venda Exemplo-Invest", {"Pré-venda Exemplo-Invest"}),  # hífen colado não separa
         ("  Exemplo   Invest  ", {"Exemplo Invest"}),
+        ("Bem-vindo | Home", set()),  # nenhuma palavra do site: não é o nome dele
     ],
 )
 def test_titulo_e_partido_nos_separadores(titulo, partes):
-    assert set(com_titulo(titulo)) == partes
+    assert termos_da_empresa(com_titulo(titulo)) - {"Exemplo Invest Ltda"} == partes
+
+
+def test_parte_do_titulo_sem_palavra_do_site_nao_entra():
+    # a promessa no título não vira [EMPRESA]: "Rendimento de 1,5% ao dia" não tem relação com o site
+    mascara = com_titulo("Exemplo Invest | Rendimento de 1,5% ao dia")
+    assert termos_da_empresa(mascara) == {"Exemplo Invest Ltda", "Exemplo Invest"}
+    promessa = "Rendimento de 1,5% ao dia, garantido"
+    assert mascarar(promessa, mascara) == promessa
+    # nem o termo genérico, mesmo sem número
+    mascara = com_titulo("Investimentos - Exemplo Invest")
+    assert termos_da_empresa(mascara) == {"Exemplo Invest Ltda", "Exemplo Invest"}
+
+
+@pytest.mark.parametrize(
+    "titulo",
+    [
+        "Exemplo 2024 | Exemplo Invest",
+        "Exemplo 100% | Exemplo Invest",
+        "Exemplo+ 5 | Exemplo Invest",
+        "Exemplo % | Exemplo Invest",
+    ],
+)
+def test_parte_do_titulo_com_digito_ou_porcento_nunca_entra(titulo):
+    assert termos_da_empresa(com_titulo(titulo)) == {"Exemplo Invest Ltda", "Exemplo Invest"}
+
+
+def test_palavra_em_comum_com_o_dominio_o_og_site_name_o_nome_fantasia_ou_a_razao_social():
+    # cada uma das quatro referências basta, sozinha
+    titulo = "Marca Fantasia"
+    razao = {"razao_social": "Nada Haver Ltda"}
+    assert termos_da_empresa(com_titulo(titulo, alvo={"dominio": "outro.com"}, cnpj=razao)) == {"Nada Haver Ltda"}
+    por_dominio = com_titulo(titulo, alvo={"dominio": "marca.com.br"}, cnpj=razao)
+    assert "Marca Fantasia" in termos_da_empresa(por_dominio)
+    fantasia = {**razao, "nome_fantasia": "Fantasia Real"}
+    assert "Marca Fantasia" in termos_da_empresa(com_titulo(titulo, alvo={"dominio": "outro.com"}, cnpj=fantasia))
+    outra_razao = {"razao_social": "Marca Registrada Ltda"}
+    assert "Marca Fantasia" in termos_da_empresa(com_titulo(titulo, alvo={"dominio": "outro.com"}, cnpj=outra_razao))
+    html = b'<head><title>Marca Fantasia</title><meta name="og:site_name" content="Fantasia Brasil"></head>'
+    por_og = montar_mascara({"captura": {"paginas": [{"html": "sha256:aa"}]}}, {"sha256:aa": html}.__getitem__)
+    assert set(por_og) == {"Marca Fantasia", "Fantasia Brasil"}
+
+
+def test_palavra_curta_em_comum_nao_basta():
+    # "ltda" tem 4 caracteres e vale; "sa" e "de" (menos de 4) não
+    cnpj = {"razao_social": "Alfa de Sa Ltda"}
+    assert "Banco de Sa" not in termos_da_empresa(com_titulo("Banco de Sa", cnpj=cnpj))
+    assert "Alfa Ltda" in termos_da_empresa(com_titulo("Alfa Ltda", cnpj=cnpj))
+
+
+def test_rotulo_do_dominio_vem_do_alvo_e_dos_sans_sem_o_tld():
+    com = com_titulo("Seguro Bacana", alvo={"dominio": "seguro-bacana.com.br"}, cnpj={})
+    assert "Seguro Bacana" in termos_da_empresa(com)
+    # só o rótulo conta, não o sufixo público: "museum" é o TLD de outro.museum
+    sem = com_titulo("Museum Tickets", alvo={"dominio": "outro.museum"}, cnpj={})
+    assert "Museum Tickets" not in termos_da_empresa(sem)
+    sans = {"sans": ["www.planobacana.com.br", "planobacana.com.br"]}
+    # "planobacana" é uma palavra só: não é a palavra "plano"
+    assert "Plano Bacana" not in termos_da_empresa(com_titulo("Plano Bacana", alvo={}, ct=sans, cnpj={}))
+    assert "Planobacana Premium" in termos_da_empresa(com_titulo("Planobacana Premium", alvo={}, ct=sans, cnpj={}))
+
+
+def test_rotulo_do_dominio_idn_vale_nas_duas_grafias():
+    titulo = "Investimentoseguro Ação"
+    assert titulo in termos_da_empresa(com_titulo(titulo, alvo={"dominio": ALVO_PUNYCODE}, cnpj={}))
+    assert titulo in termos_da_empresa(com_titulo(titulo, alvo={}, ct={"sans": ["www." + ALVO_IDN]}, cnpj={}))
 
 
 @pytest.mark.parametrize("atributo", ["property", "name"])
@@ -170,9 +242,13 @@ def test_pagina_sem_titulo_nem_og_site_name():
 
 def test_titulo_de_pagina_em_iso_8859_1():
     html = '<html><head><meta charset="iso-8859-1"><title>Promoção Investimentos</title></head></html>'
-    saidas = {"wayback_snapshot": {"paginas": [{"html": "sha256:aa"}]}}
+    saidas = {
+        # a palavra em comum com o título só aparece se o título foi decodificado do ISO-8859-1
+        "cnpj": {"razao_social": "Promocao Investimentos Ltda"},
+        "wayback_snapshot": {"paginas": [{"html": "sha256:aa"}]},
+    }
     mascara = montar_mascara(saidas, {"sha256:aa": html.encode("iso-8859-1")}.__getitem__)
-    assert mascara == {"Promoção Investimentos": "[EMPRESA]"}
+    assert mascara == {"Promocao Investimentos Ltda": "[EMPRESA]", "Promoção Investimentos": "[EMPRESA]"}
 
 
 # --- mascarar ---------------------------------------------------------------------------------------------
