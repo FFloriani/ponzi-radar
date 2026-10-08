@@ -7,7 +7,9 @@ Uso:
 
 ARQ é um caminho relativo à raiz do repositório (a pasta acima de tools/), de onde o
 conteúdo é lido. O trailer de coautoria é acrescentado à mensagem se faltar. Caminhos em
-`casos/` são recusados: a evidência coletada pelo radar nunca vai para o repositório.
+`casos/` são recusados: a evidência coletada pelo radar nunca vai para o repositório. O que o
+`.gitignore` da raiz ignora também (um `config.local.toml` com a credencial do proxy, um `.env`):
+casamento simples dos padrões por `fnmatch`, sem diferenciar maiúsculas; `!padrão` não é lido.
 
 Fluxo: blobs (base64) -> confere sha1("blob <len>\\0" + dados) local contra o remoto ->
 tree com base_tree -> commit -> PATCH da ref. Repositório vazio: o primeiro arquivo vai
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fnmatch
 import hashlib
 import json
 import os
@@ -45,6 +48,37 @@ def montar_mensagem(mensagem: str) -> str:
     return mensagem if TRAILER in mensagem else f"{mensagem}\n\n{TRAILER}"
 
 
+def padroes_ignorados(raiz: Path = RAIZ) -> list[str]:
+    """Os padrões do `.gitignore` da raiz, sem comentários, linhas vazias e negações."""
+    try:
+        linhas = (raiz / ".gitignore").read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    return [p for linha in linhas if (p := linha.strip()) and not p.startswith(("#", "!"))]
+
+
+def ignorado(relativo: str, padroes: list[str]) -> str | None:
+    """O padrão do `.gitignore` que ignora `relativo` (posix, relativo à raiz), ou `None`.
+
+    `dir/` só casa com diretório; um padrão com `/` no começo ou no meio vale a partir da raiz; sem `/`, vale para
+    qualquer nível (o nome do arquivo ou de uma pasta do caminho).
+    """
+    partes = relativo.lower().split("/")
+    for padrao in padroes:
+        so_diretorio = padrao.endswith("/")
+        nucleo = padrao.rstrip("/").lower()
+        if "/" in nucleo:  # ancorado na raiz: casa com um prefixo do caminho
+            nucleo = nucleo.lstrip("/")
+            fim = len(partes) - 1 if so_diretorio else len(partes)
+            if any(fnmatch.fnmatchcase("/".join(partes[: i + 1]), nucleo) for i in range(fim)):
+                return padrao
+        else:
+            candidatas = partes[:-1] if so_diretorio else partes
+            if any(fnmatch.fnmatchcase(parte, nucleo) for parte in candidatas):
+                return padrao
+    return None
+
+
 def caminho_relativo(arquivo: str, raiz: Path = RAIZ) -> str:
     """Valida `arquivo` (relativo à raiz do repo) e devolve o caminho em formato posix."""
     pedido = Path(arquivo)
@@ -56,6 +90,10 @@ def caminho_relativo(arquivo: str, raiz: Path = RAIZ) -> str:
     # lower(): no Windows "Casos/" é a mesma pasta; resolve() já eliminou "x/../casos/"
     if relativo.parts and relativo.parts[0].lower() == PASTA_PROIBIDA:
         raise ErroPublicar(f"recusado, {PASTA_PROIBIDA}/ nunca vai para o repositório: {arquivo}")
+    if (padrao := ignorado(relativo.as_posix(), padroes_ignorados(raiz))) is not None:
+        raise ErroPublicar(
+            f"recusado, ignorado pelo .gitignore ({padrao}): {arquivo} pode ter credencial ou dado local"
+        )
     if not absoluto.is_file():
         raise ErroPublicar(f"arquivo não encontrado: {arquivo}")
     return relativo.as_posix()
