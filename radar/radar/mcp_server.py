@@ -35,9 +35,9 @@ from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from functools import partial
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -50,19 +50,19 @@ from radar.diff import NOME_DA_PONTUACAO, carregar_anterior, comparar, renderiza
 from radar.dossie import PendenciasAbertas
 from radar.dossie import gerar_dossie as escrever_dossie
 from radar.execucao import (
-    PADRAO_SLUG_CEGO,
+    ErroComparacao,
     carregar_execucao,
     criar_contexto,
+    criar_indices,
     criar_servicos,
-    em_modo_atual,
-    execucao_anterior,
+    escolher_execucoes,
+    interpretar_as_of,
+    pasta_do_run,
 )
 from radar.execucao import listar_casos as casos_em_disco
-from radar.indices import Indices
 from radar.modelos import ErroNo, Pendencia, Resposta
 from radar.motor import Motor, NoBase, Servicos
 from radar.nos import nos_do_nucleo
-from radar.nos.alvo import normalizar_alvo
 from radar.pendencias.definicoes import CABECALHO_NAO_CONFIAVEL, DEFINICOES
 from radar.pendencias.mascara import MARCADOR, mascarar, montar_mascara
 from radar.pendencias.validacao import arquivar_fonte as baixar_fonte
@@ -93,10 +93,7 @@ _NAO_GRAVADA = (
 _DEMOROU = "a fonte demorou para responder; tente de novo"
 _MUDOU = "a pendência mudou durante a validação; consulte ver_pendencia de novo"
 
-_RUN_ID = re.compile(r"[a-z0-9_-]+/\d{4}-\d{2}-\d{2}_\d{6}")
-_CARIMBO = re.compile(r"\d{4}-\d{2}-\d{2}_\d{6}")
 _REF = re.compile(r"sha256:[0-9a-f]{64}")
-_DATA_ISO = re.compile(r"\d{4}-\d{2}-\d{2}")
 _PESSOA = re.compile(r"\[PESSOA_(\d+)\]")
 # o `Content-Type` com que cada artefato de texto é decodificado; o resto (fora o PDF e o PNG) não é exibido
 _TIPO_DO_TEXTO = {".html": "text/html", ".txt": "text/plain", ".json": "application/json"}
@@ -313,13 +310,6 @@ def _registrar_falha(run_id: str, esperadas: tuple[type[BaseException], ...], ta
         _log.error("execução %s: falha no trabalho de fundo", run_id, exc_info=erro)
 
 
-def _execucao_cega(pasta: Path) -> bool:
-    try:
-        return bool(ler_json(pasta / "estado.json")["contexto"]["modo_cego"])
-    except (OSError, ValueError, KeyError, TypeError):
-        return False
-
-
 @dataclass
 class _Execucao:
     """Uma execução aberta no servidor: o motor, os serviços dela, a última tarefa de fundo lançada, a máscara do
@@ -356,7 +346,7 @@ class _Radar:
         self.config = config
         self._nos: Callable[[], list[NoBase]] = (lambda: list(nos)) if nos is not None else nos_do_nucleo
         self.rede = Rede(config.rede)
-        self.indices = Indices(config.casos_dir / "_indices", self.rede, config.indices.ttl_horas)
+        self.indices = criar_indices(config, self.rede)
         self.matriz = carregar_matriz()
         self._execucoes: dict[str, _Execucao] = {}
         self._tarefas: set[asyncio.Task] = set()
@@ -371,22 +361,10 @@ class _Radar:
 
     # --- execuções -----------------------------------------------------------------------------
 
-    def _pasta(self, run_id: Any) -> Path | None:
-        """A pasta de `run_id` (`<slug>/<AAAA-MM-DD_HHMMSS>`) dentro de `casos_dir`, ou `None` se ele é inválido."""
-        if not isinstance(run_id, str) or ".." in run_id or "\\" in run_id:
-            return None
-        if PurePosixPath(run_id).is_absolute() or PureWindowsPath(run_id).is_absolute():
-            return None
-        if not _RUN_ID.fullmatch(run_id):
-            return None
-        base = Path(self.config.casos_dir).resolve()
-        pasta = (base / run_id).resolve()
-        return pasta if pasta.is_relative_to(base) else None
-
     def _execucao(self, run_id: Any) -> _Execucao | dict:
         """A execução aberta, ou o `{"erro": ...}` a devolver. Sem `await`: duas chamadas juntas não carregam dois
         motores para o mesmo `run_id`. No modo cego, a máscara volta do `mascara.json` e soma as saídas atuais."""
-        pasta = self._pasta(run_id)
+        pasta = pasta_do_run(self.config.casos_dir, run_id)
         if pasta is None:
             return {"erro": "run_id inválido"}
         if (aberta := self._execucoes.get(run_id)) is not None:
@@ -559,13 +537,9 @@ class _Radar:
         data = None
         if as_of is not None:
             try:
-                if not _DATA_ISO.fullmatch(as_of):
-                    raise ValueError(as_of)
-                data = date.fromisoformat(as_of)
-            except (TypeError, ValueError):
-                return {"erro": "as_of inválido: use AAAA-MM-DD"}
-            if data > agora.date():
-                return {"erro": "as_of posterior a hoje"}
+                data = interpretar_as_of(as_of, agora.date())
+            except ValueError as erro:
+                return {"erro": str(erro)}
         try:
             ctx = criar_contexto(alvo, data, modo_contato, modo_cego, self.config.casos_dir, agora)
         except ErroNo as erro:
@@ -759,58 +733,12 @@ class _Radar:
         return {"caminho": str(caminho), "eixo1": pontuacao["eixo1"], "eixo2": pontuacao["eixo2"]}
 
     async def comparar_execucoes(self, alvo: str, a: str | None, b: str | None) -> dict:
-        casos = casos_em_disco(self.config.casos_dir)
         try:
-            slug = normalizar_alvo(alvo)[1]
-        except ErroNo:
-            if alvo not in casos:  # o slug, como `listar_casos` mostra, também vale
-                return {"erro": "alvo inválido"}
-            slug = alvo
-        if PADRAO_SLUG_CEGO.fullmatch(slug):
-            return {"erro": "indisponível no modo cego"}
-        if slug not in casos:
-            return {"erro": "nenhuma execução deste alvo"}
-        carimbos = casos[slug]
-        escolhidas = []
-        for valor in (a, b):
-            if valor is None:
-                escolhidas.append(None)
-                continue
-            carimbo = valor.removeprefix(f"{slug}/")
-            if not _CARIMBO.fullmatch(carimbo) or carimbo not in carimbos:
-                return {"erro": f"execução não encontrada: {valor}"}
-            escolhidas.append(carimbo)
-        par = self._par(slug, carimbos, *escolhidas)
-        if isinstance(par, dict):
-            return par
-        anterior, atual = (self.config.casos_dir / slug / c for c in par)
-        if _execucao_cega(anterior) or _execucao_cega(atual):
-            return {"erro": "indisponível no modo cego"}
-        texto = await asyncio.to_thread(self._diff, anterior, atual)
-        return {"a": f"{slug}/{par[0]}", "b": f"{slug}/{par[1]}", "diff": texto}
-
-    def _par(self, slug: str, carimbos: list[str], a: str | None, b: str | None) -> tuple[str, str] | dict:
-        """As duas execuções a comparar, a mais antiga primeiro. Sem `a` nem `b`: as duas últimas em modo atual;
-        só `b`: a anterior a ela em modo atual; só `a`: a última em modo atual depois dela."""
-        pasta_do_alvo = self.config.casos_dir / slug
-        if a is None and b is None:
-            atuais = [c for c in carimbos if em_modo_atual(pasta_do_alvo / c)]
-            if len(atuais) < 2:
-                return {"erro": "são necessárias duas execuções em modo atual deste alvo para comparar"}
-            return atuais[-2], atuais[-1]
-        if a is None:
-            anterior = execucao_anterior(pasta_do_alvo / b)
-            if anterior is None:
-                return {"erro": f"não há execução anterior a {slug}/{b} em modo atual"}
-            return anterior.name, b
-        if b is None:
-            depois = [c for c in carimbos if c > a and em_modo_atual(pasta_do_alvo / c)]
-            if not depois:
-                return {"erro": f"não há execução em modo atual depois de {slug}/{a}"}
-            return a, depois[-1]
-        if a == b:
-            return {"erro": "a e b são a mesma execução"}
-        return (a, b) if a < b else (b, a)
+            anterior, atual = escolher_execucoes(self.config.casos_dir, alvo, a, b)
+        except ErroComparacao as erro:
+            return {"erro": str(erro)}
+        texto = await asyncio.to_thread(self._diff, self.config.casos_dir / anterior, self.config.casos_dir / atual)
+        return {"a": anterior, "b": atual, "diff": texto}
 
     def _diff(self, anterior: Path, atual: Path) -> str:
         return renderizar_diff(comparar(carregar_execucao(anterior), carregar_execucao(atual), self.matriz))
