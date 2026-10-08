@@ -605,6 +605,16 @@ def test_dossie_lacunas_cvm_so_com_resumo(tmp_path, so_resumo, frase):
     assert frase in s7 and "sem prova negativa por CNPJ ou domínio" in s7
 
 
+def test_dossie_lacunas_listam_o_indice_vencido(tmp_path):
+    # I6: a renovação falhou e o nó usou a cópia anterior; o dossiê diz qual e desde quando
+    vencidos = {"deliberacoes": "2026-10-06T12:00:00"}
+    alertas = {"correspondencias": [], "cobertura": {"com_texto_integral": 10, "so_resumo": 0}, "indices_vencidos": vencidos}
+    registros = {**saidas_base()["registros"], "indices_vencidos": {"cadastros_cvm": "2026-10-05T08:00:00"}}
+    s7 = secao(dossie(gravar(tmp_path, saidas={"cvm_alertas": alertas, "registros": registros})), 7)
+    assert "Índice deliberacoes vencido desde 2026-10-06 (a renovação falhou; cvm_alertas usou a cópia anterior)" in s7
+    assert "Índice cadastros_cvm vencido desde 2026-10-05 (a renovação falhou; registros usou a cópia anterior)" in s7
+
+
 def test_dossie_lacunas_sem_aviso_de_cvm_quando_tudo_tem_texto(tmp_path):
     assert "só têm resumo" not in secao(dossie(gravar(tmp_path)), 7)
 

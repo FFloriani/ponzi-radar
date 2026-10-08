@@ -12,7 +12,7 @@ import pytest
 from radar.config import Config, RedeConfig
 from radar.custodia import Custodia, verificar
 from radar.execucao import carregar_execucao, criar_contexto, criar_servicos
-from radar.indices import Deliberacao, Indices
+from radar.indices import Deliberacao, IndiceVencido, Indices
 from radar.modelos import Contexto, ErroNo, Feito
 from radar.motor import Motor, NoBase, Servicos
 from radar.nos.alvo import AlvoNo
@@ -91,7 +91,9 @@ def corpo_da_custodia(serv, entrada: dict) -> dict:
 def test_registros_declaracao():
     no = RegistrosNo()
     assert (no.nome, no.entradas, no.as_of, no.toca_alvo) == ("registros", ("alvo", "cnpj"), "filtravel", False)
-    assert no.saidas == ("cvm", "bcb", "bcb_dominio", "registrado", "motivo", "vazamento_temporal")
+    assert no.saidas == (
+        "cvm", "bcb", "bcb_dominio", "registrado", "motivo", "vazamento_temporal", "indices_vencidos"
+    )  # fmt: skip
 
 
 async def test_bcb_raiz_8_digitos(respx_mock, tmp_path, serv):
@@ -240,7 +242,7 @@ async def test_registros_indice_em_erro_derruba_o_no(respx_mock, tmp_path, serv)
 def test_sancionador_declaracao():
     no = CvmSancionadorNo()
     assert (no.nome, no.entradas, no.as_of, no.toca_alvo) == ("cvm_sancionador", ("cnpj",), "filtravel", False)
-    assert no.saidas == ("processos", "motivo")
+    assert no.saidas == ("processos", "motivo", "indices_vencidos")
 
 
 async def test_sancionador_por_razao_social(respx_mock, tmp_path, serv):
@@ -447,7 +449,7 @@ def test_alertas_declaracao():
     assert (no.nome, no.entradas, no.opcionais, no.as_of, no.toca_alvo) == (
         "cvm_alertas", ("alvo",), ("cnpj",), "exato", False
     )
-    assert no.saidas == ("correspondencias", "cobertura")
+    assert no.saidas == ("correspondencias", "cobertura", "indices_vencidos")
 
 
 async def test_alertas_casa_por_cnpj_dominio_e_nome(respx_mock, tmp_path, serv):
@@ -632,3 +634,49 @@ async def test_nos_pelo_motor_com_indice_fora_do_ar_nao_derruba_os_outros(respx_
     assert motor.status()["registros"] == motor.status()["cvm_sancionador"] == "feito"
     ex = carregar_execucao(ctx.pasta)
     assert "cvm_alertas" not in ex.saidas and "503" in ex.status["cvm_alertas"]["motivo"]
+
+
+# ------------------------------------------------------------------------------------ índice vencido (I6)
+
+
+class _IndicesVencidos:
+    """Índices que respondem com a cópia anterior porque a renovação falhou."""
+
+    def __init__(self, desde: datetime) -> None:
+        self.desde = desde
+
+    async def cadastros_cvm(self):
+        return IndiceVencido([], self.desde)
+
+    async def instituicoes_bcb(self):
+        return []
+
+    async def dominios_bcb(self):
+        return IndiceVencido([], self.desde)
+
+    async def sancionador(self):
+        return IndiceVencido([], self.desde)
+
+    async def deliberacoes(self):
+        return IndiceVencido([], self.desde)
+
+
+async def test_nos_da_cvm_registram_o_indice_vencido(tmp_path, rede):
+    desde = datetime(2026, 10, 6, 12, 0, 0)
+    serv = Servicos(config=Config(), rede=rede, custodia=Custodia(tmp_path / "execucao"), indices=_IndicesVencidos(desde))
+    ctx = contexto(tmp_path)
+    entradas = {**entrada_alvo(), **entrada_cnpj(BANCO_DO_BRASIL)}
+    registros = await RegistrosNo().executar(ctx, entradas, {}, serv)
+    assert registros.saidas["indices_vencidos"] == {
+        "cadastros_cvm": "2026-10-06T12:00:00", "dominios_bcb": "2026-10-06T12:00:00"
+    }
+    sancionador = await CvmSancionadorNo().executar(ctx, entradas, {}, serv)
+    assert sancionador.saidas["indices_vencidos"] == {"sancionador": "2026-10-06T12:00:00"}
+    alertas = await CvmAlertasNo().executar(ctx, entradas, {}, serv)
+    assert alertas.saidas["indices_vencidos"] == {"deliberacoes": "2026-10-06T12:00:00"}
+
+
+async def test_indice_em_dia_nao_acrescenta_a_chave(respx_mock, tmp_path, serv):
+    mocar_deliberacoes(respx_mock)
+    r = await CvmAlertasNo().executar(contexto(tmp_path), entrada_alvo(), {}, serv)
+    assert "indices_vencidos" not in r.saidas

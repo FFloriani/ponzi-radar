@@ -534,6 +534,16 @@ def _lacunas(ex: ExecucaoSalva, itens: dict[str, Item]) -> dict:
             f"{so_resumo} {_plural(so_resumo, 'deliberação', 'deliberações')} da CVM "
             f"{_plural(so_resumo, 'só tem resumo', 'só têm resumo')}: sem prova negativa por CNPJ ou domínio nelas."
         )
+    vistos: set[str] = set()
+    for no in ("registros", "cvm_sancionador", "cvm_alertas"):
+        vencidos = (saida(ex, no) or {}).get("indices_vencidos")
+        for indice, desde in (vencidos.items() if isinstance(vencidos, dict) else ()):
+            if indice not in vistos and (data := data_iso(desde)) is not None:
+                vistos.add(indice)
+                fontes.append(
+                    f"Índice {indice} vencido desde {data.isoformat()} (a renovação falhou; {no} usou a cópia "
+                    "anterior): o que mudou depois disso não foi visto."
+                )
     if (saida(ex, "wayback_indice") or {}).get("truncado") is True:
         fontes.append(
             "A listagem do Wayback veio truncada (limite do CDX): o total e o primeiro e o último snapshot podem "

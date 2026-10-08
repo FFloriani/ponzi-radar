@@ -166,9 +166,10 @@ def _titular(entradas: dict[str, dict]) -> str | None:
 
 
 def _da_extracao(entradas: dict[str, dict]) -> list[Candidato]:
-    """Os candidatos `cnpj` da extração, sem repetir o valor (fica o primeiro)."""
+    """Os candidatos `cnpj` da extração, sem repetir o valor (fica o primeiro). Sem a `extracao` (a página não pôde
+    ser lida), nenhum: vale só o titular do RDAP."""
     vistos: dict[str, Candidato] = {}
-    for bruto in entradas["extracao"]["candidatos"]:
+    for bruto in (entradas.get("extracao") or {}).get("candidatos") or []:
         candidato = Candidato.model_validate(bruto)
         if candidato.categoria == "cnpj" and cnpj_valido(candidato.valor):
             vistos.setdefault(candidato.valor, candidato)
@@ -216,8 +217,9 @@ class CnpjNo(NoBase):
     """
 
     nome = "cnpj"
-    entradas = ("extracao",)
-    opcionais = ("rdap",)
+    # os dois opcionais (I6): sem a página, o titular do RDAP; sem nenhum dos dois, a P-CNPJ sem candidatos
+    entradas = ()
+    opcionais = ("extracao", "rdap")
     saidas = (
         "cnpj",
         "razao_social",

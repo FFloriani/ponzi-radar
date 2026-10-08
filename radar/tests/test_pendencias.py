@@ -16,7 +16,9 @@ from radar.modelos import Aguardando, Candidato, Contexto, ErroNo, Evidencia, Fe
 from radar.motor import Motor, NoBase, Servicos
 from radar.nos import nos_do_nucleo
 from radar.nos.extracao import _CATEGORIAS
-from radar.nos.pendencias import PendNo, nos_de_pendencia
+from radar.nos.cnpj import CnpjNo
+from radar.nos.extracao import ExtracaoNo
+from radar.nos.pendencias import AVISO_SEM_INDICE_CVM, AVISO_SEM_PAGINA, PendNo, nos_de_pendencia
 from radar.pendencias.definicoes import (
     CABECALHO_NAO_CONFIAVEL,
     DEFINICOES,
@@ -571,15 +573,16 @@ def test_declaracao_dos_nos():
     ]
     assert all(isinstance(n, PendNo) and n.saidas == ("resposta",) for n in nos.values())
     assert all(n.toca_alvo is False and n.as_of == "exato" and n.exige_um_de == () for n in nos.values())
+    # I6: a página e o índice da CVM são opcionais onde a pendência sai sempre (spec 7.1): sem eles ela abre e avisa
     esperado = {
-        "pend_a1": (("extracao",), ()),
+        "pend_a1": ((), ("extracao",)),
         "pend_a2": (("extracao",), ()),
-        "pend_a3": (("pend_a1", "extracao"), ()),
-        "pend_b": (("extracao",), ()),
-        "pend_c": (("extracao",), ("cnpj",)),
-        "pend_c4": (("cvm_alertas",), ("cnpj",)),
-        "pend_d1": (("extracao",), ("cnpj",)),
-        "pend_d4": (("extracao",), ()),
+        "pend_a3": (("pend_a1",), ("extracao",)),
+        "pend_b": ((), ("extracao",)),
+        "pend_c": ((), ("extracao", "cnpj")),
+        "pend_c4": ((), ("cvm_alertas", "cnpj")),
+        "pend_d1": ((), ("extracao", "cnpj")),
+        "pend_d4": ((), ("extracao",)),
     }
     for nome, (entradas, opcionais) in esperado.items():
         assert (nos[nome].entradas, nos[nome].opcionais) == (entradas, opcionais), nome
@@ -1179,3 +1182,72 @@ async def test_pendno_com_resposta_entrega_a_pendencia_ao_motor(ctx, serv):
     feito = await PendNo("pend_a1").executar(ctx, entradas_da_extracao(candidato("percentual", "1|dia")), {"P-A1": r}, serv)
     (pendencia,) = feito.pendencias
     assert (pendencia.id, [c.valor for c in pendencia.candidatos]) == ("P-A1", ["1|dia"])
+
+
+# ---------------------------------------------------------------------------- fonte fora do ar (I6)
+
+
+class _Falha(NoBase):
+    """Coletor que cai em erro (o site com anti-bot e sem snapshot; o índice da CVM fora do ar)."""
+
+    def __init__(self, nome: str, mensagem: str = "fonte fora do ar") -> None:
+        super().__init__(nome=nome)
+        self._mensagem = mensagem
+
+    async def executar(self, ctx, entradas, respostas, s):
+        raise ErroNo(self._mensagem, permanente=False)
+
+
+def _motor_sem_pagina(tmp_path, cvm_fora: bool = False) -> Motor:
+    """Captura e Wayback em erro (a `extracao` real fica bloqueada), o `cnpj` real sem titular no RDAP."""
+    ctx = criar_contexto("https://exemplo.com.br/", None, "captura", False, tmp_path, AGORA)
+    servicos = Servicos(config=Config(), rede=None, custodia=Custodia(ctx.pasta), matriz=MATRIZ_SPEC)
+    alertas = {"correspondencias": [], "cobertura": {"com_texto_integral": 7, "so_resumo": 0}}
+    coletores = [
+        _Fixo("alvo", {}), _Fixo("rdap", {"cnpj_titular": None, "vazamento_temporal": []}), _Fixo("dns", {}),
+        _Fixo("ct", {}), _Fixo("wayback_indice", {}), _Falha("captura", "captura falhou: HTTP 403"),
+        _Falha("wayback_snapshot", "sem snapshot até 2026-10-07"), ExtracaoNo(), CnpjNo(), _Fixo("registros", {}),
+        _Fixo("cvm_sancionador", {"processos": [], "motivo": "sem CNPJ"}),
+        _Falha("cvm_alertas", "deliberacoes: HTTP 503") if cvm_fora else _Fixo("cvm_alertas", alertas),
+    ]  # fmt: skip
+    return Motor(ctx, [*coletores, *nos_de_pendencia()], servicos)
+
+
+def _aberta(motor: Motor, pid: str) -> Pendencia:
+    return next(p for p in motor.pendencias_abertas() if p.id == pid)
+
+
+async def test_sem_texto_de_pagina_as_pendencias_que_sempre_saem_abrem(tmp_path):
+    motor = _motor_sem_pagina(tmp_path)
+    await motor.executar()
+    assert motor.status()["extracao"] == "bloqueado"
+    # a P-CNPJ abre sem candidatos (o RDAP não tem titular) e as que não dependem do CNPJ abrem já
+    assert {"P-A1", "P-B", "P-D4", "P-CNPJ"} <= set(_abertas(motor))
+    assert _aberta(motor, "P-CNPJ").candidatos == []
+    for pid in ("P-A1", "P-B", "P-D4"):
+        pendencia = _aberta(motor, pid)
+        assert pendencia.candidatos == [] and AVISO_SEM_PAGINA in pendencia.criterios, pid
+    # com a P-CNPJ respondida, as que esperavam o `cnpj` abrem também
+    await motor.responder("P-CNPJ", resposta("nao_encontrado"))
+    assert {"P-C", "P-C4", "P-D1", "P-E"} <= set(_abertas(motor))
+    assert AVISO_SEM_PAGINA in _aberta(motor, "P-C").criterios
+    assert AVISO_SEM_INDICE_CVM not in _aberta(motor, "P-C4").criterios  # o índice respondeu
+    # a P-A1 respondida com promessa de retorno abre a P-A3, mesmo sem a página
+    await motor.responder("P-A1", resposta("confirmado", {"pct_mes": 30.0, "taxa_diaria": False, "garantido": True}))
+    assert AVISO_SEM_PAGINA in _aberta(motor, "P-A3").criterios
+
+
+async def test_sem_o_indice_da_cvm_a_p_c4_abre_e_manda_conferir_as_fontes_oficiais(tmp_path):
+    motor = _motor_sem_pagina(tmp_path, cvm_fora=True)
+    await motor.executar()
+    await motor.responder("P-CNPJ", resposta("nao_encontrado"))
+    assert motor.status()["cvm_alertas"] == "erro"
+    c4 = _aberta(motor, "P-C4")
+    assert c4.candidatos == [] and AVISO_SEM_INDICE_CVM in c4.criterios
+
+
+async def test_com_pagina_e_indice_nao_ha_aviso(ctx, serv):
+    r = await PendNo("pend_b").executar(ctx, entradas_da_extracao(), {}, serv)
+    assert AVISO_SEM_PAGINA not in r.pendencias[0].criterios
+    r = await PendNo("pend_c4").executar(ctx, entradas_completas(), {}, serv)
+    assert AVISO_SEM_INDICE_CVM not in r.pendencias[0].criterios

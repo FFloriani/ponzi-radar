@@ -328,12 +328,14 @@ def nova_pendencia(
     candidatos: list[Candidato | dict],
     no_origem: str,
     matriz: Any = None,
+    avisos: list[str] | tuple[str, ...] = (),
 ) -> Pendencia:
     """A pendência `id` aberta pelo nó `no_origem`, com os `candidatos` que ele achou (`Candidato` ou dict).
 
     Cada categoria leva no máximo `MAX_CANDIDATOS_POR_CATEGORIA` candidatos; `restricoes["candidatos_omitidos"]`
     diz quantos ficaram de fora (`{}` se nenhum). `matriz` é lida só pela P-E, para listar os tipos de sinal e os
-    modificadores que ela aceita.
+    modificadores que ela aceita. `avisos` vão no fim dos critérios: o que faltou nesta execução (a página que não
+    pôde ser lida, o índice da CVM que falhou) e o que fazer sem isso.
     """
     definicao = DEFINICOES.get(id)
     if definicao is None:
@@ -346,7 +348,7 @@ def nova_pendencia(
         id=id,
         itens=list(definicao.itens),
         pergunta=definicao.pergunta,
-        criterios=definicao.criterios,
+        criterios=" ".join([definicao.criterios, *avisos]),
         candidatos=validados,
         formato_resposta=formato,
         restricoes={

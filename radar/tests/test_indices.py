@@ -21,6 +21,7 @@ from radar.indices import (
     InstituicaoBCB,
     ProcessoCVM,
     RegistroCVM,
+    vencido_desde,
 )
 from radar.modelos import ErroNo
 from radar.rede import Rede
@@ -374,8 +375,8 @@ async def test_lista_cortada_com_cache_existente_deixa_o_cache_como_estava(respx
     antes = (tmp_path / "deliberacoes.json").read_bytes()
     relogio.avancar(hours=25)
     _jsp_cortado(reg, a_partir_da=15)
-    with pytest.raises(ErroNo):
-        await indices.deliberacoes()
+    vencido = await indices.deliberacoes()  # I6: o anterior volta, marcado como vencido
+    assert vencido_desde(vencido) == AGORA + timedelta(hours=24) and len(vencido) == 7
     assert (tmp_path / "deliberacoes.json").read_bytes() == antes  # com o `gerado_em` antigo: continua vencido
 
 
@@ -409,8 +410,8 @@ async def test_deliberacoes_dentro_da_validade_nao_toca_a_rede(respx_mock, indic
 
 async def test_deliberacoes_falha_no_meio_guarda_o_progresso(respx_mock, tmp_path, indices):
     reg = mocar_deliberacoes(respx_mock)
-    funciona = reg.rota_documentos.side_effect
-    reg.rota_documentos.mock(side_effect=lambda r: httpx.Response(503) if str(r.url).endswith("deli900.htm") else funciona(r))
+    funciona = reg.rota_involucros.side_effect
+    reg.rota_involucros.mock(side_effect=lambda r: httpx.Response(503) if str(r.url).endswith("deli900.html") else funciona(r))
     with pytest.raises(ErroNo) as e:
         await indices.deliberacoes()
     assert e.value.permanente is False and "deli900" in e.value.mensagem
@@ -418,7 +419,7 @@ async def test_deliberacoes_falha_no_meio_guarda_o_progresso(respx_mock, tmp_pat
     assert [i["numero"] for i in parcial["itens"]] == [905, 903, 902, 901]
     assert parcial["gerado_em"] is None  # incompleto: o próximo uso refaz a busca
     # o servidor volta: só o que faltava é baixado
-    reg.rota_documentos.mock(side_effect=funciona)
+    reg.rota_involucros.mock(side_effect=funciona)
     antes = len(reg.involucros)
     deliberacoes = await indices.deliberacoes()
     assert [d.numero for d in deliberacoes] == sorted(NUMEROS, reverse=True)
@@ -516,12 +517,14 @@ async def test_erro_numa_deliberacao_nova_nao_a_descarta_em_silencio(respx_mock,
     funciona = reg.rota_involucros.side_effect
     resposta = {"403": lambda: httpx.Response(403), "layout": lambda: httpx.Response(200, text="<html>Nova cara</html>")}[quebra]
     reg.rota_involucros.mock(side_effect=lambda r: resposta() if str(r.url).endswith(f"deli{numero}.html") else funciona(r))
-    with pytest.raises(ErroNo) as e:
-        await indices.deliberacoes()
-    assert e.value.permanente is True and f"deli{numero}" in e.value.mensagem
+    # I6: há um índice anterior completo, então ele volta vencido (com o progresso) em vez de derrubar o nó
+    vencido = await indices.deliberacoes()
+    assert vencido_desde(vencido) == AGORA + timedelta(hours=24)
+    progresso = ([905] if numero == 903 else []) + [902, 901, 900, 899, 895]
+    assert [d.numero for d in vencido] == progresso
     cache = _cache(tmp_path, "deliberacoes")
     # o progresso fica (a 905 entra se a 903 é que falhou) e o índice continua vencido: a próxima chamada tenta de novo
-    assert [i["numero"] for i in cache["itens"]] == ([905] if numero == 903 else []) + [902, 901, 900, 899, 895]
+    assert [i["numero"] for i in cache["itens"]] == progresso
     assert cache["gerado_em"] == AGORA.isoformat()
     reg.rota_involucros.mock(side_effect=funciona)
     assert [d.numero for d in await indices.deliberacoes()] == sorted(NUMEROS, reverse=True)
@@ -667,17 +670,30 @@ async def test_htm_ausente_cai_no_pdf(respx_mock, indices):
     assert d.integral and "06.151.776/0001" in d.texto and reg.documentos == [] and reg.pdfs == [509]
 
 
-@pytest.mark.parametrize(("status", "permanente"), [(403, True), (503, False)])
-async def test_pdf_com_outro_erro_derruba_o_indice_e_guarda_o_progresso(respx_mock, tmp_path, indices, status, permanente):
+@pytest.mark.parametrize("status", [403, 503])
+async def test_anexo_de_deliberacao_antiga_com_erro_fica_so_com_o_resumo(respx_mock, tmp_path, indices, status):
+    # I6: um anexo antigo que nunca responde não trava a renovação do índice
     reg = mocar_deliberacoes(respx_mock)
     reg.jsp.mock(return_value=httpx.Response(200, text=_listagem(586, 509)))
     funciona = reg.rota_pdfs.side_effect
     reg.rota_pdfs.mock(side_effect=lambda r: httpx.Response(status) if str(r.url).endswith("deli509.pdf") else funciona(r))
+    d586, d509 = await indices.deliberacoes()
+    assert d586.integral and not d509.integral and "509" in d509.texto
+    cache = _cache(tmp_path, "deliberacoes")
+    assert [i["numero"] for i in cache["itens"]] == [586, 509] and cache["gerado_em"] == AGORA.isoformat()
+
+
+@pytest.mark.parametrize(("status", "permanente"), [(403, True), (503, False)])
+async def test_anexo_de_deliberacao_recente_com_erro_derruba_o_indice(respx_mock, tmp_path, indices, relogio, status, permanente):
+    # a recente (menos de 180 dias) é a que traz CNPJ e domínio: sem o texto dela o índice não vale
+    relogio.t = datetime(2025, 12, 1, 12, 0, 0)
+    reg = mocar_deliberacoes(respx_mock)
+    funciona = reg.rota_documentos.side_effect
+    reg.rota_documentos.mock(side_effect=lambda r: httpx.Response(status) if str(r.url).endswith("deli905.htm") else funciona(r))
     with pytest.raises(ErroNo) as e:
         await indices.deliberacoes()
-    assert e.value.permanente is permanente and "deli509" in e.value.mensagem
-    parcial = _cache(tmp_path, "deliberacoes")
-    assert [i["numero"] for i in parcial["itens"]] == [586] and parcial["gerado_em"] is None
+    assert e.value.permanente is permanente and "deli905" in e.value.mensagem
+    assert _cache(tmp_path, "deliberacoes")["gerado_em"] is None
 
 
 async def test_cache_de_antes_do_campo_integral_nao_vale(respx_mock, tmp_path, indices):
@@ -699,3 +715,25 @@ def test_urls_da_spec():
         "?$format=json&$top=100000"
     )
     assert URL_DELIBERACOES_PAGINAS.endswith("/system/modules/br.com.squadra.legislacao/elements/resultadoLegislacao.jsp")
+
+
+# ---------------------- índice vencido quando a renovação falha (I6)
+
+
+async def test_renovacao_que_falha_devolve_o_indice_vencido(respx_mock, tmp_path, indices, relogio):
+    rotas = mocar_cvm(respx_mock)
+    frescos = await indices.cadastros_cvm()
+    assert vencido_desde(frescos) is None
+    relogio.avancar(hours=25)
+    for rota in rotas.values():
+        rota.mock(return_value=httpx.Response(503))
+    vencidos = await indices.cadastros_cvm()
+    assert vencidos == frescos and vencido_desde(vencidos) == AGORA + timedelta(hours=24)
+    # o arquivo continua o de antes: a próxima chamada tenta renovar de novo
+    assert _cache(tmp_path, "cadastros_cvm")["gerado_em"] == AGORA.isoformat()
+
+
+async def test_sem_indice_anterior_a_falha_continua_erro(respx_mock, indices):
+    respx_mock.get(URL_SANCIONADOR).mock(return_value=httpx.Response(503))
+    with pytest.raises(ErroNo):
+        await indices.sancionador()

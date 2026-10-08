@@ -1,9 +1,11 @@
 """Índices de registro, sanções e alertas (CVM e BCB), baixados uma vez e guardados em disco com validade.
 
 Cada índice é um arquivo `pasta/<nome>.json` com `{"gerado_em": ISO, "itens": [...]}`, refeito quando passa de
-`ttl_horas`. Uma falha de rede nunca devolve o índice velho: vira `ErroNo` e o nó que pediu cai em erro. Os
-pedidos passam por `Rede` com `usar_cache=False`, porque o cache em memória dela não expira e devolveria o
-arquivo de horas atrás.
+`ttl_horas`. Se a renovação falha e há um índice anterior completo, ele volta como `IndiceVencido` (a lista, com
+`vencido_desde`): uma queda da CVM por um dia não derruba C1, C4 e a P-C4 de toda análise. Os nós registram isso na
+saída (`indices_vencidos`) e o dossiê o mostra nas lacunas. Sem índice anterior, a falha vira `ErroNo` e o nó que
+pediu cai em erro. Os pedidos passam por `Rede` com `usar_cache=False`, porque o cache em memória dela não expira e
+devolveria o arquivo de horas atrás.
 
 Fontes (conferidas em 07/10/2026):
 
@@ -25,9 +27,12 @@ Fontes (conferidas em 07/10/2026):
   só com o resumo (`integral=False`), e quem consulta o índice precisa dizer isso: "nenhuma correspondência" numa
   deliberação só com o resumo não prova nada sobre o CNPJ ou o domínio.
 
-Erros ao montar as deliberações: só o 404 de uma página (do invólucro, do `.htm` ou do PDF) é pulado. Qualquer outro
-erro, o invólucro sem o bloco do texto (layout novo) e a busca que corta a lista (página sem resultado antes do
-total) levantam `ErroNo`, depois de guardar o que já foi baixado, para uma deliberação nova nunca sumir em silêncio.
+Erros ao montar as deliberações: o 404 de uma página (do invólucro, do `.htm` ou do PDF) é pulado. O erro no anexo
+(`.htm` ou PDF) de uma deliberação antiga (mais de 180 dias, a mesma janela de releitura) a deixa só com o resumo e
+segue: um anexo antigo que nunca responde não trava a renovação. Qualquer outro erro (no invólucro, no anexo de uma
+deliberação recente ou sem data), o invólucro sem o bloco do texto (layout novo) e a busca que corta a lista (página
+sem resultado antes do total) levantam `ErroNo`, depois de guardar o que já foi baixado, para uma deliberação nova
+nunca sumir em silêncio.
 """
 
 from __future__ import annotations
@@ -35,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
+import logging
 import re
 import zipfile
 import zlib
@@ -51,6 +57,8 @@ from radar.cnpj_util import normalizar_cnpj
 from radar.modelos import ErroNo
 from radar.rede import ErroRede, Rede, RespostaRede
 from radar.texto import normalizar, texto_de_html, texto_de_pdf
+
+_log = logging.getLogger(__name__)
 
 URL_CVM = "https://dados.cvm.gov.br/dados/"
 # (valor de `cadastro`, caminho do ZIP em URL_CVM, CSV de pessoas jurídicas dentro do ZIP)
@@ -167,6 +175,20 @@ class Deliberacao(BaseModel):
     url: str
     texto: str
     integral: bool
+
+
+class IndiceVencido(list):
+    """Os itens do índice anterior, devolvidos porque a renovação falhou: `vencido_desde` é quando ele venceu
+    (`gerado_em` + `ttl_horas`)."""
+
+    def __init__(self, itens: Iterable, vencido_desde: datetime) -> None:
+        super().__init__(itens)
+        self.vencido_desde = vencido_desde
+
+
+def vencido_desde(itens: object) -> datetime | None:
+    """Quando venceu o índice devolvido por `Indices`, se ele é o anterior a uma renovação que falhou; senão `None`."""
+    return itens.vencido_desde if isinstance(itens, IndiceVencido) else None
 
 
 def _texto(valor: object) -> str:
@@ -308,7 +330,14 @@ class Indices:
             if cache is not None and self._vigente(cache[0]):
                 return cache[1]
             gerado_antes, anteriores = cache if cache is not None else (None, [])
-            itens = await self._atualizar_deliberacoes({d.numero: d for d in anteriores}, gerado_antes)
+            try:
+                itens = await self._atualizar_deliberacoes({d.numero: d for d in anteriores}, gerado_antes)
+            except ErroNo as erro:
+                if gerado_antes is None:  # nunca houve índice completo: não há o que devolver
+                    raise
+                # o que já veio nesta tentativa ficou no disco, com o `gerado_em` anterior
+                atual = self._ler_cache("deliberacoes", Deliberacao)
+                return self._vencido("deliberacoes", atual[1] if atual else anteriores, gerado_antes, erro)
             self._gravar("deliberacoes", itens, self._agora())
             return itens
 
@@ -347,6 +376,12 @@ class Indices:
             return False
         return timedelta(0) <= idade <= self._ttl
 
+    def _vencido(self, nome: str, itens: list[_T], gerado_em: datetime, erro: ErroNo) -> IndiceVencido:
+        desde = gerado_em + self._ttl
+        _log.warning("índice %s: a renovação falhou (%s); vale o anterior, vencido desde %s", nome, erro.mensagem,
+                     desde.isoformat())  # fmt: skip
+        return IndiceVencido(itens, desde)
+
     def _gravar(self, nome: str, itens: list[_T], gerado_em: datetime | None) -> None:
         """`gerado_em=None` marca o índice como incompleto: a próxima leitura o trata como vencido."""
         self._pasta.mkdir(parents=True, exist_ok=True)
@@ -363,7 +398,12 @@ class Indices:
             cache = self._ler_cache(nome, modelo)
             if cache is not None and self._vigente(cache[0]):
                 return cache[1]
-            itens = await baixar()
+            try:
+                itens = await baixar()
+            except ErroNo as erro:
+                if cache is None or cache[0] is None:
+                    raise
+                return self._vencido(nome, cache[1], cache[0], erro)
             self._gravar(nome, itens, self._agora())
             return itens
 
@@ -528,7 +568,15 @@ class Indices:
         resumo = texto_de_html(bloco)
         carimbo = _CARIMBO.search(resumo)
         data = date(int(carimbo[3]), _MESES_EN.index(carimbo[1]) + 1, int(carimbo[2])) if carimbo else None
-        integral = await self._texto_integral(url, bloco)
+        try:
+            integral = await self._texto_integral(url, bloco)
+        except ErroNo as erro:
+            # o anexo de uma deliberação antiga que não responde não trava o índice: ela fica só com o resumo. A
+            # recente (ou sem data) é a que traz CNPJ e domínio: o erro sobe e a renovação é tentada de novo
+            if data is None or data >= self._agora().date() - timedelta(days=_DIAS_PARA_RELER):
+                raise
+            _log.warning("deliberacoes: anexo da %s indisponível (%s); fica só com o resumo", numero, erro.mensagem)
+            integral = ""
         if not integral:
             return Deliberacao(numero=numero, data=data, url=url, texto=resumo, integral=False)
         # sem carimbo, vale a primeira data do texto integral; a do resumo cita leis e resoluções

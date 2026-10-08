@@ -643,7 +643,8 @@ def test_nova_pendencia_restricoes_acompanham_o_contexto(ctx_2019):
 
 def test_declaracao_do_no():
     no = CnpjNo()
-    assert (no.nome, no.entradas, no.opcionais, no.exige_um_de) == ("cnpj", ("extracao",), ("rdap",), ())
+    # I6: sem a página (captura e Wayback sem texto) o `cnpj` roda com o RDAP só
+    assert (no.nome, no.entradas, no.opcionais, no.exige_um_de) == ("cnpj", (), ("extracao", "rdap"), ())
     assert no.toca_alvo is False and no.as_of == "exato"
     assert no.saidas == (
         "cnpj", "razao_social", "nome_fantasia", "abertura", "cnae", "cnae_descricao",
@@ -710,3 +711,20 @@ async def test_api_fora_do_ar_deixa_o_no_em_erro(respx_mock, tmp_path):
         assert motor.saidas("cnpj") is None
     finally:
         await rede.fechar()
+
+
+# ---------------------------------------------------------------------------- sem a página (I6)
+
+
+async def test_sem_extracao_usa_o_titular_do_rdap(respx_mock, ctx_hoje, serv):
+    mocar_brasilapi(respx_mock)
+    r = await CnpjNo().executar(ctx_hoje, {"rdap": {"cnpj_titular": PETROBRAS}}, {}, serv)
+    assert isinstance(r, Feito) and r.saidas["cnpj"] == PETROBRAS
+
+
+async def test_sem_extracao_nem_titular_abre_a_p_cnpj_sem_candidatos(ctx_hoje, serv):
+    for entradas in ({}, {"rdap": {"cnpj_titular": None}}):
+        r = await CnpjNo().executar(ctx_hoje, entradas, {}, serv)
+        assert isinstance(r, Aguardando)
+        (p,) = r.pendencias
+        assert (p.id, p.candidatos) == ("P-CNPJ", [])

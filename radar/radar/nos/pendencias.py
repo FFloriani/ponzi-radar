@@ -10,18 +10,21 @@ categorias que a definição lista) e:
   invalida a resposta e reabre a pendência;
 - senão, devolve `Aguardando` com a pendência.
 
-| Nó | Entradas | Gera |
+| Nó | Entradas (opcionais entre parênteses) | Gera |
 |---|---|---|
-| `pend_a1`, `pend_b`, `pend_d4` | `extracao` | sempre |
+| `pend_a1`, `pend_b`, `pend_d4` | (`extracao`) | sempre |
 | `pend_a2` | `extracao` | só com candidato `historico_rentabilidade` |
-| `pend_a3` | `pend_a1`, `extracao` | P-A1 `confirmado`/`corrigido` com `pct_mes` > 0 ou `taxa_diaria`, ou candidato `investimento` |
-| `pend_c` | `extracao` (opcional: `cnpj`) | sempre; a empresa do `cnpj`, se há, é o candidato `empresa` |
-| `pend_c4` | `cvm_alertas` (opcional: `cnpj`) | sempre; candidato `empresa` e as correspondências só por nome |
-| `pend_d1` | `extracao` (opcional: `cnpj`) | sempre; os sócios do `cnpj`, se há, são os candidatos |
+| `pend_a3` | `pend_a1` (`extracao`) | P-A1 `confirmado`/`corrigido` com `pct_mes` > 0 ou `taxa_diaria`, ou candidato `investimento` |
+| `pend_c` | (`extracao`, `cnpj`) | sempre; a empresa do `cnpj`, se há, é o candidato `empresa` |
+| `pend_c4` | (`cvm_alertas`, `cnpj`) | sempre; candidato `empresa` e as correspondências só por nome |
+| `pend_d1` | (`extracao`, `cnpj`) | sempre; os sócios do `cnpj`, se há, são os candidatos |
 | `pend_e` | todos os coletores, opcionais | sempre |
 
 O `cnpj` é opcional da P-C, da P-C4 e da P-D1 porque a pendência abre depois dele (a P-CNPJ pode estar aguardando)
-e usa o que ele achou.
+e usa o que ele achou. A `extracao` e o `cvm_alertas` são opcionais onde a pendência sai sempre (spec 7.1, I6 da
+revisão final): o site com anti-bot e sem snapshot no Wayback, ou o índice da CVM fora do ar, não podem tirar do Claude
+as perguntas que não dependem deles. Sem eles a pendência abre sem os candidatos que viriam deles e os critérios
+ganham o aviso (`AVISO_SEM_PAGINA`, `AVISO_SEM_INDICE_CVM`).
 """
 
 from __future__ import annotations
@@ -37,6 +40,17 @@ from radar.pendencias.definicoes import DEFINICOES, nova_pendencia
 # o que o nó decide antes de abrir a pendência: os candidatos dela ou o motivo de não gerá-la
 _Preparo = Callable[[Contexto, dict[str, dict], Servicos], list[Candidato] | Pulado]
 
+AVISO_SEM_PAGINA = (
+    "Atenção: o site não pôde ser lido nesta execução (nem a captura nem o Wayback deram o texto da página), então não "
+    "há candidatos tirados dele: pesquise você mesmo nas cópias arquivadas, nas redes do operador, na imprensa e em "
+    "sites de reclamação."
+)
+AVISO_SEM_INDICE_CVM = (
+    "Atenção: o índice local de deliberações da CVM falhou nesta execução, então nenhuma deliberação foi conferida "
+    "automaticamente: confira à mão as fontes oficiais (deliberações de atuação irregular e Atos Declaratórios da "
+    "CVM, I-SCAN da IOSCO, reguladores estrangeiros)."
+)
+
 # todos os nós que coletam dados (o `alvo` só normaliza a entrada): a P-E espera por eles, qualquer que seja o resultado
 _COLETORES = (
     "rdap", "dns", "ct", "wayback_indice", "captura", "wayback_snapshot", "extracao", "cnpj", "registros",
@@ -45,9 +59,10 @@ _COLETORES = (
 
 
 def _da_extracao(entradas: dict[str, dict], pendencia: str) -> list[Candidato]:
-    """Os candidatos da extração nas categorias da pendência, na ordem em que a extração os entregou."""
+    """Os candidatos da extração nas categorias da pendência, na ordem em que a extração os entregou. Sem a
+    `extracao` nas entradas (a página não pôde ser lida), nenhum."""
     categorias = DEFINICOES[pendencia].categorias
-    candidatos = (Candidato.model_validate(c) for c in entradas["extracao"]["candidatos"])
+    candidatos = (Candidato.model_validate(c) for c in (entradas.get("extracao") or {}).get("candidatos") or [])
     return [c for c in candidatos if c.categoria in categorias]
 
 
@@ -104,7 +119,7 @@ def _preparar_c4(ctx: Contexto, entradas: dict[str, dict], s: Servicos) -> list[
     """A empresa e as deliberações da CVM que o `cvm_alertas` achou só pelo nome. Sem CNPJ nem domínio batendo, a
     identidade da empresa é palpite e quem confirma é o Claude. `artefato` das deliberações é a ref de custódia do
     JSON do `cvm_alertas`, se a saída a trouxer em `artefato`; senão, o nome do nó."""
-    saida = entradas["cvm_alertas"]
+    saida = entradas.get("cvm_alertas") or {"correspondencias": []}  # sem o índice: o aviso vai nos critérios
     artefato = saida.get("artefato") or "cvm_alertas"
     deliberacoes = [
         Candidato(
@@ -168,16 +183,18 @@ class _Especificacao:
 
 
 _ESPECIFICACOES = {
-    "pend_a1": _Especificacao("P-A1", ("extracao",), (), _candidatos_da_extracao("P-A1")),
+    "pend_a1": _Especificacao("P-A1", (), ("extracao",), _candidatos_da_extracao("P-A1")),
     "pend_a2": _Especificacao("P-A2", ("extracao",), (), _preparar_a2),
-    "pend_a3": _Especificacao("P-A3", ("pend_a1", "extracao"), (), _preparar_a3),
-    "pend_b": _Especificacao("P-B", ("extracao",), (), _candidatos_da_extracao("P-B")),
-    "pend_c": _Especificacao("P-C", ("extracao",), ("cnpj",), _preparar_c),
-    "pend_c4": _Especificacao("P-C4", ("cvm_alertas",), ("cnpj",), _preparar_c4),
-    "pend_d1": _Especificacao("P-D1", ("extracao",), ("cnpj",), _preparar_d1),
-    "pend_d4": _Especificacao("P-D4", ("extracao",), (), _candidatos_da_extracao("P-D4")),
+    "pend_a3": _Especificacao("P-A3", ("pend_a1",), ("extracao",), _preparar_a3),
+    "pend_b": _Especificacao("P-B", (), ("extracao",), _candidatos_da_extracao("P-B")),
+    "pend_c": _Especificacao("P-C", (), ("extracao", "cnpj"), _preparar_c),
+    "pend_c4": _Especificacao("P-C4", (), ("cvm_alertas", "cnpj"), _preparar_c4),
+    "pend_d1": _Especificacao("P-D1", (), ("extracao", "cnpj"), _preparar_d1),
+    "pend_d4": _Especificacao("P-D4", (), ("extracao",), _candidatos_da_extracao("P-D4")),
     "pend_e": _Especificacao("P-E", (), _COLETORES, _preparar_e),
 }
+# a fonte opcional que, ausente, vira aviso nos critérios (a P-E espera todos os coletores e não avisa)
+_AVISOS = {"extracao": AVISO_SEM_PAGINA, "cvm_alertas": AVISO_SEM_INDICE_CVM}
 
 
 class PendNo(NoBase):
@@ -195,13 +212,19 @@ class PendNo(NoBase):
     def pendencia(self) -> str:
         return self._especificacao.pendencia
 
+    def _avisos(self, entradas: dict[str, dict]) -> list[str]:
+        """O aviso de cada fonte opcional da pendência que não chegou (nó em erro, bloqueado ou pulado)."""
+        if self.nome == "pend_e":
+            return []
+        return [aviso for fonte, aviso in _AVISOS.items() if fonte in self.opcionais and fonte not in entradas]
+
     async def executar(
         self, ctx: Contexto, entradas: dict[str, dict], respostas: dict, s: Servicos
     ) -> Feito | Aguardando | Pulado:
         candidatos = self._especificacao.preparar(ctx, entradas, s)
         if isinstance(candidatos, Pulado):
             return candidatos
-        pendencia = nova_pendencia(self.pendencia, ctx, candidatos, self.nome, s.matriz)
+        pendencia = nova_pendencia(self.pendencia, ctx, candidatos, self.nome, s.matriz, self._avisos(entradas))
         if (resposta := respostas.get(self.pendencia)) is not None:
             return Feito({"resposta": resposta.model_dump(mode="json")}, pendencias=[pendencia])
         return Aguardando([pendencia])

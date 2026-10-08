@@ -13,7 +13,7 @@ import unicodedata
 from datetime import date
 
 from radar.cnpj_util import cnpj_valido, normalizar_cnpj
-from radar.indices import Deliberacao, Indices, RegistroCVM
+from radar.indices import Deliberacao, Indices, RegistroCVM, vencido_desde
 from radar.modelos import Contexto, ErroNo, Feito
 from radar.motor import NoBase, Servicos
 from radar.nos.alvo import e_plataforma
@@ -30,6 +30,13 @@ def _indices(s: Servicos) -> Indices:
     if s.indices is None:
         raise ErroNo("serviço de índices não configurado", permanente=True)
     return s.indices
+
+
+def _com_vencidos(saidas: dict, **listas: object) -> dict:
+    """`saidas` com `indices_vencidos` (`{nome do índice: vencido_desde em ISO}`) quando algum dos índices consultados
+    é o anterior a uma renovação que falhou (I6); sem nenhum, as saídas ficam como estão."""
+    vencidos = {nome: desde.isoformat() for nome, lista in listas.items() if (desde := vencido_desde(lista))}
+    return {**saidas, "indices_vencidos": vencidos} if vencidos else saidas
 
 
 def _guardar(s: Servicos, indice: str, consulta: dict, correspondencias: list[dict]) -> None:
@@ -107,7 +114,8 @@ class RegistrosNo(NoBase):
 
     nome = "registros"
     entradas = ("alvo", "cnpj")
-    saidas = ("cvm", "bcb", "bcb_dominio", "registrado", "motivo", "vazamento_temporal")
+    # `indices_vencidos` só aparece quando algum índice é o anterior a uma renovação que falhou
+    saidas = ("cvm", "bcb", "bcb_dominio", "registrado", "motivo", "vazamento_temporal", "indices_vencidos")
     as_of = "filtravel"
 
     async def executar(
@@ -118,28 +126,31 @@ class RegistrosNo(NoBase):
         consulta = {"cnpj": cnpj, "dominio": ctx.alvo, "as_of": ctx.as_of.isoformat()}
         cvm: list[dict] = []
         bcb: list[dict] = []
+        consultados: dict[str, list] = {}
         if cnpj is not None:
+            consultados["cadastros_cvm"] = await indices.cadastros_cvm()
             cvm = [
                 r.model_dump(mode="json")
-                for r in await indices.cadastros_cvm()
+                for r in consultados["cadastros_cvm"]
                 if r.cnpj == cnpj and _vigente(r, ctx.as_of)
             ]
             _guardar(s, "cadastros_cvm", consulta, cvm)
-            bcb = [i.model_dump(mode="json") for i in await indices.instituicoes_bcb() if i.raiz_cnpj == cnpj[:8]]
+            consultados["instituicoes_bcb"] = await indices.instituicoes_bcb()
+            bcb = [i.model_dump(mode="json") for i in consultados["instituicoes_bcb"] if i.raiz_cnpj == cnpj[:8]]
             _guardar(s, "instituicoes_bcb", consulta, bcb)
         dominio = ctx.alvo.lower()
-        bcb_dominio = [d.model_dump(mode="json") for d in await indices.dominios_bcb() if d.dominio == dominio]
+        consultados["dominios_bcb"] = await indices.dominios_bcb()
+        bcb_dominio = [d.model_dump(mode="json") for d in consultados["dominios_bcb"] if d.dominio == dominio]
         _guardar(s, "dominios_bcb", consulta, bcb_dominio)
-        return Feito(
-            {
-                "cvm": cvm,
-                "bcb": bcb,
-                "bcb_dominio": bcb_dominio,
-                "registrado": bool(cvm or bcb or bcb_dominio),
-                "motivo": None if cnpj is not None else "sem CNPJ",
-                "vazamento_temporal": ["bcb", "bcb_dominio"] if ctx.retroativo else [],
-            }
-        )
+        saidas = {
+            "cvm": cvm,
+            "bcb": bcb,
+            "bcb_dominio": bcb_dominio,
+            "registrado": bool(cvm or bcb or bcb_dominio),
+            "motivo": None if cnpj is not None else "sem CNPJ",
+            "vazamento_temporal": ["bcb", "bcb_dominio"] if ctx.retroativo else [],
+        }
+        return Feito(_com_vencidos(saidas, **consultados))
 
 
 # --- cvm_sancionador --------------------------------------------------------------------------------
@@ -156,7 +167,7 @@ class CvmSancionadorNo(NoBase):
 
     nome = "cvm_sancionador"
     entradas = ("cnpj",)
-    saidas = ("processos", "motivo")
+    saidas = ("processos", "motivo", "indices_vencidos")
     as_of = "filtravel"
 
     async def executar(
@@ -199,7 +210,7 @@ class CvmSancionadorNo(NoBase):
             "processos_consultados": len(todos),
         }
         _guardar(s, "sancionador", consulta, achados)
-        return Feito({"processos": achados, "motivo": None})
+        return Feito(_com_vencidos({"processos": achados, "motivo": None}, sancionador=todos))
 
 
 # --- cvm_alertas -----------------------------------------------------------------------------------
@@ -301,7 +312,7 @@ class CvmAlertasNo(NoBase):
     nome = "cvm_alertas"
     entradas = ("alvo",)
     opcionais = ("cnpj",)
-    saidas = ("correspondencias", "cobertura")
+    saidas = ("correspondencias", "cobertura", "indices_vencidos")
     as_of = "exato"
 
     async def executar(
@@ -318,4 +329,4 @@ class CvmAlertasNo(NoBase):
         cobertura = {"com_texto_integral": integrais, "so_resumo": len(consultadas) - integrais}
         consulta = {"dominio": ctx.alvo, "cnpj": cnpj, "as_of": ctx.as_of.isoformat(), "cobertura": cobertura}
         _guardar(s, "deliberacoes", consulta, correspondencias)
-        return Feito({"correspondencias": correspondencias, "cobertura": cobertura})
+        return Feito(_com_vencidos({"correspondencias": correspondencias, "cobertura": cobertura}, deliberacoes=delibs))

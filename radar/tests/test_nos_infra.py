@@ -1133,11 +1133,12 @@ async def test_nucleo_dns_servfail_deixa_o_no_em_erro_e_sem_saidas(respx_mock, t
         "alvo": "feito", "rdap": "feito", "dns": "erro", "ct": "feito", "wayback_indice": "feito",
         "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito", "cnpj": "feito",
         "registros": "erro", "cvm_sancionador": "erro", "cvm_alertas": "erro",
-        **{**PEND_COM_CNPJ, "pend_c4": "bloqueado"},  # a P-C4 depende da `cvm_alertas`, que caiu
+        **PEND_COM_CNPJ,  # I6: a P-C4 abre mesmo com a `cvm_alertas` em erro, com o aviso nos critérios
     }
     ex = carregar_execucao(ctx.pasta)
     assert "Status 2 (SERVFAIL)" in ex.status["dns"]["motivo"]
-    assert ex.status["pend_c4"] == {"status": "bloqueado", "motivo": "dependência com erro: cvm_alertas"}
+    assert ex.status["pend_c4"] == {"status": "aguardando", "motivo": None}
+    assert "índice local de deliberações da CVM falhou" in ex.pendencias["P-C4"]["criterios"]
     # esta execução não tem o serviço de índices: os três nós da CVM/BCB dizem isso e não deixam saída
     for no in ("registros", "cvm_sancionador", "cvm_alertas"):
         assert ex.status[no] == {"status": "erro", "motivo": "serviço de índices não configurado"}
