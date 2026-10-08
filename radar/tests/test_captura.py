@@ -707,6 +707,8 @@ async def test_proxy_da_config_e_usado_pelo_navegador(proxy_local, tmp_path):
     assert pagina["url"] == url
     assert "Conteúdo servido pelo proxy" in texto_de(serv, pagina)
     assert proxy_local.requisicoes == [url]
+    # R4: o documento sai pela pilha do Chromium, como GET absoluto; nada de túnel CONNECT para http
+    assert proxy_local.tuneis == []
 
 
 # ---------------------------------------------------------------------------- navegador: terceiros e falhas
@@ -781,8 +783,7 @@ async def test_proxy_fora_do_ar_e_falha_do_analista_nao_do_site(tmp_path):
     with pytest.raises(ErroNo) as e:
         await capturar(tmp_path, "http://alvo-atras-do-proxy.test/", rede=rede, max_subpaginas=0)
     assert e.value.permanente is False
-    # R4: a navegação sai pelo route.fetch, que diz a falha do proxy com o endereço dele
-    assert e.value.mensagem.startswith("captura indisponível: ") and f"127.0.0.1:{porta}" in e.value.mensagem
+    assert e.value.mensagem.startswith("captura indisponível: ") and "ERR_PROXY_CONNECTION_FAILED" in e.value.mensagem
     assert "\n" not in e.value.mensagem
 
 
@@ -1042,11 +1043,11 @@ def _ip_da_lan() -> str:
 
 
 class _ServicoLocal(ThreadingHTTPServer):
-    """Um serviço do analista em 127.0.0.1: guarda cada pedido que recebe."""
+    """Um serviço do analista (em 127.0.0.1, ou no `host` dado): guarda cada pedido que recebe."""
 
     daemon_threads = True
 
-    def __init__(self) -> None:
+    def __init__(self, host: str = "127.0.0.1") -> None:
         servidor = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -1062,7 +1063,7 @@ class _ServicoLocal(ThreadingHTTPServer):
             def log_message(self, *a) -> None:
                 pass
 
-        super().__init__(("127.0.0.1", 0), Handler)
+        super().__init__((host, 0), Handler)
         self.pedidos: list[str] = []
 
 
@@ -1077,12 +1078,32 @@ def _resposta(handler: BaseHTTPRequestHandler, status: int, corpo: bytes = b"", 
     handler.wfile.write(corpo)
 
 
-def _pagina_do_site(caminho: str, local: str, porta_ws: int) -> tuple[int, bytes, str | None]:
-    """O site hostil: a home redireciona para o serviço local; a /pagina tem uma imagem que redireciona para ele."""
+_JS_PARA_O_SALTO = "<script>setTimeout(() => { location.href = '/2saltos-b'; }, 50);</script>"
+
+
+def _pagina_do_site(caminho: str, local: str, porta_ws: int, porta: int = 0) -> tuple[int, bytes, str | None]:
+    """O site hostil (`local` é o serviço do analista; `porta`, a do próprio site):
+
+    - `/` e `/redir`: 302 para o serviço local; `/2saltos`: 302 para o próprio site, e de lá (`/2saltos-b`) para ele;
+    - `/home`: link para a `/2saltos` (a subpágina); `/js`: a página navega sozinha para a `/2saltos-b`;
+    - `/ws`: um WebSocket para o loopback; `/iframe`: um iframe de outro site (`localhost`) com a `/pagina`;
+    - o resto (`/pagina`): uma imagem que redireciona para o serviço local.
+    """
     if caminho in ("/", "/redir"):
         return 302, b"", f"{local}/segredo"
+    if caminho == "/2saltos":
+        return 302, b"", "/2saltos-b"
+    if caminho == "/2saltos-b":
+        return 302, b"", f"{local}/segredo-2saltos"
     if caminho.endswith("/img-redir"):
         return 302, b"", f"{local}/img"
+    if caminho == "/home":
+        return 200, b"<html><body><p>home publica</p><a href='/2saltos'>regras</a></body></html>", None
+    if caminho == "/js":
+        return 200, f"<html><body><p>pagina publica</p>{_JS_PARA_O_SALTO}</body></html>".encode(), None
+    if caminho == "/iframe":
+        iframe = f"<iframe src='http://localhost:{porta}/pagina'></iframe>"
+        return 200, f"<html><body><p>pagina publica</p>{iframe}</body></html>".encode(), None
     if caminho.endswith("/ws"):
         corpo = f"<html><body><p>conversa</p><script>new WebSocket('ws://127.0.0.1:{porta_ws}/');</script></body></html>"
         return 200, corpo.encode(), None
@@ -1090,14 +1111,14 @@ def _pagina_do_site(caminho: str, local: str, porta_ws: int) -> tuple[int, bytes
 
 
 @contextmanager
-def _site_hostil(host: str, porta_ws: int = 9):
-    """O serviço local, o ouvinte de WebSocket e o site hostil (em `host`, fora do loopback)."""
-    servico = _ServicoLocal()
-    local = f"http://127.0.0.1:{servico.server_port}"
+def _site_hostil(host: str, porta_ws: int = 9, servico_em: str = "127.0.0.1"):
+    """O serviço do analista (em `servico_em`) e o site hostil (em `host`)."""
+    servico = _ServicoLocal(servico_em)
+    local = f"http://{servico_em}:{servico.server_port}"
 
     class Site(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            _resposta(self, *_pagina_do_site(self.path, local, porta_ws))
+            _resposta(self, *_pagina_do_site(self.path, local, porta_ws, self.server.server_port))
 
         def log_message(self, *a) -> None:
             pass
@@ -1128,12 +1149,53 @@ async def test_redirect_da_pagina_inicial_para_endereco_local_e_barrado(tmp_path
 
 
 @lento
-async def test_redirect_de_imagem_para_endereco_local_e_barrado(tmp_path):
+@pytest.mark.parametrize(
+    ("caminho", "motivo"),
+    [("/2saltos", "redirect para endereço local bloqueado"), ("/js", "navegação para endereço local bloqueada")],
+)
+async def test_pagina_inicial_que_chega_ao_endereco_local_por_outro_salto_e_barrada(tmp_path, caminho, motivo):
+    # o salto que a rota do contexto não vê: o segundo de uma cadeia de redirect, ou o da navegação que a página faz
+    # sozinha depois de carregar (a página de erro do Chromium que fica no lugar dela não é página do site)
     with _site_hostil(_ip_da_lan()) as (servico, site):
+        with pytest.raises(ErroNo) as e:
+            await capturar(tmp_path, site + caminho, max_subpaginas=0)
+    assert servico.pedidos == []
+    assert e.value.mensagem == f"captura falhou: {motivo}: http://127.0.0.1:{servico.server_port}/segredo-2saltos"
+    assert not (tmp_path / "custodia.log").exists()
+
+
+@lento
+async def test_subpagina_que_chega_ao_endereco_local_em_dois_saltos_vai_para_falhas_sem_entrar_no_har(tmp_path):
+    with _site_hostil(_ip_da_lan()) as (servico, site):
+        r, serv = await capturar(tmp_path, site + "/home", max_subpaginas=1)
+    assert servico.pedidos == []
+    assert [p["url"] for p in r.saidas["paginas"]] == [site + "/home"]
+    destino = f"http://127.0.0.1:{servico.server_port}/segredo-2saltos"
+    motivo = f"redirect para endereço local bloqueado: {destino}"
+    assert r.saidas["falhas"] == [{"url": site + "/2saltos", "motivo": motivo}]
+    assert b"servico local" not in serv.custodia.ler(r.saidas["paginas"][0]["har"])
+
+
+@lento
+async def test_redirect_de_imagem_para_endereco_local_e_barrado(tmp_path):
+    # o site de teste em 127.0.0.1 (o loopback é dele) e o serviço do analista na rede privada: o Chromium deixa o
+    # loopback pedir à rede privada (a checagem de rede privada dele só barra o contrário), então só a guarda segura
+    with _site_hostil("127.0.0.1", servico_em=_ip_da_lan()) as (servico, site):
         r, serv = await capturar(tmp_path, site + "/pagina", max_subpaginas=0)
     assert servico.pedidos == []
     (pagina,) = r.saidas["paginas"]
     assert "pagina publica" in texto_de(serv, pagina)
+    assert b"servico local" not in serv.custodia.ler(pagina["har"])
+
+
+@lento
+async def test_imagem_num_iframe_de_outro_site_com_redirect_para_endereco_local_e_barrada(tmp_path):
+    # o iframe de localhost numa página de 127.0.0.1 é de outro site (o Chromium o roda em outro processo): a sessão do
+    # navegador inteiro também vê os pedidos e os saltos dele
+    with _site_hostil("127.0.0.1", servico_em=_ip_da_lan()) as (servico, site):
+        r, serv = await capturar(tmp_path, site + "/iframe", max_subpaginas=0)
+    assert servico.pedidos == []
+    (pagina,) = r.saidas["paginas"]
     assert b"servico local" not in serv.custodia.ler(pagina["har"])
 
 
@@ -1186,25 +1248,29 @@ class _ProxyHostil(ThreadingHTTPServer):
 
 
 @lento
-async def test_com_proxy_redirects_para_endereco_local_nao_saem_do_navegador(tmp_path):
+@pytest.mark.parametrize("caminho", ["/redir", "/2saltos"])
+@pytest.mark.parametrize("host_local", ["127.0.0.1", "[::ffff:127.0.0.1]"])
+async def test_com_proxy_redirects_para_endereco_local_nao_saem_do_navegador(tmp_path, caminho, host_local):
+    # um proxy local (Burp, mitmproxy) repassaria ao serviço do analista o que recebesse. [::ffff:127.0.0.1] é o
+    # loopback escrito como IPv6 (o Chromium o mostra como [::ffff:7f00:1])
     servico = _ServicoLocal()
-    proxy = _ProxyHostil(f"http://127.0.0.1:{servico.server_port}")
+    proxy = _ProxyHostil(f"http://{host_local}:{servico.server_port}")
     for servidor in (servico, proxy):
         threading.Thread(target=servidor.serve_forever, daemon=True).start()
     rede = RedeConfig(proxy=f"http://127.0.0.1:{proxy.server_port}")
     try:
         with pytest.raises(ErroNo) as e:
-            await capturar(tmp_path / "a", "http://alvo.test/redir", rede=rede, max_subpaginas=0)
+            await capturar(tmp_path / "a", f"http://alvo.test{caminho}", rede=rede, max_subpaginas=0)
         r, _ = await capturar(tmp_path / "b", "http://alvo.test/pagina", rede=rede, max_subpaginas=0)
     finally:
         for servidor in (servico, proxy):
             servidor.shutdown()
             servidor.server_close()
-    assert e.value.mensagem.startswith("captura falhou: redirect para endereço local bloqueado: http://127.0.0.1:")
+    assert e.value.mensagem.startswith("captura falhou: redirect para endereço local bloqueado: http://")
     assert len(r.saidas["paginas"]) == 1
-    # nem o serviço local nem o proxy viram um pedido para o 127.0.0.1: o navegador não seguiu os saltos
+    # nem o serviço local nem o proxy viram um pedido para o loopback: o navegador não seguiu os saltos
     assert servico.pedidos == []
-    assert not [v for v in proxy.vistos if "127.0.0.1" in v], proxy.vistos
+    assert not [v for v in proxy.vistos if "127.0.0.1" in v or "7f00" in v or "ffff" in v], proxy.vistos
 
 
 @lento
@@ -1238,11 +1304,37 @@ async def test_subpagina_que_termina_em_endereco_local_vai_para_falhas(tmp_path,
     ]
 
 
-def test_padroes_do_bloqueio_dos_subrecursos():
-    publico = modulo_captura._Guarda("https://exemplo.com.br/").padroes_locais()
-    assert {"*://127.*", "*://localhost/*", "*://10.*", "*://192.168.*", "*://172.20.*", "*://[::1]*"} <= set(publico)
-    # o site de teste local carrega o que é dele: o loopback sai da lista; o da LAN, a faixa dele
-    teste = modulo_captura._Guarda("http://127.0.0.1:5000/").padroes_locais()
-    assert "*://127.*" not in teste and "*://localhost/*" not in teste and "*://10.*" in teste
-    lan = modulo_captura._Guarda("http://192.168.15.5:8000/").padroes_locais()
-    assert "*://192.168.*" not in lan and "*://127.*" in lan
+def _pausa_no_fetch(url: str) -> bool:
+    """O `urlPattern` do `Fetch` do CDP casa com `url`: `*` é qualquer sequência (até vazia), `?` é um caractere."""
+    return any(
+        re.fullmatch("".join(".*" if c == "*" else "." if c == "?" else re.escape(c) for c in padrao), url)
+        for padrao in modulo_captura._PADROES_DO_FETCH
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:8080/admin", "http://0.0.0.0/", "http://10.1.2.3/", "http://192.168.0.1/",
+        "http://172.20.0.1/", "http://169.254.169.254/latest", "http://100.64.0.1/", "https://203.0.113.9/",
+        "http://[::1]:9/",
+        "http://[::ffff:7f00:1]:9/img", "http://[fd00::1]/", "http://[fe80::1]/", "http://localhost/",
+        "http://localhost.:8080/", "http://app.localhost/x", "http://usuario:senha@127.0.0.1:9/",
+    ],
+)  # fmt: skip
+def test_o_fetch_pausa_todo_endereco_local_que_a_guarda_barra(url):
+    assert not modulo_captura._Guarda("https://exemplo.com.br/").permitido(url)
+    assert _pausa_no_fetch(url)
+
+
+def test_o_fetch_nao_pausa_nome_comum_e_o_que_pausa_sem_ser_local_segue():
+    guarda = modulo_captura._Guarda("https://exemplo.com.br/")
+    for url in ("https://exemplo.com.br/termos", "https://cdn.exemplo.com.br/a.js", "https://www.google.com/"):
+        assert not _pausa_no_fetch(url) and guarda.permitido(url)
+    # pausa, mas a guarda deixa seguir: nome que começa com dígito, IP global e e-mail na query
+    for url in ("https://123exemplo.com.br/", "https://8.8.8.8/", "https://exemplo.com.br/?email=a@b.com.br"):
+        assert _pausa_no_fetch(url) and guarda.permitido(url)
+    # o site de teste local: o loopback dele pausa e segue; a rede privada não segue
+    local = modulo_captura._Guarda("http://127.0.0.1:5000/")
+    assert _pausa_no_fetch("http://localhost:9/x") and local.permitido("http://localhost:9/x")
+    assert not local.permitido("http://192.168.0.1/")

@@ -122,9 +122,10 @@ class _HandlerDoProxy(BaseHTTPRequestHandler):
         self.wfile.write(corpo)
 
     def do_CONNECT(self) -> None:
-        # a navegação da captura sai pelo `route.fetch` do Playwright, que usa CONNECT até para http: o proxy de
-        # mentira abre o túnel e responde ele mesmo ao pedido de dentro, guardando a URL absoluta como no GET
+        # o Chromium só abre túnel para https; um cliente que tunela até http (o `route.fetch` do Playwright faz isso)
+        # cai aqui: o proxy de mentira responde ele mesmo ao pedido de dentro e guarda o túnel em `tuneis`
         host = self.path.rsplit(":", 1)[0]
+        self.server.tuneis.append(self.path)
         self.send_response(200, "Connection established")
         self.end_headers()
         linha = self.rfile.readline().decode("latin-1").split()
@@ -151,6 +152,7 @@ class _Proxy(ThreadingHTTPServer):
     def __init__(self) -> None:
         super().__init__(("127.0.0.1", 0), _HandlerDoProxy)
         self.requisicoes: list[str] = []
+        self.tuneis: list[str] = []  # os `host:porta` de cada CONNECT
 
 
 @contextmanager
