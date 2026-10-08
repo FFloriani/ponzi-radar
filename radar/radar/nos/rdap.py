@@ -6,6 +6,7 @@ import re
 from typing import Any
 from urllib.parse import quote
 
+from radar.cnpj_util import normalizar_cnpj
 from radar.modelos import Contexto, ErroNo, Feito
 from radar.motor import NoBase, Servicos
 from radar.nos._api import buscar_json
@@ -50,13 +51,13 @@ def _nome_da_entidade(entidade: dict) -> str | None:
 
 
 def _cnpj_do_titular(dados: dict) -> str | None:
-    """14 dígitos do `publicIds[type=cnpj]` do titular. CPF e qualquer outro id são ignorados."""
+    """CNPJ do `publicIds[type=cnpj]` do titular: 14 caracteres em maiúsculas (dígitos ou, desde jul/2026,
+    letras e dígitos) com os dígitos verificadores certos. CPF e qualquer outro id são ignorados."""
     for titular in _entidades(dados, "registrant"):
         for id_publico in _lista(titular.get("publicIds")):
             if isinstance(id_publico, dict) and str(id_publico.get("type", "")).lower() == "cnpj":
-                digitos = re.sub(r"\D", "", str(id_publico.get("identifier", "")))
-                if len(digitos) == 14:
-                    return digitos
+                if cnpj := normalizar_cnpj(str(id_publico.get("identifier", ""))):
+                    return cnpj
     return None
 
 

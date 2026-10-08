@@ -248,6 +248,31 @@ async def test_rdap_titular_pessoa_fisica_nao_vira_cnpj_nas_saidas(respx_mock, c
     assert "12345678909" not in json.dumps(resultado.saidas)
 
 
+@pytest.mark.parametrize(
+    "identificador,esperado",
+    [
+        ("12.ABC.345/01DE-35", "12ABC34501DE35"),  # alfanumérico (IN RFB 2.229/2024), exemplo da Receita
+        ("12.abc.345/01de-35", "12ABC34501DE35"),
+        ("12ABC34501DE35", "12ABC34501DE35"),
+        ("33.000.167/0001-01", "33000167000101"),
+        ("33000167000101", "33000167000101"),
+        ("33.000.167/0001-02", None),  # DV errado
+        ("12.ABC.345/01DE-34", None),
+        ("12.ABC.345/01DE-AB", None),  # os dois últimos têm de ser dígitos
+        ("123.456.789-09", None),  # um CPF na posição do CNPJ
+        ("00.000.000/0000-00", None),
+        ("", None),
+    ],
+)
+async def test_rdap_cnpj_do_titular_numerico_ou_alfanumerico(respx_mock, ctx_hoje, serv, identificador, esperado):
+    dados = copy.deepcopy(fixture("rdap_registrobr_petrobras"))
+    dados["entities"][0]["publicIds"] = [{"type": "cnpj", "identifier": identificador}]
+    respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(200, json=dados))
+    resultado = await RdapNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+    assert resultado.saidas["cnpj_titular"] == esperado
+    assert "12345678909" not in json.dumps(resultado.saidas)
+
+
 async def test_rdap_sem_eventos_devolve_none(respx_mock, ctx_hoje, serv):
     respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(200, json={"objectClassName": "domain"}))
     resultado = await RdapNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
@@ -783,7 +808,7 @@ async def test_nucleo_ponta_a_ponta_em_modo_atual(respx_mock, tmp_path):
     assert ex.saidas["ct"]["total"] == 10
     assert ex.saidas["wayback_indice"]["total"] == 22
     # a página do Wayback (example.com) não promete nada: sem candidatos, mas com a fonte
-    assert ex.saidas["extracao"] == {"candidatos": [], "fonte": "wayback_snapshot"}
+    assert ex.saidas["extracao"] == {"candidatos": [], "fonte": "wayback_snapshot", "truncado": {}}
     # 1 RDAP + 5 DoH + 1 crt.sh + 2 CDX do Wayback (domínio e home) + snapshot da home (HTML e texto)
     assert len(log_custodia(ctx.pasta)) == 12
     assert verificar(ctx.pasta) == []
@@ -794,7 +819,8 @@ HTML_COM_PROMESSA = (
     "<script>var x = '99% a.d.';</script>"
     "<h1>Rendimento de 1,5% a.d. garantido</h1>"
     "<p>Bônus de indicação até o nível 3. Carência de 12 meses.</p>"
-    "<footer>CNPJ 33.000.167/0001-01</footer></body></html>"
+    "<footer>CNPJ 33.000.167/0001-01 <a href='https://wa.me/5511999998888'>Fale conosco</a></footer>"
+    "</body></html>"
 ).encode()
 
 
@@ -815,15 +841,23 @@ async def test_nucleo_extrai_os_candidatos_do_texto_do_snapshot(respx_mock, tmp_
         ("indicacao", "nível 3"),
         ("carencia", "carência de 12 meses"),
         ("cnpj", "33000167000101"),
+        ("whatsapp", "wa.me/5511999998888"),  # só existe no href: o texto do link é "Fale conosco"
     ]  # o 99% a.d. do <script> não é texto da página
     # o artefato é a ref do texto guardado e a posição é o índice nele
     pagina = ex.saidas["wayback_snapshot"]["paginas"][0]
     texto = Custodia(ctx.pasta).ler(pagina["texto"]).decode("utf-8")
-    for c in extracao["candidatos"]:
+    html = Custodia(ctx.pasta).ler(pagina["html"]).decode("utf-8")
+    *do_texto, do_atributo = extracao["candidatos"]
+    for c in do_texto:
         assert c["artefato"] == pagina["texto"] and c["trecho"] in texto
-    assert texto[extracao["candidatos"][0]["posicao"] :].startswith("1,5% a.d.")
+    assert texto[do_texto[0]["posicao"] :].startswith("1,5% a.d.")
+    # o candidato do atributo aponta para o HTML guardado, no offset do href
+    assert do_atributo["artefato"] == pagina["html"]
+    assert html[do_atributo["posicao"] :].startswith("https://wa.me/5511999998888")
+    assert do_atributo["trecho"] in html
+    assert extracao["truncado"] == {}
     # o CNPJ da página é o mesmo que o RDAP devolve para o titular
-    assert extracao["candidatos"][-1]["valor"] == ex.saidas["rdap"]["cnpj_titular"]
+    assert do_texto[-1]["valor"] == ex.saidas["rdap"]["cnpj_titular"]
     assert verificar(ctx.pasta) == []
 
 
