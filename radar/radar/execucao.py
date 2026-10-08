@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -18,6 +19,7 @@ from radar.rede import Rede
 
 _TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}_\d{6}")
 _PASTA_INDICES = "_indices"
+PREFIXO_CEGO = "cego-"
 
 
 def criar_contexto(
@@ -32,9 +34,12 @@ def criar_contexto(
 
     `as_of=None` vale hoje (`agora.date()`). Entrada inválida ou modo desconhecido levantam antes
     de criar qualquer pasta; dois chamados no mesmo segundo para o mesmo alvo levantam
-    `FileExistsError` na segunda.
+    `FileExistsError` na segunda. No modo cego o slug é opaco (`slug_cego`): a pasta e o `run_id`
+    não dizem o alvo, que fica só no contexto.
     """
     dominio, slug, url_inicial = normalizar_alvo(entrada)
+    if modo_cego:
+        slug = slug_cego(dominio)
     carimbo = agora.strftime("%Y-%m-%d_%H%M%S")
     ctx = Contexto(
         alvo=dominio,
@@ -49,6 +54,11 @@ def criar_contexto(
     )
     ctx.pasta.mkdir(parents=True, exist_ok=False)
     return ctx
+
+
+def slug_cego(dominio: str) -> str:
+    """`cego-` + os 12 primeiros hex do SHA-256 do domínio registrável: o mesmo alvo dá sempre o mesmo slug."""
+    return PREFIXO_CEGO + hashlib.sha256(dominio.encode("utf-8")).hexdigest()[:12]
 
 
 def criar_servicos(
@@ -116,7 +126,7 @@ def listar_casos(casos_dir: Path) -> dict[str, list[str]]:
     return casos
 
 
-def _em_modo_atual(pasta: Path) -> bool:
+def em_modo_atual(pasta: Path) -> bool:
     """O `as_of` do `estado.json` é o dia da execução. Estado ausente ou ilegível → não."""
     try:
         contexto = ler_json(pasta / "estado.json")["contexto"]
@@ -137,6 +147,6 @@ def execucao_anterior(pasta: Path) -> Path | None:
     if not pasta.parent.is_dir():
         return None
     for irma in reversed(_execucoes(pasta.parent)):
-        if irma.name < pasta.name and _em_modo_atual(irma):
+        if irma.name < pasta.name and em_modo_atual(irma):
             return irma
     return None

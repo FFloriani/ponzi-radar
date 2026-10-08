@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import shutil
 from datetime import date, datetime
@@ -20,6 +21,7 @@ from radar.execucao import (
     carregar_execucao,
     criar_contexto,
     criar_servicos,
+    em_modo_atual,
     execucao_anterior,
     listar_casos,
 )
@@ -580,6 +582,32 @@ def test_criar_contexto_retroativo_e_modos(tmp_path):
     ctx = criar_contexto("invest.io", date(2019, 6, 6), "nenhum", True, tmp_path, AGORA)
     assert ctx.as_of == date(2019, 6, 6)
     assert (ctx.modo_contato, ctx.modo_cego, ctx.retroativo) == ("nenhum", True, True)
+
+
+def test_criar_contexto_cego_tem_slug_opaco(tmp_path):
+    # R-T16-cego: no modo cego a pasta e o run_id não dizem o alvo; o mesmo alvo dá sempre o mesmo slug
+    opaco = "cego-" + hashlib.sha256(b"exemplo.com.br").hexdigest()[:12]
+    ctx = criar_contexto("https://www.Exemplo.com.br/promo", None, "captura", True, tmp_path, AGORA)
+    assert (ctx.slug, ctx.run_id) == (opaco, f"{opaco}/2026-10-07_120000")
+    assert ctx.pasta == tmp_path / opaco / "2026-10-07_120000" and ctx.pasta.is_dir()
+    assert ctx.alvo == "exemplo.com.br"  # o contexto guarda o alvo de verdade, para os nós
+    outro = criar_contexto("exemplo.com.br", None, "captura", True, tmp_path, datetime(2026, 10, 7, 12, 0, 1))
+    assert outro.slug == opaco
+    aberto = criar_contexto("exemplo.com.br", None, "captura", False, tmp_path, AGORA)
+    assert aberto.slug == "exemplo-com-br"
+    assert listar_casos(tmp_path) == {
+        opaco: ["2026-10-07_120000", "2026-10-07_120001"],
+        "exemplo-com-br": ["2026-10-07_120000"],
+    }
+
+
+def test_em_modo_atual(tmp_path):
+    atual = criar_contexto("exemplo.com.br", None, "captura", False, tmp_path, AGORA)
+    retro = criar_contexto("exemplo.com.br", date(2026, 1, 1), "captura", False, tmp_path, datetime(2026, 10, 7, 13))
+    for ctx in (atual, retro):
+        gravar_json_atomico(ctx.pasta / "estado.json", {"contexto": ctx.model_dump(mode="json")})
+    assert em_modo_atual(atual.pasta) is True and em_modo_atual(retro.pasta) is False
+    assert em_modo_atual(tmp_path / "nao-existe") is False
 
 
 def test_criar_contexto_timestamp_repetido_levanta_file_exists(tmp_path):
