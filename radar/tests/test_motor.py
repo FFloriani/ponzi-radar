@@ -420,6 +420,25 @@ async def test_correcao_mantem_historico(tmp_path, serv, diario):
     assert verificar(tmp_path) == []
 
 
+async def test_responder_grava_marcas(tmp_path, serv, diario):
+    m = Motor(ctx(tmp_path), [Falso("p", diario, pede("p", "P-1", "P-2"))], serv)
+    await m.executar()
+    await m.responder("P-1", resp(v=1), marcas=["trecho_nao_conferido", "data_desconhecida"])
+    await m.responder("P-2", resp(v=2))  # sem marcas: lista vazia, nunca ausente
+
+    julgamentos = ler_json(tmp_path / "julgamentos.json")
+    assert [j["marcas"] for j in julgamentos] == [["trecho_nao_conferido", "data_desconhecida"], []]
+    # a cópia da custódia leva as marcas
+    linhas = linhas_custodia(tmp_path)
+    guardado = json.loads(Custodia(tmp_path).ler("sha256:" + linhas[0]["sha256"]))
+    assert guardado["marcas"] == ["trecho_nao_conferido", "data_desconhecida"]
+    # a lista gravada é uma cópia: mexer na do chamador depois não muda o julgamento
+    marcas = ["data_desconhecida"]
+    await m.responder("P-2", resp(v=3, substitui="P-2#1"), marcas=marcas)
+    marcas.append("outra")
+    assert ler_json(tmp_path / "julgamentos.json")[-1]["marcas"] == ["data_desconhecida"]
+
+
 async def test_correcao_reexecuta_dono_e_descendentes(tmp_path, serv, diario):
     nos = [
         Falso("p", diario, pede("p", "P-X")),

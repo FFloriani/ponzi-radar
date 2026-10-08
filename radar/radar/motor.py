@@ -173,12 +173,16 @@ class Motor:
             self._salvar()
             await self._percorrer()
 
-    async def responder(self, pendencia_id: str, resposta: Resposta) -> list[Pendencia]:
+    async def responder(
+        self, pendencia_id: str, resposta: Resposta, marcas: list[str] | None = None
+    ) -> list[Pendencia]:
         """Grava a resposta (sem validar o conteúdo), reexecuta o que ela destrava e devolve as
         pendências abertas.
 
         Uma correção traz `resposta.substitui` com o id do julgamento ativo; a anterior fica
         `ativa=false` e o dono da pendência roda de novo, com todos os descendentes já executados.
+        `marcas` são as da validação (`trecho_nao_conferido`, `data_desconhecida`): o julgamento as
+        guarda em `"marcas"`, sempre lista (vazia sem marcas).
         """
         async with self._trava:
             anterior = self._conferir_resposta(pendencia_id, resposta)
@@ -189,6 +193,7 @@ class Motor:
                 "resposta": resposta.model_dump(mode="json"),
                 "em": datetime.now(UTC).isoformat(timespec="milliseconds"),
                 "substitui": resposta.substitui,
+                "marcas": list(marcas or []),
             }
             self.servicos.custodia.guardar(
                 _canonico(julgamento).encode("utf-8"), "json", tipo="julgamento", origem=julgamento["id"]
