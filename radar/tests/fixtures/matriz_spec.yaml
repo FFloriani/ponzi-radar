@@ -1,0 +1,45 @@
+# Só o que a P-E lê da matriz (spec 8.1): tipo de sinal -> estágio e os modificadores.
+# Cópia da spec até a Tarefa 14 criar o `carregar_matriz`.
+estagios:
+  saques_funcionando: E1
+  depoimentos: E1
+  expansao_acelerada: E2
+  influenciadores: E2
+  eventos: E2
+  escalada_taxa: E3
+  plano_novo: E3
+  troca_contrato: E3
+  carencia_maior: E3
+  novas_geografias: E3
+  atraso_pagamento: E4
+  limite_saque: E4
+  manutencao_sistema: E4
+  taxa_para_sacar: E4
+  pico_reclamacoes: E4
+  culpa_terceiros: E4
+  token_proprio: E5
+  saldo_migrado: E5
+  pagamento_parcelado: E5
+  acordos: E5
+  recuperacao_judicial: E5
+  site_fora_do_ar: E6
+  pagamentos_parados: E6
+  operacao_policial: E6
+  fuga_operador: E6
+  retomada_prometida: E7
+  lideres_novo_esquema: E7
+modificadores:
+  retorno_alto:          {direcao: encurta, origem: A1}
+  historico_fraude:      {direcao: encurta, origem: D1}
+  identidade_nova:       {direcao: encurta, origem: D3}
+  carencia_longa:        {direcao: alonga,  origem: B3}
+  midia_de_massa:        {direcao: encurta, origem: P-E}
+  colapso_vizinho:       {direcao: encurta, origem: P-E}
+  alerta_base_aberta:    {direcao: encurta, origem: P-E}
+  passivo_em_btc_alta:   {direcao: encurta, origem: P-E}
+  choque_liquidez_macro: {direcao: encurta, origem: P-E}
+  afinidade_fechada:     {direcao: alonga,  origem: P-E}
+  idosos_alvo:           {direcao: alonga,  origem: P-E}
+  defensores_ativos:     {direcao: alonga,  origem: P-E}
+  freios_terminais:      {direcao: alonga,  origem: P-E}
+  investigacao_em_curso: {direcao: corte_sem_aviso, origem: P-E}
