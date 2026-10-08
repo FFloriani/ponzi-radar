@@ -123,7 +123,7 @@ O slug sai do domínio registrável (`exemplo.com.br` vira `exemplo-com-br`), ex
 | `dns` | DNS sobre HTTPS (Cloudflare `cloudflare-dns.com/dns-query`) | A, AAAA, MX, NS, TXT; provedor de hospedagem e de e-mail | não | só atual |
 | `ct` | crt.sh (JSON) | primeiro certificado, SANs (subdomínios, domínios irmãos) | não | exato (`not_before` ≤ `as_of`) |
 | `wayback_indice` | CDX do Wayback | primeiro e último snapshot, capturas por mês | não | exato |
-| `cvm_alertas` | Deliberações de "Atuação Irregular" da CVM (stop orders; 273 em 07/10/2026), indexadas em `casos/_indices/` e renovadas se o índice tiver mais de 24 h. Os Atos Declaratórios ficam num sistema legado sem lista navegável e são consultados pela P-C4 | correspondências por CNPJ, domínio ou nome | não | exato (data do ato) |
+| `cvm_alertas` | Deliberações de "Atuação Irregular" da CVM (stop orders): a busca devolveu 273 entradas em 07/10/2026, que correspondem a 99 deliberações, uma entrada por formato. Ficam indexadas em `casos/_indices/` e são renovadas se o índice tiver mais de 24 h. O texto integral vem do `.htm` (só as mais recentes) ou do PDF anexo, extraído com `pypdf`; quando não há nenhum dos dois, fica só o resumo. A saída informa a `cobertura`. Os Atos Declaratórios ficam num sistema legado sem lista navegável e são consultados pela P-C4 | correspondências por CNPJ, domínio ou nome, mais a `cobertura` | não | exato (data do ato) |
 | `captura` | o site, via Playwright | por página: DOM, texto, screenshot, HAR, domínios de terceiros carregados | **sim** | só atual |
 | `wayback_snapshot` | Wayback (modo `id_`, HTML cru) | página inicial e até 10 subpáginas como estavam até o `as_of` | não | exato |
 | `extracao` | regex sobre o texto de `captura` ou de `wayback_snapshot` | candidatos com trecho, hash do artefato e posição | não | herda |
@@ -478,7 +478,10 @@ investimentos/
 3. **Dados abertos da CVM:** os ZIPs ficam em `dados.cvm.gov.br/dados/<DATASET>/.../DADOS/`, com CSV separado por `;` e codificação latin-1.
    - Colunas usadas: `CNPJ`, `DENOM_SOCIAL`, `DENOM_COMERC`, `SIT`, `DT_REG` e `DT_CANCEL`.
    - O processo sancionador vem em dois arquivos: `processo_sancionador.csv` e `processo_sancionador_acusado.csv`.
-4. **Deliberações:** a busca de "Atuação Irregular" em `conteudo.cvm.gov.br/legislacao` é paginada e cada deliberação tem página HTML com o texto completo. Os Atos Declaratórios ficam em `sistemas.cvm.gov.br`, sistema ASP em frames, e passam para a P-C4.
+4. **Deliberações:** a busca de "Atuação Irregular" em `conteudo.cvm.gov.br/legislacao` é paginada.
+   - A paginação usa o JSP `resultadoLegislacao.jsp` e exige o cookie `JSESSIONID` da página de partida.
+   - São 99 deliberações, e cada uma tem uma página HTML de invólucro com resumo e data. Só as mais recentes ligam ao texto integral em `.htm`; as demais o trazem em PDF ou DOC (constatado na Tarefa 11).
+   - Os Atos Declaratórios ficam em `sistemas.cvm.gov.br`, sistema ASP em frames, e passam para a P-C4.
 5. **Pacotes no Python 3.14.7:** todos instalam. Versões: `mcp` 2.3.0, `playwright` 1.63.0, `pydantic` 2.13.5, `tldextract` 5.4.0, `respx` 0.23.1, `pytest` 9.1.1. No `mcp` 2.x, o FastMCP virou `MCPServer` (`mcp.server.mcpserver`).
 6. **Limites:** o Wayback devolveu 429 em `archive.org/wayback/available`, enquanto o CDX respondeu. Os limites ficam conservadores: Wayback a 1 req/2 s, crt.sh a 1 req/3 s.
 
