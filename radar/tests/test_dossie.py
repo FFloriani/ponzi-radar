@@ -759,7 +759,7 @@ def test_dossie_nao_escreve_nada_se_a_montagem_falha(tmp_path, monkeypatch):
     with pytest.raises(UndefinedError):
         gerar_dossie(pasta, MATRIZ)
     assert sorted(p.name for p in pasta.iterdir()) == [
-        "artefatos", "custodia.log", "estado.json", "evidencias.json", "julgamentos.json"
+        "artefatos", "custodia.lock", "custodia.log", "estado.json", "evidencias.json", "julgamentos.json"
     ]  # fmt: skip
 
 
@@ -796,7 +796,8 @@ def test_dossie_gerado_de_novo_troca_os_arquivos_sem_deixar_lixo(tmp_path):
     segundo = dossie(pasta)
     assert primeiro == segundo  # nada no dossiê depende da hora de gerar
     assert sorted(p.name for p in pasta.iterdir()) == [
-        "artefatos", "custodia.log", "dossie.md", "estado.json", "evidencias.json", "julgamentos.json", "pontuacao.json"
+        "artefatos", "custodia.lock", "custodia.log", "dossie.md", "estado.json", "evidencias.json", "julgamentos.json",
+        "pontuacao.json",
     ]  # fmt: skip
 
 

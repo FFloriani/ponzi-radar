@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -15,10 +16,6 @@ from pathlib import Path
 from typing import Any
 
 _ESPERA_TRAVA_S = 0.05
-# uma trava com mais que isto foi esquecida: as nossas duram o tempo de gravar um arquivo
-_TRAVA_ORFA_S = 10 * 60
-_ACESSO_NEGADO = 5  # ERROR_ACCESS_DENIED: o processo existe, mas é de outro usuário
-_AINDA_RODANDO = 259  # STILL_ACTIVE
 
 _log = logging.getLogger(__name__)
 # teto de ~1 s (19 esperas de 50 ms) para o destino ficar livre no os.replace
@@ -81,160 +78,69 @@ def ler_json(caminho: Path, padrao: Any = None) -> Any:
     return json.loads(texto)
 
 
-def _processo_vivo(pid: int) -> bool:
-    """O processo `pid` existe. Na dúvida (sem permissão para consultar), existe."""
-    if pid <= 0:
-        return False
+def _travar_sem_esperar(descritor: int) -> bool:
+    """Tenta a trava exclusiva do sistema no lockfile aberto em `descritor`. `False`: outro handle a segura."""
     if sys.platform == "win32":
-        import ctypes
-        from ctypes import wintypes
+        import msvcrt
 
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
-        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-        if not handle:
-            return ctypes.get_last_error() == _ACESSO_NEGADO
+        os.lseek(descritor, 0, os.SEEK_SET)  # `locking` trava a partir da posição atual
         try:
-            codigo = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(codigo)):
-                return True
-            return codigo.value == _AINDA_RODANDO  # o handle de um processo que já saiu ainda abre
-        finally:
-            kernel32.CloseHandle(handle)
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:  # PermissionError: existe, é de outro usuário
+            msvcrt.locking(descritor, msvcrt.LK_NBLCK, 1)
+        except OSError as erro:
+            if erro.errno in (errno.EACCES, errno.EDEADLK):  # o byte 0 está travado por outro handle
+                return False
+            raise
         return True
+    import fcntl
+
+    try:
+        fcntl.flock(descritor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
     return True
 
 
-def _dono(caminho: Path) -> tuple[bytes | None, int | None, float | None]:
-    """O conteúdo do lockfile e o `pid` e o instante (epoch) gravados nele; os dois `None` se ilegível (o processo
-    pode ter morrido entre criar e escrever). O instante, sem conteúdo legível, é o da última escrita do arquivo.
-    Lockfile que não existe mais: `(None, None, None)`."""
-    try:
-        conteudo = caminho.read_bytes()
-        alterado = caminho.stat().st_mtime
-    except OSError:
-        return None, None, None
-    try:
-        pid, instante = conteudo.decode("ascii").split()
-        return conteudo, int(pid), float(instante)
-    except (UnicodeDecodeError, ValueError):
-        return conteudo, None, alterado
+def _destravar(descritor: int) -> None:
+    if sys.platform == "win32":
+        import msvcrt
 
+        os.lseek(descritor, 0, os.SEEK_SET)
+        msvcrt.locking(descritor, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
 
-def _quebrar_se_orfa(caminho: Path, dono: tuple[bytes | None, int | None, float | None] | None = None) -> bool:
-    """Quebra o lockfile de um processo que não existe mais ou de mais de 10 minutos, com aviso no log. `True`: vale
-    tentar de novo (a órfã foi quebrada, o lockfile sumiu ou a trava mudou de dono no meio); `False`: o dono está vivo.
-    `dono` é o que o chamador acabou de ler do lockfile (`_dono`); sem ele, o lockfile é lido aqui.
-
-    A quebra troca o nome do lockfile por um único antes de apagar: entre dois processos que veem a mesma órfã, só
-    um consegue. O renomeado é conferido; se não é a órfã (outro processo pegou a trava entre a leitura e a troca),
-    volta ao nome de antes.
-    """
-    conteudo, pid, instante = dono if dono is not None else _dono(caminho)
-    if conteudo is None:
-        return True  # sumiu entre o estouro do tempo e a leitura: a trava está livre
-    idade = time.time() - instante if instante is not None else None
-    morto = pid is not None and not _processo_vivo(pid)
-    if not (morto or (idade is not None and idade > _TRAVA_ORFA_S)):
-        return False
-    unico = caminho.with_name(f"{caminho.name}.orfa-{uuid.uuid4().hex}")
-    try:
-        os.rename(caminho, unico)
-    except FileNotFoundError:
-        return True  # outro processo quebrou antes
-    except PermissionError:
-        # no Windows, outro processo lendo ou trocando o mesmo arquivo nesse instante: tenta de novo
-        return sys.platform == "win32"
-    except OSError:
-        return False
-    try:
-        if unico.read_bytes() != conteudo:
-            try:
-                os.rename(unico, caminho)  # é a trava nova de outro processo: devolve
-            except OSError:
-                _log.warning("trava %s: não deu para devolver a trava de outro processo (%s)", caminho, unico)
-            return True
-        unico.unlink()
-    except OSError:
-        _log.warning("trava %s: a órfã renomeada ficou em %s", caminho, unico)
-        return True  # o nome da trava já está livre
-    motivo = f"o processo {pid} não existe mais" if morto else f"tem {idade / 60:.0f} minutos"
-    _log.warning("trava órfã quebrada: %s (%s)", caminho, motivo)
-    return True
-
-
-def _ocupada(caminho: Path, timeout: float) -> TimeoutError:
-    _, pid, instante = _dono(caminho)
-    dono = f"pid {pid}" if pid is not None else "dono desconhecido"
-    if instante is not None:
-        dono += ", desde " + time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(instante))
-    return TimeoutError(
-        f"trava ocupada há mais de {timeout:g} s: {caminho} ({dono}); se nenhum processo do radar estiver usando "
-        "esta execução, apague o arquivo para liberar"
-    )
+        fcntl.flock(descritor, fcntl.LOCK_UN)
 
 
 @contextmanager
 def trava(caminho: Path, timeout: float = 10.0) -> Iterator[None]:
-    """Exclusão mútua entre processos por lockfile criado com `O_CREAT|O_EXCL`, com o pid e o instante de quem a pegou.
+    """Exclusão mútua entre processos (e entre threads: cada chamada abre o próprio handle) pela trava do sistema
+    operacional num lockfile permanente: `msvcrt.locking` no byte 0 no Windows, `flock` no POSIX.
 
-    Tenta a cada 50 ms. Passado `timeout` segundos, uma trava órfã (o processo que a pegou não existe mais, ou ela
-    tem mais de 10 minutos) é quebrada com aviso no log e a espera recomeça (I8: um servidor MCP morto com a trava na
-    mão não pode impedir a retomada); senão levanta `TimeoutError`, que nomeia o arquivo e diz como liberar, sem mexer
-    no lockfile de quem a segura. O prazo conta o tempo com o mesmo dono: se a trava trocou de dono durante a espera
-    (a fila andou), a espera recomeça em vez de estourar. A liberação só apaga o lockfile se ele ainda é o desta
-    trava, e uma falha ao escrevê-lo não deixa o lockfile vazio para trás.
+    O lockfile é criado na primeira vez e nunca apagado: quem decide é a trava do kernel, não a existência do arquivo.
+    O kernel solta a trava quando o handle fecha, inclusive quando o processo morre com ela na mão (I8: um servidor MCP
+    morto não impede a retomada), então não existe trava órfã. Tenta a cada 50 ms; passados `timeout` segundos,
+    levanta `TimeoutError`, que nomeia o arquivo e diz que outro processo do radar está gravando nele. O lockfile do
+    protocolo anterior (pid e instante dentro) é só um arquivo: não segura nada.
     """
     caminho = Path(caminho)
-    limite = time.monotonic() + timeout
-    dono_no_inicio: bytes | None = None
-    while True:
-        try:
-            # O_BINARY: no Windows o modo texto gravaria \r\n, e a liberação compara o conteúdo byte a byte
-            descritor = os.open(caminho, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0))
-        except FileExistsError:
-            if dono_no_inicio is None:
-                dono_no_inicio = _dono(caminho)[0]
-        except PermissionError:
-            # no Windows, um lockfile que acabou de ser apagado ainda dá "acesso negado"
-            # até o sistema concluir a remoção: é só ocupado, tenta de novo
-            if sys.platform != "win32":
-                raise
-        else:
-            # o instante com microssegundos também distingue esta trava de outra do mesmo processo na liberação
-            meu = f"{os.getpid()} {time.time():.6f}\n".encode("ascii")
-            try:
-                os.write(descritor, meu)
-            except BaseException:
-                os.close(descritor)
-                caminho.unlink(missing_ok=True)
-                raise
-            os.close(descritor)
-            break
-        if time.monotonic() >= limite:
-            atual = _dono(caminho)
-            if atual[0] is not None and atual[0] != dono_no_inicio:
-                dono_no_inicio = atual[0]  # outro processo pegou e soltou no meio: não é o mesmo dono há `timeout`
-            elif not _quebrar_se_orfa(caminho, atual):
-                raise _ocupada(caminho, timeout)
-            limite = time.monotonic() + timeout
-            continue
-        time.sleep(_ESPERA_TRAVA_S)
+    # modo binário (O_BINARY no Windows) e sem O_EXCL: o lockfile que já existe é o mesmo de sempre
+    descritor = os.open(caminho, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o666)
     try:
-        yield
-    finally:
+        limite = time.monotonic() + timeout
+        while not _travar_sem_esperar(descritor):
+            if time.monotonic() >= limite:
+                raise TimeoutError(
+                    f"trava ocupada há mais de {timeout:g} s: {caminho}; outro processo do radar está gravando nesta "
+                    "pasta (espere ele terminar)"
+                )
+            time.sleep(_ESPERA_TRAVA_S)
         try:
-            if caminho.read_bytes() == meu:
-                caminho.unlink()
-            else:
-                _log.warning("trava %s já é de outro processo: não apago", caminho)
-        except OSError:
-            pass
+            yield
+        finally:
+            try:
+                _destravar(descritor)
+            except OSError:  # o fechamento do handle, logo abaixo, também solta a trava
+                _log.warning("trava %s: o desbloqueio falhou; ela sai quando o arquivo fecha", caminho, exc_info=True)
+    finally:
+        os.close(descritor)

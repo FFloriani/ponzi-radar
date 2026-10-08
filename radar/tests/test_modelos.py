@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import logging
 import subprocess
 import sys
 import threading
@@ -367,23 +366,24 @@ def test_trava_exclusiva(tmp_path):
             with trava(tmp_path / "x.lock", timeout=0.2): pass
 
 
-def test_trava_que_estourou_o_tempo_nao_apaga_o_lockfile_de_quem_a_segura(tmp_path):
+def test_trava_que_estourou_o_tempo_nao_solta_a_de_quem_a_segura(tmp_path):
     lock = tmp_path / "x.lock"
     with trava(lock):
-        with pytest.raises(TimeoutError):
-            with trava(lock, timeout=0.1):
-                pass
-        assert lock.exists()
-    assert not lock.exists()
+        for _ in range(2):  # o estouro de quem espera não mexe na trava de quem a segura
+            with pytest.raises(TimeoutError):
+                with trava(lock, timeout=0.1):
+                    pass
+    with trava(lock, timeout=0.2):
+        pass
 
 
 def test_trava_libera_ao_sair_e_pode_ser_readquirida(tmp_path):
     lock = tmp_path / "x.lock"
     with trava(lock):
-        assert lock.exists()
-    assert not lock.exists()
+        pass
     with trava(lock, timeout=0.2):
         pass
+    assert lock.exists()  # o lockfile é permanente: quem decide é a trava do sistema, não o arquivo
 
 
 def test_trava_libera_mesmo_com_excecao_no_corpo(tmp_path):
@@ -391,7 +391,8 @@ def test_trava_libera_mesmo_com_excecao_no_corpo(tmp_path):
     with pytest.raises(RuntimeError):
         with trava(lock):
             raise RuntimeError("falha")
-    assert not lock.exists()
+    with trava(lock, timeout=0.2):
+        pass
 
 
 def test_trava_espera_a_liberacao(tmp_path):
@@ -417,145 +418,21 @@ def test_trava_espera_a_liberacao(tmp_path):
         t.join(5)
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="no Windows, lockfile em remoção dá acesso negado")
-def test_trava_trata_acesso_negado_transitorio_do_windows_como_ocupada(tmp_path, monkeypatch):
-    real = os.open
-    falhas = []
-
-    def os_open(caminho, flags, *a, **kw):
-        if not falhas:
-            falhas.append(1)
-            raise PermissionError(13, "Acesso negado")
-        return real(caminho, flags, *a, **kw)
-
-    monkeypatch.setattr("radar.arquivos.os.open", os_open)
-    with trava(tmp_path / "x.lock", timeout=2.0):
-        pass
-    assert falhas == [1]
-
-
-# --- trava órfã (I8) ------------------------------------------------------
-
-
-def test_trava_grava_pid_e_instante(tmp_path):
+def test_threads_disputando_a_trava_entram_uma_de_cada_vez(tmp_path):
     lock = tmp_path / "x.lock"
-    antes = time.time()
-    with trava(lock):
-        pid, instante = lock.read_text(encoding="ascii").split()
-    assert int(pid) == os.getpid() and antes - 1 <= float(instante) <= time.time() + 1
-
-
-def _segurar_e_morrer(lock: Path) -> int:
-    """Um processo que pega a trava e é morto com ela na mão (o Claude Code reiniciando o servidor MCP)."""
-    codigo = (
-        "import sys, time\n"
-        "from radar.arquivos import trava\n"
-        "with trava(sys.argv[1]):\n"
-        "    print('segurando', flush=True)\n"
-        "    time.sleep(60)\n"
-    )
-    processo = subprocess.Popen([sys.executable, "-c", codigo, str(lock)], stdout=subprocess.PIPE, text=True)
-    try:
-        assert processo.stdout.readline().strip() == "segurando"
-    finally:
-        processo.kill()
-        processo.wait(10)
-        processo.stdout.close()
-    assert lock.exists()  # morreu sem soltar
-    # o pid do lockfile (no Windows, o python do venv é um lançador e o interpretador é outro processo)
-    return int(lock.read_text(encoding="ascii").split()[0])
-
-
-def test_trava_de_processo_morto_e_quebrada_com_aviso(tmp_path, caplog):
-    lock = tmp_path / "motor.lock"
-    pid = _segurar_e_morrer(lock)
-    with caplog.at_level(logging.WARNING, logger="radar.arquivos"):
-        with trava(lock, timeout=0.3):
-            assert lock.read_text(encoding="ascii").split()[0] == str(os.getpid())
-    assert not lock.exists()
-    assert any("trava órfã" in r.getMessage() and str(pid) in r.getMessage() for r in caplog.records)
-
-
-def test_trava_com_mais_de_10_minutos_e_quebrada(tmp_path):
-    lock = tmp_path / "x.lock"
-    lock.write_text(f"{os.getpid()} {time.time() - 11 * 60:.3f}\n", encoding="ascii")  # vivo, mas esquecido
-    with trava(lock, timeout=0.2):
-        pass
-    assert not lock.exists()
-
-
-def test_trava_ilegivel_e_antiga_pelo_relogio_do_arquivo_e_quebrada(tmp_path):
-    lock = tmp_path / "x.lock"
-    lock.write_bytes(b"")  # o processo morreu entre criar e escrever
-    velho = time.time() - 11 * 60
-    os.utime(lock, (velho, velho))
-    with trava(lock, timeout=0.2):
-        pass
-
-
-def test_trava_de_processo_vivo_estoura_dizendo_como_liberar(tmp_path):
-    lock = tmp_path / "x.lock"
-    with trava(lock):
-        with pytest.raises(TimeoutError) as e:
-            with trava(lock, timeout=0.1):
-                pass
-    mensagem = str(e.value)
-    assert str(lock) in mensagem and f"pid {os.getpid()}" in mensagem and "apague o arquivo" in mensagem
-
-
-# --- trava: corridas (resíduos da revisão final) -----------------------------------------------------------
-
-
-def test_lockfile_que_some_no_estouro_e_tentado_de_novo(tmp_path, monkeypatch):
-    # a trava viva some entre o estouro do tempo e a leitura do dono: está livre, tenta de novo em vez de estourar
-    lock = tmp_path / "x.lock"
-    lock.write_text(f"{os.getpid()} {time.time():.3f}\n", encoding="ascii")
-    original = arquivos._dono
-
-    def dono_que_some(caminho):
-        caminho.unlink(missing_ok=True)
-        return original(caminho)
-
-    monkeypatch.setattr(arquivos, "_dono", dono_que_some)
-    with trava(lock, timeout=0.1):
-        assert lock.read_text(encoding="ascii").split()[0] == str(os.getpid())
-
-
-def test_quebra_da_orfa_nao_apaga_a_trava_nova_de_outro_processo(tmp_path, monkeypatch):
-    # dois processos veem a mesma órfã; um deles já a trocou pela dele quando o outro vai quebrá-la
-    lock = tmp_path / "x.lock"
-    lock.write_text(f"999999999 {time.time() - 3600:.3f}\n", encoding="ascii")  # órfã: pid que não existe
-    nova = f"{os.getpid()} {time.time():.3f}\n"
-    real = os.rename
-    trocou = []
-
-    def rename(origem, destino):
-        if not trocou:  # na hora da quebra, o outro processo já pôs a trava dele
-            trocou.append(1)
-            Path(origem).write_text(nova, encoding="ascii")
-        return real(origem, destino)
-
-    monkeypatch.setattr(arquivos.os, "rename", rename)
-    assert arquivos._quebrar_se_orfa(lock) is True  # tenta de novo, sem apagar a trava do outro
-    assert lock.read_text(encoding="ascii") == nova
-    assert [p.name for p in tmp_path.iterdir()] == ["x.lock"]  # nada de sobra com o nome único
-
-
-def test_quebra_da_orfa_renomeia_e_so_um_vence(tmp_path):
-    lock = tmp_path / "x.lock"
-    lock.write_text(f"999999999 {time.time() - 3600:.3f}\n", encoding="ascii")
     dentro, maximo, erros = [0], [0], []
-    trava_de_contagem = threading.Lock()
+    contagem = threading.Lock()
 
     def entra():
         try:
-            with trava(lock, timeout=1.0):
-                with trava_de_contagem:
-                    dentro[0] += 1
-                    maximo[0] = max(maximo[0], dentro[0])
-                time.sleep(0.1)
-                with trava_de_contagem:
-                    dentro[0] -= 1
+            for _ in range(5):
+                with trava(lock, timeout=5.0):
+                    with contagem:
+                        dentro[0] += 1
+                        maximo[0] = max(maximo[0], dentro[0])
+                    time.sleep(0.01)
+                    with contagem:
+                        dentro[0] -= 1
         except Exception as erro:  # noqa: BLE001 - o teste só conta
             erros.append(erro)
 
@@ -563,25 +440,111 @@ def test_quebra_da_orfa_renomeia_e_so_um_vence(tmp_path):
     for t in threads:
         t.start()
     for t in threads:
-        t.join(10)
+        t.join(30)
     assert erros == [] and maximo[0] == 1
-    assert not lock.exists() and list(tmp_path.iterdir()) == []
+    assert [p.name for p in tmp_path.iterdir()] == ["x.lock"]  # nada além do lockfile
 
 
-def test_liberacao_so_apaga_a_trava_que_e_sua(tmp_path):
+def test_leitor_com_o_lockfile_aberto_na_liberacao_nao_deixa_a_trava_presa(tmp_path):
+    # antivírus, indexador ou outro processo com o lockfile aberto na hora da liberação: no Windows, o arquivo aberto
+    # sem FILE_SHARE_DELETE não podia ser apagado, e a trava ficava presa com o pid de um processo vivo
     lock = tmp_path / "x.lock"
     with trava(lock):
-        outra = f"999999999 {time.time():.3f}\n"
-        lock.write_text(outra, encoding="ascii")  # quebrada por idade e pega por outro processo
-    assert lock.read_text(encoding="ascii") == outra
-
-
-def test_falha_ao_escrever_o_lockfile_nao_deixa_trava_vazia(tmp_path, monkeypatch):
-    def falha(descritor, dados):
-        raise OSError(28, "disco cheio")
-
-    monkeypatch.setattr(arquivos.os, "write", falha)
-    with pytest.raises(OSError, match="disco cheio"):
-        with trava(tmp_path / "x.lock"):
+        leitor = open(lock, "rb")  # noqa: SIM115 - fica aberto durante a liberação
+    try:
+        with trava(lock, timeout=0.5):
             pass
-    assert not (tmp_path / "x.lock").exists()
+    finally:
+        leitor.close()
+
+
+def test_lockfile_do_protocolo_anterior_nao_segura_nada(tmp_path):
+    # o lockfile que a versão anterior deixou (pid e instante de um processo vivo) é só um arquivo
+    lock = tmp_path / "x.lock"
+    lock.write_bytes(f"{os.getpid()} {time.time():.6f}\n".encode("ascii"))
+    with trava(lock, timeout=0.2):
+        pass
+
+
+# --- trava entre processos: a do sistema operacional (I8, terceira passada) -----------------------------------------
+
+_SEGURA_ATE_O_STDIN_FECHAR = (
+    "import sys, time\n"
+    "from radar.arquivos import trava\n"
+    "with trava(sys.argv[1]):\n"
+    "    print('segurando', flush=True)\n"
+    "    sys.stdin.readline()\n"
+)
+
+
+def _segurando(lock: Path) -> subprocess.Popen:
+    """Um processo do radar com a trava na mão: solta quando o stdin dele fecha."""
+    processo = subprocess.Popen(
+        [sys.executable, "-c", _SEGURA_ATE_O_STDIN_FECHAR, str(lock)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+    )  # fmt: skip
+    assert processo.stdout.readline().strip() == "segurando"
+    return processo
+
+
+def _soltar(processo: subprocess.Popen) -> None:
+    processo.stdin.close()
+    processo.wait(10)
+    processo.stdout.close()
+
+
+def test_trava_de_processo_morto_fica_livre_na_hora(tmp_path):
+    # o Claude Code reinicia o servidor MCP com a trava na mão: o kernel a solta junto com o processo
+    lock = tmp_path / "motor.lock"
+    processo = _segurando(lock)
+    processo.kill()  # o stdin fica aberto: o processo não sai do `with` por conta própria
+    processo.wait(10)
+    try:
+        inicio = time.monotonic()
+        with trava(lock, timeout=5.0):
+            pass
+        assert time.monotonic() - inicio < 1.0  # nada de esperar o prazo para quebrar uma trava órfã
+    finally:
+        _soltar(processo)
+
+
+def test_trava_de_processo_vivo_estoura_nomeando_o_arquivo(tmp_path):
+    lock = tmp_path / "x.lock"
+    processo = _segurando(lock)
+    try:
+        with pytest.raises(TimeoutError) as e:
+            with trava(lock, timeout=0.3):
+                pass
+    finally:
+        _soltar(processo)
+    mensagem = str(e.value)
+    assert str(lock) in mensagem and "outro processo do radar está gravando" in mensagem
+    with trava(lock, timeout=2.0):  # o dono soltou ao terminar
+        pass
+
+
+def test_processos_disputando_a_trava_nunca_entram_juntos(tmp_path):
+    # cada processo soma 1 a um contador em arquivo, com uma pausa entre ler e gravar: sem exclusão mútua, um
+    # sobrescreve a soma do outro, e quem entra com outro dentro deixa a marca
+    codigo = (
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "from radar.arquivos import trava\n"
+        "lock, contador, dentro = map(Path, sys.argv[1:4])\n"
+        "for _ in range(30):\n"
+        "    with trava(lock, timeout=60):\n"
+        "        if dentro.exists():\n"
+        "            print('dois dentro', flush=True)\n"
+        "        dentro.write_bytes(b'')\n"
+        "        n = int(contador.read_bytes())\n"
+        "        time.sleep(0.002)\n"
+        "        contador.write_bytes(str(n + 1).encode())\n"
+        "        dentro.unlink()\n"
+    )
+    lock, contador, dentro = tmp_path / "x.lock", tmp_path / "contador", tmp_path / "dentro"
+    contador.write_bytes(b"0")
+    argumentos = [sys.executable, "-c", codigo, str(lock), str(contador), str(dentro)]
+    processos = [subprocess.Popen(argumentos, stdout=subprocess.PIPE, text=True) for _ in range(3)]
+    saidas = [p.communicate(timeout=120)[0] for p in processos]
+    assert [p.returncode for p in processos] == [0, 0, 0] and "dois dentro" not in "".join(saidas)
+    assert int(contador.read_bytes()) == 90

@@ -252,7 +252,7 @@ def test_guardar_recusa_estender_log_corrompido(tmp_path):
 
 def test_guardar_nao_deixa_lixo_na_pasta(tmp_path):
     Custodia(tmp_path).guardar(b"abc", "txt", "pagina", "a")
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["artefatos", "custodia.log"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["artefatos", "custodia.lock", "custodia.log"]  # lockfile fica
     assert [p.name for p in (tmp_path / "artefatos").iterdir()] == [f"{ABC}.txt"]
 
 

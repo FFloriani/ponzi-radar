@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from radar.arquivos import ler_json
+from radar.arquivos import ler_json, trava
 from radar.config import Config
 from radar.custodia import Custodia, verificar
 from radar.modelos import Aguardando, Contexto, ErroNo, Feito, Pendencia, Pulado, Resposta
@@ -498,7 +498,9 @@ async def test_respostas_concorrentes(tmp_path, serv, diario):
     assert {n: v["status"] for n, v in estado["nos"].items()} == {"p1": "feito", "p2": "feito"}
     assert {pid: p["aberta"] for pid, p in estado["pendencias"].items()} == {"P-1": False, "P-2": False}
     assert ler_json(tmp_path / "evidencias.json") == {"p1": {"v": 1}, "p2": {"v": 2}}
-    assert verificar(tmp_path) == [] and not (tmp_path / "motor.lock").exists()
+    assert verificar(tmp_path) == []
+    with trava(tmp_path / "motor.lock", timeout=0.1):  # a trava ficou livre (o lockfile é permanente)
+        pass
 
 
 # --- estado em disco e retomada ----------------------------------------------------------------
@@ -523,8 +525,8 @@ async def test_estado_em_disco(tmp_path, serv, diario):
     assert estado["pendencias"] == {"P-X": {**pend("P-X", "p").model_dump(mode="json"), "aberta": True}}
     assert ler_json(tmp_path / "evidencias.json") == {"a": {"de": "a"}}
     assert ler_json(tmp_path / "julgamentos.json") == []
-    # nada de trava nem temporário esquecido
-    assert sorted(f.name for f in tmp_path.iterdir()) == ["estado.json", "evidencias.json", "julgamentos.json"]
+    # nada de temporário esquecido; o lockfile da trava é permanente
+    assert sorted(f.name for f in tmp_path.iterdir()) == ["estado.json", "evidencias.json", "julgamentos.json", "motor.lock"]
 
 
 async def test_estado_gravado_a_cada_mudanca(tmp_path, serv, diario):
