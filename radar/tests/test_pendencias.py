@@ -306,6 +306,13 @@ def test_categorias_de_cada_pendencia():
     }
 
 
+@pytest.mark.parametrize(("pendencia_id", "itens"), [("P-B", "B1, B2, B3, B4"), ("P-C", "C2, C3")])
+def test_criterios_pedem_os_itens_de_cada_evidencia(pendencia_id, itens):
+    # I3: com quatro (ou dois) itens numa resposta, cada evidência diz qual item sustenta
+    c = DEFINICOES[pendencia_id].criterios
+    assert "itens" in c and itens in c
+
+
 def test_criterios_da_p_c4():
     c = DEFINICOES["P-C4"].criterios
     for termo in ("I-SCAN", "IOSCO", "FCA", "SEC", "CNMV", "Atos Declaratórios", "cobertura"):

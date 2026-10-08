@@ -126,7 +126,9 @@ _DEFINICOES = (
             "pagamento ou o saldo é em token ou moeda criada pelo operador. carencia_com_multa=true se sair antes "
             "do prazo custa uma multa que consome parte relevante do capital ou dos rendimentos. "
             "taxa_para_sacar=true se o saque só é liberado depois de o cliente pagar ou depositar algo (taxa, "
-            "imposto, 'liberação', caução). Marque true só com um trecho que o sustente nas evidencias."
+            "imposto, 'liberação', caução). Marque true só com um trecho que o sustente nas evidencias. Em cada "
+            "evidência, informe em itens os ids que ela sustenta, entre B1, B2, B3, B4 (B1 indicação, B2 token próprio, "
+            "B3 carência com multa, B4 taxa para sacar): o dossiê cita em cada item só as evidências marcadas com ele."
         ),
         modelo_valor=ValorB,
         categorias=("indicacao", "token", "carencia", "saque"),
@@ -146,7 +148,9 @@ _DEFINICOES = (
             "pessoa física ou de titular diferente da empresa identificada: compare o titular com a razão social e o "
             "CNPJ do candidato empresa (sem ele, a empresa não foi identificada e vale a que o site apresenta como "
             "operadora). offshore_alegado=true se o operador diz ter sede ou licença no exterior (por exemplo Dubai, Estônia, "
-            "ilhas) para operar sem registro no Brasil."
+            "ilhas) para operar sem registro no Brasil. Em cada evidência, informe em itens os ids que ela sustenta, "
+            "entre C2, C3 (C2 contrato atípico; C3 conta de PF ou de terceiro e sede offshore): o dossiê cita em cada "
+            "item só as evidências marcadas com ele."
         ),
         modelo_valor=ValorC,
         categorias=("contrato", "pix", "carteira"),

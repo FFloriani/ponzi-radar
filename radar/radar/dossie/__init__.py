@@ -230,15 +230,33 @@ def _pontos(item: Item) -> str:
     return f"0/{item.maximo}"
 
 
+def _marcas_das_evidencias(julgamento: dict, marcas: list[str], item: Item) -> list[str]:
+    """As marcas por evidência (`marca:evidencias[i]`) das evidências que o item cita, sem repetir."""
+    evidencias = (julgamento.get("resposta") or {}).get("evidencias")
+    indices = set()
+    for i, bruta in enumerate(evidencias if isinstance(evidencias, list) else []):
+        try:
+            if Evidencia.model_validate(bruta) in item.evidencias:
+                indices.add(f"evidencias[{i}]")
+        except ValidationError:
+            continue
+    return list(dict.fromkeys(m.partition(":")[0] for m in marcas if m.partition(":")[2] in indices))
+
+
 def _marcas(ex: ExecucaoSalva, id_: str, item: Item) -> list[str]:
     """As marcas de validação (`trecho_nao_conferido`, `data_desconhecida`) do julgamento ativo da pendência do item.
-    O item do coletor não tem julgamento por trás: as marcas da pendência não são dele."""
+    O item do coletor não tem julgamento por trás: as marcas da pendência não são dele. Com as marcas por evidência
+    (I3), o item leva só as das evidências que ele cita; um julgamento só com as agregadas as dá a todos os itens."""
     if item.origem not in _ORIGENS_COM_JULGAMENTO:
         return []
     for pid, pendencia in ex.pendencias.items():
         if id_ in (pendencia.get("itens") or []):
-            marcas = (julgamento_ativo(ex, pid) or {}).get("marcas", [])
-            return [m for m in marcas if isinstance(m, str)] if isinstance(marcas, list) else []
+            julgamento = julgamento_ativo(ex, pid) or {}
+            marcas = julgamento.get("marcas", [])
+            marcas = [m for m in marcas if isinstance(m, str)] if isinstance(marcas, list) else []
+            if any(":" in m for m in marcas):
+                return _marcas_das_evidencias(julgamento, marcas, item)
+            return marcas
     return []
 
 

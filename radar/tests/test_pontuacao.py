@@ -1047,6 +1047,46 @@ def test_modificadores_deterministicos(matriz):
     assert mods[2].evidencia is None  # D3 vem do coletor, sem trecho
 
 
+# I3: cada item cita a evidência marcada com ele, e o modificador do item cita a do item de origem
+BONUS = ev("operador", trecho="bônus de indicação em 3 níveis", itens=["B1"])
+CARENCIA = ev("operador", trecho="carência de 12 meses e multa de 30% no resgate", itens=["B3"])
+VALOR_B_POSITIVO = {**B_NEGATIVO, "indicacao": "indicacao_remunerada", "carencia_com_multa": True}
+
+
+def _trechos(it: Item) -> list[str]:
+    return [e.trecho for e in it.evidencias]
+
+
+def test_evidencias_marcadas_vao_so_para_o_item_delas(matriz):
+    ex = execucao({"pend_b": resp(valor=VALOR_B_POSITIVO, evidencias=[BONUS, CARENCIA])})
+    assert _trechos(item(ex, "B1")) == ["bônus de indicação em 3 níveis"]
+    assert _trechos(item(ex, "B3")) == ["carência de 12 meses e multa de 30% no resgate"]
+    _, mods = sinais_da_execucao(ex, matriz, None)
+    carencia = next(m for m in mods if m.id == "carencia_longa")
+    assert carencia.evidencia.trecho == "carência de 12 meses e multa de 30% no resgate"
+
+
+def test_evidencias_sem_itens_valem_para_todos_os_itens(matriz):
+    # julgamento de antes da I3: sem `itens`, cada item cita todas
+    sem_itens = [{k: v for k, v in e.items() if k != "itens"} for e in (BONUS, CARENCIA)]
+    ex = execucao({"pend_b": resp(valor=VALOR_B_POSITIVO, evidencias=sem_itens)})
+    assert _trechos(item(ex, "B1")) == _trechos(item(ex, "B3")) == [e["trecho"] for e in sem_itens]
+
+
+def test_item_sem_evidencia_propria_usa_todas(matriz):
+    ex = execucao({"pend_b": resp(valor=VALOR_B_POSITIVO, evidencias=[BONUS])})
+    assert _trechos(item(ex, "B3")) == ["bônus de indicação em 3 níveis"]
+
+
+def test_evidencias_da_p_c_por_item(matriz):
+    contrato = ev("operador", trecho="contrato de aluguel de criptomoedas", itens=["C2"])
+    conta = ev("operador", trecho="deposite na chave Pix do gerente", itens=["C3"])
+    valor = {"contrato_atipico": True, "tipo_contrato": "aluguel", "conta_pf_ou_terceiro": True, "offshore_alegado": False}
+    ex = execucao({"pend_c": resp(valor=valor, evidencias=[contrato, conta])})
+    assert _trechos(item(ex, "C2")) == ["contrato de aluguel de criptomoedas"]
+    assert _trechos(item(ex, "C3")) == ["deposite na chave Pix do gerente"]
+
+
 def test_retorno_alto_so_com_a1_4(matriz):
     _, mods = sinais_da_execucao(execucao(), matriz, None)  # A1=3
     assert mods == []

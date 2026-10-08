@@ -522,9 +522,11 @@ async def test_marcas_gravadas_no_julgamento(abrir, tmp_path):
          "tipo_fonte": "operador"}
     )
     r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-A1", resposta=resposta)
-    assert r["aceita"] is True and r["marcas"] == ["trecho_nao_conferido", "data_desconhecida"]
+    marcas = ["trecho_nao_conferido", "trecho_nao_conferido:evidencias[1]", "data_desconhecida",
+              "data_desconhecida:evidencias[0]"]  # fmt: skip
+    assert r["aceita"] is True and r["marcas"] == marcas
     [julgamento] = ler_json(pasta(tmp_path, run_id) / "julgamentos.json")
-    assert julgamento["marcas"] == ["trecho_nao_conferido", "data_desconhecida"]
+    assert julgamento["marcas"] == marcas
 
 
 async def test_ips_do_alvo_e_mascara_repassados_ao_validar(abrir, tmp_path, monkeypatch):
@@ -1258,6 +1260,7 @@ async def test_prompt_analisar_site(abrir):
     assert [p[:2] for p in passos] == ["1.", "2.", "3.", "4.", "5."]
     assert "iniciar_analise" in passos[0] and "status" in passos[0] and "em_andamento" in passos[0]
     assert all(nome in passos[1] for nome in ("ver_pendencia", "responder_pendencia", "12 caracteres"))
+    assert "itens" in passos[1] and "P-B" in passos[1] and "P-C" in passos[1]  # I3
     assert AVISO_NAO_CONFIAVEL in passos[2]
     assert "as_of" in passos[3]
     assert all(termo in passos[4] for termo in ("gerar_dossie", "eixo 1", "eixo 2", "lacunas"))

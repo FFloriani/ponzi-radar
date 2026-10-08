@@ -68,8 +68,8 @@ STATUS_FINAL = {
 ITENS_ESPERADOS = {
     "A1": ("confirmado", 4), "A2": ("nao_se_aplica", 0), "A3": ("confirmado", 2), "B1": ("confirmado", 2),
     "B2": ("nao_se_aplica", 0), "B3": ("confirmado", 1), "B4": ("nao_se_aplica", 0), "C1": ("confirmado", 3),
-    "C2": ("confirmado", 2), "C3": ("nao_se_aplica", 0), "C4": ("nao_se_aplica", 0), "D1": ("nao_encontrado", 0),
-    "D2": ("nao_verificado", 0), "D3": ("confirmado", 1), "D4": ("nao_se_aplica", 0),
+    "C2": ("confirmado", 2), "C3": ("nao_se_aplica", 0), "C4": ("nao_encontrado", 0), "D1": ("nao_encontrado", 0),
+    "D2": ("nao_verificado", 0), "D3": ("confirmado", 1), "D4": ("nao_encontrado", 0),
 }  # fmt: skip
 
 
@@ -155,8 +155,10 @@ def _mocar_indices(respx_mock) -> None:
 # ---------------------------------------------------------------------------- respostas roteirizadas
 
 
-def _evidencia(fonte: str, trecho: str) -> dict:
-    return {"fonte": fonte, "trecho": trecho, "data_fonte": AS_OF.isoformat(), "tipo_fonte": "operador"}
+def _evidencia(fonte: str, trecho: str, *itens: str) -> dict:
+    """A evidência citada; `itens`, os itens que ela sustenta (I3: na P-B e na P-C cada item cita a sua)."""
+    evidencia = {"fonte": fonte, "trecho": trecho, "data_fonte": AS_OF.isoformat(), "tipo_fonte": "operador"}
+    return {**evidencia, "itens": list(itens)} if itens else evidencia
 
 
 def respostas_roteirizadas(planos: str, inicio: str) -> dict[str, dict]:
@@ -166,12 +168,12 @@ def respostas_roteirizadas(planos: str, inicio: str) -> dict[str, dict]:
         "P-A1": {
             "status": "confirmado",
             "valor": {"pct_mes": 56.308, "taxa_diaria": True, "garantido": True},
-            "evidencias": [_evidencia(planos, "Rendimento de 1,5% ao dia garantido")],
+            "evidencias": [_evidencia(planos, "Rendimento de 1,5% ao dia garantido", "A1")],
         },
         "P-A3": {
             "status": "confirmado",
             "valor": {"origem_verificavel": False, "custodiante_independente": False},
-            "evidencias": [_evidencia(planos, "aluga as suas moedas para operações de arbitragem")],
+            "evidencias": [_evidencia(planos, "aluga as suas moedas para operações de arbitragem", "A3")],
         },
         "P-B": {
             "status": "confirmado",
@@ -182,8 +184,8 @@ def respostas_roteirizadas(planos: str, inicio: str) -> dict[str, dict]:
                 "taxa_para_sacar": False,
             },
             "evidencias": [
-                _evidencia(planos, "bônus de indicação em 3 níveis"),
-                _evidencia(planos, "carência de 12 meses e multa de 30% no resgate antecipado"),
+                _evidencia(planos, "bônus de indicação em 3 níveis", "B1"),
+                _evidencia(planos, "carência de 12 meses e multa de 30% no resgate antecipado", "B3"),
             ],
         },
         "P-C": {
@@ -194,19 +196,12 @@ def respostas_roteirizadas(planos: str, inicio: str) -> dict[str, dict]:
                 "conta_pf_ou_terceiro": False,
                 "offshore_alegado": False,
             },
-            "evidencias": [_evidencia(planos, "O contrato é de aluguel de criptomoedas")],
+            "evidencias": [_evidencia(planos, "O contrato é de aluguel de criptomoedas", "C2")],
         },
-        "P-C4": {
-            "status": "confirmado",
-            "valor": {"alerta_vigente": False, "alertas": []},
-            "evidencias": [_evidencia(planos, "Intermediação de Negócios Ltda. CNPJ 11.222.333/0001-81")],
-        },
+        # sem alerta e sem figura pública: procurado e não achado (não "confirmado" com valor falso)
+        "P-C4": {"status": "nao_encontrado", "onde_procurou": ["I-SCAN", "CVM", "busca roteirizada"]},
         "P-D1": {"status": "nao_encontrado", "onde_procurou": ["busca roteirizada"]},
-        "P-D4": {
-            "status": "confirmado",
-            "valor": {"credibilidade_emprestada": False, "tipos": []},
-            "evidencias": [_evidencia(inicio, "Plataforma de investimentos com rendimento garantido")],
-        },
+        "P-D4": {"status": "nao_encontrado", "onde_procurou": ["páginas do site", "busca roteirizada"]},
         "P-E": {
             "status": "confirmado",
             "valor": {
@@ -328,4 +323,6 @@ async def test_piramide_sintetica_ponta_a_ponta(respx_mock, servidor_local, pedi
         OURO.write_bytes(gerado.encode("utf-8"))
     assert OURO.is_file(), f"falta o ouro {OURO}: gere com RADAR_GRAVAR_OURO=1 e revise à mão"
     assert gerado == normalizar_dossie(OURO.read_bytes().decode("utf-8"), ctx.pasta)
+    # a custódia tem registros: um `verificar` vazio sem log seria "íntegro" no vazio
+    assert (ctx.pasta / "custodia.log").stat().st_size > 0
     assert verificar(ctx.pasta) == []

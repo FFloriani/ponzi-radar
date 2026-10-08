@@ -119,6 +119,10 @@ async def serv(tmp_path):
         await rede.fechar()
 
 
+# a marca da spec e a da evidência (I3): a resposta destes testes tem uma evidência só
+NAO_CONFERIDA_0 = ["trecho_nao_conferido", "trecho_nao_conferido:evidencias[0]"]
+
+
 def pend(ctx: Contexto, id: str = "P-A1") -> Pendencia:  # noqa: A002
     return nova_pendencia(id, ctx, [], "pend_teste", matriz=MATRIZ_SPEC)
 
@@ -193,7 +197,7 @@ async def test_artefato_que_nao_e_html_e_lido_como_texto(ctx, serv, ext, conteud
 async def test_artefato_png_aceita_sem_conferir(ctx, serv):
     ref = guardar(serv, PNG, "png")
     v = await validar(confirmado(ev(ref, "qualquer coisa que está na imagem")), pend(ctx), ctx, serv)
-    assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
+    assert v == Validacao(True, None, None, NAO_CONFERIDA_0)
 
 
 @pytest.mark.parametrize(
@@ -234,7 +238,7 @@ async def test_fonte_har_nao_e_citavel(ctx, serv):
 async def test_artefato_bin_aceita_sem_conferir(ctx, serv):
     ref = guardar(serv, b"\x00\x01 Saque suspenso\xff", "bin")
     v = await validar(confirmado(ev(ref, "saque suspenso")), pend(ctx), ctx, serv)
-    assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
+    assert v == Validacao(True, None, None, NAO_CONFERIDA_0)
 
 
 async def test_campo_aponta_a_evidencia_que_falhou(ctx, serv):
@@ -282,7 +286,7 @@ async def test_url_inacessivel_aceita_com_marca(ctx, serv, respx_mock):
     rota = respx_mock.get(URL).mock(return_value=httpx.Response(503))
     v = await validar(confirmado(ev(URL)), pend(ctx), ctx, serv)
     assert rota.call_count == 4  # as quatro tentativas da Rede
-    assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
+    assert v == Validacao(True, None, None, NAO_CONFERIDA_0)
 
 
 @pytest.mark.parametrize("status", [404, 410])
@@ -301,13 +305,13 @@ async def test_url_que_nao_existe_rejeita(ctx, serv, respx_mock, status):
 async def test_outro_erro_http_aceita_com_marca(ctx, serv, respx_mock, status):
     respx_mock.get(URL).mock(return_value=httpx.Response(status))
     v = await validar(confirmado(ev(URL)), pend(ctx), ctx, serv)
-    assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
+    assert v == Validacao(True, None, None, NAO_CONFERIDA_0)
 
 
 async def test_falha_de_transporte_aceita_com_marca(ctx, serv, respx_mock):
     respx_mock.get(URL).mock(side_effect=httpx.ConnectError("sem rota"))
     v = await validar(confirmado(ev(URL)), pend(ctx), ctx, serv)
-    assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
+    assert v == Validacao(True, None, None, NAO_CONFERIDA_0)
 
 
 async def test_mesma_url_em_duas_evidencias_baixa_uma_vez(ctx, serv, respx_mock):
@@ -322,7 +326,7 @@ async def test_url_de_imagem_aceita_sem_conferir(ctx, serv, respx_mock):
         return_value=httpx.Response(200, content=PNG, headers={"content-type": "image/png"})
     )
     v = await validar(confirmado(ev("https://exemplo.org/print.png")), pend(ctx), ctx, serv)
-    assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
+    assert v == Validacao(True, None, None, NAO_CONFERIDA_0)
 
 
 # --- data ------------------------------------------------------------------------------------------------
@@ -408,14 +412,14 @@ async def test_execucao_atual_nao_confere_a_data_detectada(ctx, serv, respx_mock
 async def test_sem_data_marca_data_desconhecida(ctx, serv):
     ref = guardar(serv, pagina())
     v = await validar(confirmado(ev(ref, data_fonte=None)), pend(ctx), ctx, serv)
-    assert v == Validacao(True, None, None, ["data_desconhecida"])
+    assert v == Validacao(True, None, None, ["data_desconhecida", "data_desconhecida:evidencias[0]"])
 
 
 async def test_artefato_nao_tem_data_detectada(ctx_retro, serv):
     # a data detectada é a da página que `arquivar_fonte` baixou; o artefato da custódia não passa por ela
     ref = guardar(serv, pagina('<meta property="article:published_time" content="2025-03-01">'))
     v = await validar(confirmado(ev(ref, data_fonte=None)), pend(ctx_retro), ctx_retro, serv)
-    assert v.marcas == ["data_desconhecida"]
+    assert v.marcas == ["data_desconhecida", "data_desconhecida:evidencias[0]"]
 
 
 async def test_marcas_sem_duplicatas_na_ordem_em_que_surgiram(ctx, serv, respx_mock):
@@ -425,7 +429,42 @@ async def test_marcas_sem_duplicatas_na_ordem_em_que_surgiram(ctx, serv, respx_m
     resposta = confirmado(ev(URL, data_fonte=None), ev(URL + "-2", data_fonte=None), ev(ref, data_fonte=None))
     v = await validar(resposta, pend(ctx), ctx, serv)
     assert v.aceita
-    assert v.marcas == ["trecho_nao_conferido", "data_desconhecida"]
+    # a marca agregada da spec e, depois dela, uma por evidência (I3)
+    assert v.marcas == [
+        "trecho_nao_conferido", "trecho_nao_conferido:evidencias[0]", "trecho_nao_conferido:evidencias[1]",
+        "data_desconhecida", "data_desconhecida:evidencias[0]", "data_desconhecida:evidencias[1]",
+        "data_desconhecida:evidencias[2]",
+    ]  # fmt: skip
+
+
+VALOR_B = {"indicacao": "indicacao_remunerada", "token_proprio": False, "carencia_com_multa": True,
+           "taxa_para_sacar": False}  # fmt: skip
+
+
+async def test_itens_da_evidencia_precisam_ser_da_pendencia(ctx, serv):
+    ref = guardar(serv, pagina())
+    boa = ev(ref).model_copy(update={"itens": ["B1", "B3"]})
+    v = await validar(confirmado(boa, valor=VALOR_B), pend(ctx, "P-B"), ctx, serv)
+    assert v.aceita, v
+    fora = ev(ref).model_copy(update={"itens": ["B3", "A1"]})
+    v = await validar(confirmado(boa, fora, valor=VALOR_B), pend(ctx, "P-B"), ctx, serv)
+    assert (v.aceita, v.campo) == (False, "evidencias[1].itens")
+    assert v.motivo == "item fora da pendência: A1 (a P-B cobre B1, B2, B3, B4)"
+
+
+async def test_itens_numa_pendencia_sem_itens_rejeita(ctx, serv):
+    ref = guardar(serv, pagina())
+    evidencia = ev(ref).model_copy(update={"itens": ["A1"]})
+    v = await validar(confirmado(evidencia, valor={"cnpj": "33000167000101"}), pend(ctx, "P-CNPJ"), ctx, serv)
+    assert (v.aceita, v.campo) == (False, "evidencias[0].itens")
+    assert v.motivo == "item fora da pendência: A1 (a P-CNPJ não cobre item da matriz)"
+
+
+async def test_itens_vazio_ou_ausente_vale(ctx, serv):
+    ref = guardar(serv, pagina())
+    for itens in (None, []):
+        evidencia = ev(ref).model_copy(update={"itens": itens})
+        assert (await validar(confirmado(evidencia, valor=VALOR_B), pend(ctx, "P-B"), ctx, serv)).aceita
 
 
 # --- esquema do valor ------------------------------------------------------------------------------------
@@ -711,7 +750,7 @@ async def test_outro_erro_de_dns_segue_para_a_rede(ctx, serv, dns, respx_mock, e
     dns["noticias.example.org"] = erro
     respx_mock.get(URL).mock(side_effect=httpx.ConnectError("sem rota"))
     v = await validar(confirmado(ev(URL)), pend(ctx), ctx, serv)
-    assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
+    assert v == Validacao(True, None, None, NAO_CONFERIDA_0)
 
 
 @pytest.mark.parametrize(
@@ -807,7 +846,7 @@ async def test_redirect_em_laco_nao_prende(ctx, serv, respx_mock):
         return_value=httpx.Response(302, headers={"location": "https://laco.example.org/a"})
     )
     v = await validar(confirmado(ev("https://laco.example.org/a")), pend(ctx), ctx, serv)
-    assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
+    assert v == Validacao(True, None, None, NAO_CONFERIDA_0)
 
 
 @pytest.mark.parametrize(
@@ -1023,7 +1062,7 @@ async def test_corpo_acima_de_10_mb_nao_e_guardado_e_fica_sem_conferir(ctx, serv
     grande = httpx.Response(200, content=b"x" * 10_000_001, headers={"content-type": "text/plain"})
     respx_mock.get(URL).mock(return_value=grande)
     v = await validar(confirmado(ev(URL)), pend(ctx), ctx, serv)
-    assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
+    assert v == Validacao(True, None, None, NAO_CONFERIDA_0)
     assert not (ctx.pasta / "custodia.log").exists()
     with pytest.raises(ErroRede, match="10 MB"):
         await arquivar_fonte(URL, ctx, serv)
@@ -1098,13 +1137,13 @@ async def test_pdf_com_trecho_ausente_rejeita(ctx, serv):
 async def test_pdf_sem_texto_extraivel_aceita_com_marca(ctx, serv):
     ref = guardar(serv, (FIXTURES_CVM / "sem_texto.pdf").read_bytes(), "pdf")
     v = await validar(confirmado(ev(ref, "qualquer trecho que o pdf tenha")), pend(ctx), ctx, serv)
-    assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
+    assert v == Validacao(True, None, None, ["trecho_nao_conferido", "trecho_nao_conferido:evidencias[0]"])
 
 
 async def test_pdf_que_nao_e_pdf_aceita_com_marca(ctx, serv):
     ref = guardar(serv, b"isto nao e um pdf de verdade", "pdf")
     v = await validar(confirmado(ev(ref, "qualquer trecho que o pdf tenha")), pend(ctx), ctx, serv)
-    assert v.marcas == ["trecho_nao_conferido"]
+    assert v.marcas == ["trecho_nao_conferido", "trecho_nao_conferido:evidencias[0]"]
 
 
 @pytest.mark.parametrize("tipo", ["application/pdf", "application/octet-stream", None])
@@ -1148,7 +1187,7 @@ async def test_html_sem_tipo_e_conferido_e_o_trecho_fabricado_rejeitado(ctx, ser
 async def test_binario_sem_tipo_aceita_sem_conferir(ctx, serv, respx_mock):
     respx_mock.get(URL).mock(return_value=httpx.Response(200, content=b"\x00\x01\x02\x03"))
     v = await validar(confirmado(ev(URL)), pend(ctx), ctx, serv)
-    assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
+    assert v == Validacao(True, None, None, NAO_CONFERIDA_0)
 
 
 # --- PDF: o mínimo é medido sem espaços --------------------------------------------------------------------

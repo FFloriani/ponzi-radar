@@ -42,19 +42,17 @@ O item `não verificado` ou `inconclusivo` aparece como intervalo de pontos (de 
 | A2 — Série de retornos lisa | não se aplica | 0/2 | — | — | — |  |  | P-A2 não gerada: sem histórico de rentabilidade |
 | A3 — Origem do retorno não verificável e sem custodiante | confirmado | 2/2 | regex confirmada | — | aluga as suas moedas para operações de arbitragem | operador, 2026-10-08 — `texto: http://127.0.0.1:<PORTA>/planos.html` | `sha256:<HASH>` |  |
 | B1 — Remuneração por captar ou indicar | confirmado | 2/3 | regex confirmada | — | bônus de indicação em 3 níveis | operador, 2026-10-08 — `texto: http://127.0.0.1:<PORTA>/planos.html` | `sha256:<HASH>` |  |
-| B1 |  |  |  |  | carência de 12 meses e multa de 30% no resgate antecipado | operador, 2026-10-08 — `texto: http://127.0.0.1:<PORTA>/planos.html` | `sha256:<HASH>` |  |
 | B2 — Pagamento em token ou moeda interna | não se aplica | 0/2 | Claude | — | — |  |  |  |
-| B3 — Carência com multa pesada | confirmado | 1/1 | regex confirmada | — | bônus de indicação em 3 níveis | operador, 2026-10-08 — `texto: http://127.0.0.1:<PORTA>/planos.html` | `sha256:<HASH>` |  |
-| B3 |  |  |  |  | carência de 12 meses e multa de 30% no resgate antecipado | operador, 2026-10-08 — `texto: http://127.0.0.1:<PORTA>/planos.html` | `sha256:<HASH>` |  |
+| B3 — Carência com multa pesada | confirmado | 1/1 | regex confirmada | — | carência de 12 meses e multa de 30% no resgate antecipado | operador, 2026-10-08 — `texto: http://127.0.0.1:<PORTA>/planos.html` | `sha256:<HASH>` |  |
 | B4 — Cobrança para liberar saque | não se aplica | 0/3 | Claude | — | — |  |  |  |
 | C1 — Sem registro ou autorização (CVM/BCB) | confirmado | 3/3 | coletor | — | — | coletor: registros |  | oferta de investimento sem registro na CVM nem no BCB |
 | C2 — Contrato com nome atípico | confirmado | 2/2 | regex confirmada | — | O contrato é de aluguel de criptomoedas | operador, 2026-10-08 — `texto: http://127.0.0.1:<PORTA>/planos.html` | `sha256:<HASH>` |  |
 | C3 — Conta de PF/terceiro, sem CNPJ, atividade incoerente ou offshore | não se aplica | 0/2 | Claude | — | — |  |  |  |
-| C4 — Alerta oficial vigente | não se aplica | 0/3 | Claude | — | — |  |  |  |
+| C4 — Alerta oficial vigente | não encontrado | 0/3 | Claude | — | — |  |  |  |
 | D1 — Responsáveis com histórico de fraude | não encontrado | 0/3 | Claude | — | — |  |  |  |
 | D2 — Clone de esquema conhecido | não verificado | 0–2 | — | — | — |  |  | clone de esquema conhecido: o Núcleo não verifica |
 | D3 — Identidade nova | confirmado | 1/1 | coletor | — | — | coletor: rdap, cnpj |  | domínio registrado em 2026-08-09 |
-| D4 — Credibilidade emprestada | não se aplica | 0/1 | Claude | — | — |  |  |  |
+| D4 — Credibilidade emprestada | não encontrado | 0/1 | Claude | — | — |  |  |  |
 
 ## 4. Linha do tempo
 

@@ -132,6 +132,14 @@ def test_evidencia_tipo_fonte_restrito():
     assert _evidencia().data_fonte is None
 
 
+def test_evidencia_itens_opcional():
+    # I3: a evidência diz qual item da pendência ela sustenta; sem `itens` (julgamento antigo), vale para todos
+    assert _evidencia().itens is None
+    assert _evidencia(itens=["B1", "B3"]).itens == ["B1", "B3"]
+    with pytest.raises(ValidationError):
+        _evidencia(itens="B1")
+
+
 def test_item_valida_estado_e_origem():
     item = Item(id="A1", estado="nao_verificado", pontos=0, maximo=3, origem="nenhuma")
     assert item.evidencias == [] and item.nota is None

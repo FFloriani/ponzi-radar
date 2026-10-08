@@ -284,6 +284,27 @@ def test_dossie_mostra_as_marcas_de_validacao(tmp_path):
     assert "trecho_nao_conferido" not in a3
 
 
+def test_dossie_cita_em_cada_item_a_evidencia_marcada_e_as_marcas_dela(tmp_path):
+    # I3: B1 cita o bônus e B3 a carência; a marca da evidência da carência só aparece no B3
+    bonus = {"fonte": REF_PAGINA, "trecho": "Rendimento de 5% ao mês", "data_fonte": None, "tipo_fonte": "operador",
+             "itens": ["B1"]}  # fmt: skip
+    carencia = {"fonte": URL_NOTICIA, "trecho": "paga 5% ao mês", "data_fonte": "2026-09-01",
+                "tipo_fonte": "imprensa", "itens": ["B3"]}  # fmt: skip
+    valor = {"indicacao": "indicacao_remunerada", "token_proprio": False, "carencia_com_multa": True,
+             "taxa_para_sacar": False}  # fmt: skip
+    pasta = gravar(
+        tmp_path,
+        saidas={"pend_b": resposta(valor=valor, evidencias_=[bonus, carencia])},
+        marcas={"P-B": ["data_desconhecida", "data_desconhecida:evidencias[0]"]},
+    )
+    linhas = secao(dossie(pasta), 3).splitlines()
+    b1 = [linha for linha in linhas if linha.startswith("| B1")]
+    b3 = [linha for linha in linhas if linha.startswith("| B3")]
+    assert len(b1) == len(b3) == 1
+    assert "Rendimento de 5% ao mês" in b1[0] and "data_desconhecida" in b1[0]
+    assert "paga 5% ao mês" in b3[0] and "data_desconhecida" not in b3[0]
+
+
 def test_dossie_sem_marcas_no_julgamento_nao_quebra(tmp_path):
     s3 = secao(dossie(gravar(tmp_path)), 3)  # os julgamentos da fixture não têm a chave `marcas`
     a1 = next(linha for linha in s3.splitlines() if linha.startswith("| A1"))

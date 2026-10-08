@@ -2,7 +2,8 @@
 
 `validar` é a defesa contra citação inventada. A primeira falha decide, nesta ordem:
 
-1. esquema do `valor` (e, na P-E, tipos de sinal, modificadores e índices de evidência contra a matriz);
+1. esquema do `valor` (e, na P-E, tipos de sinal, modificadores e índices de evidência contra a matriz) e os
+   `itens` de cada evidência, que têm de ser itens da pendência;
 2. fonte de cada evidência: `sha256:<hex>` da custódia ou URL http(s), que `arquivar_fonte` baixa;
 3. trecho: com pelo menos 12 caracteres e 2 palavras (os marcadores da máscara não contam; no PDF os caracteres
    são contados sem espaços), e existente no texto da fonte, comparado sem caixa, acento, aspas curvas nem
@@ -11,7 +12,9 @@
 4. data: no modo retroativo, nem a `data_fonte` nem a data que a página declara ter sido publicada passam do `as_of`.
 
 A evidência cuja fonte não dá para conferir (rede indisponível, corpo grande demais, imagem sem OCR, binário, PDF
-sem texto) entra com a marca `trecho_nao_conferido`; a sem data, com `data_desconhecida`.
+sem texto) entra com a marca `trecho_nao_conferido`; a sem data, com `data_desconhecida`. Cada marca vem uma vez na
+forma da spec (`trecho_nao_conferido`) e, depois dela, uma vez por evidência (`trecho_nao_conferido:evidencias[1]`),
+para o dossiê pôr a marca só no item que cita aquela evidência.
 
 `arquivar_fonte` é o único lugar por onde uma URL dada pelo Claude chega à rede. Ele recusa o que não é fonte
 pública: esquema que não é http(s), `localhost`, nome malformado, IP ou nome que resolve para IP não global, o
@@ -550,9 +553,21 @@ async def _carregar_fonte(fonte: str, ctx: Contexto, s: Servicos, ips_do_alvo: f
     raise ErroNo("fonte inválida: use sha256:<hex> ou URL http(s)", permanente=True)
 
 
-def _marcar(marcas: list[str], marca: str) -> None:
-    if marca not in marcas:
-        marcas.append(marca)
+def _marcar(marcas: list[str], marca: str, indice: int) -> None:
+    """A marca agregada da spec, sem repetir, e a da evidência `indice` (`marca:evidencias[i]`)."""
+    for valor in (marca, f"{marca}:evidencias[{indice}]"):
+        if valor not in marcas:
+            marcas.append(valor)
+
+
+def _itens_fora(resposta: Resposta, pendencia: Pendencia) -> Validacao | None:
+    """Os `itens` de cada evidência têm de ser itens da pendência (`B3` na P-B; nenhum na P-CNPJ e na P-E)."""
+    for i, evidencia in enumerate(resposta.evidencias):
+        if fora := [item for item in evidencia.itens or () if item not in pendencia.itens]:
+            cobre = f"cobre {', '.join(pendencia.itens)}" if pendencia.itens else "não cobre item da matriz"
+            return _rejeitar(f"item fora da pendência: {', '.join(fora)} (a {pendencia.id} {cobre})",
+                             f"evidencias[{i}].itens")  # fmt: skip
+    return None
 
 
 async def validar(
@@ -569,7 +584,7 @@ async def validar(
     validadas como as de qualquer outra resposta. `mascara` (a de `montar_mascara`) só vale com `ctx.modo_cego`.
     `ips_do_alvo`: os endereços A/AAAA do alvo (saída do nó `dns`), cujo IP literal não é fonte.
     """
-    if (rejeicao := _validar_valor(resposta, pendencia, s)) is not None:
+    if (rejeicao := _validar_valor(resposta, pendencia, s) or _itens_fora(resposta, pendencia)) is not None:
         return rejeicao
     if not resposta.evidencias:
         return Validacao(True)
@@ -600,7 +615,7 @@ async def validar(
                 f"evidencias[{i}].trecho",
             )
         if fonte.texto is None:
-            _marcar(marcas, MARCA_TRECHO_NAO_CONFERIDO)
+            _marcar(marcas, MARCA_TRECHO_NAO_CONFERIDO, i)
         elif not await fonte.contem(procurado, mascara_ativa):
             return _rejeitar("trecho não encontrado na fonte", f"evidencias[{i}].trecho")
 
@@ -611,5 +626,5 @@ async def validar(
         if ctx.retroativo and any(data > ctx.as_of for data in datas):
             return _rejeitar("data_fonte posterior ao as_of", f"evidencias[{i}].data_fonte")
         if not datas:
-            _marcar(marcas, MARCA_DATA_DESCONHECIDA)
+            _marcar(marcas, MARCA_DATA_DESCONHECIDA, i)
     return Validacao(True, marcas=marcas)

@@ -54,10 +54,14 @@ class Pendencia(BaseModel):
 
 
 class Evidencia(BaseModel):
+    """`itens`: os ids de item da pendência que a evidência sustenta (`["B3"]`). Numa pendência de vários itens (P-B,
+    P-C) cada item do dossiê cita só as evidências marcadas com ele; `None` (julgamento antigo) vale para todos."""
+
     fonte: str
     trecho: str
     data_fonte: date | None = None
     tipo_fonte: Literal["operador", "oficial", "imprensa", "relato"]
+    itens: list[str] | None = None
 
 
 class Resposta(BaseModel):

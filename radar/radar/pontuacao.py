@@ -386,6 +386,15 @@ _PELA_PENDENCIA = {
 }
 
 
+def _evidencias_do_item(resposta: Resposta | None, item_id: str) -> list[Evidencia]:
+    """As evidências que sustentam o item (I3): as marcadas com ele em `itens`; sem nenhuma marcada com ele (o
+    julgamento de antes dos `itens`, ou o item que o Claude não marcou), todas as da resposta."""
+    if resposta is None:
+        return []
+    proprias = [e for e in resposta.evidencias if e.itens and item_id in e.itens]
+    return proprias or list(resposta.evidencias)
+
+
 def _item_da_pendencia(ex: ExecucaoSalva, item_id: str, matriz: Matriz) -> Item:
     fonte = _PELA_PENDENCIA[item_id]
     leitura = _ler_pendencia(ex, fonte.no, fonte.pendencia, fonte.modelo)
@@ -400,7 +409,7 @@ def _item_da_pendencia(ex: ExecucaoSalva, item_id: str, matriz: Matriz) -> Item:
         pontos=pontos,
         maximo=matriz.itens[item_id].max,
         origem=_origem(ex, item_id, fonte.pendencia, leitura, confirmado=estado == "confirmado"),
-        evidencias=leitura.resposta.evidencias if leitura.resposta is not None else [],
+        evidencias=_evidencias_do_item(leitura.resposta, item_id),
         nota=leitura.nota,
     )
 
@@ -520,7 +529,7 @@ def _item_c3(ex: ExecucaoSalva, matriz: Matriz, oferta: bool | None) -> Item:
     automaticas = (_c3_sem_cnpj(ex), _c3_pelo_cnae(ex, oferta))
     partes = (pela_pc, *automaticas)
     maximo = matriz.itens["C3"].max
-    evidencias_pc = leitura.resposta.evidencias if leitura.resposta is not None else []
+    evidencias_pc = _evidencias_do_item(leitura.resposta, "C3")
     if disparadas := [p for p in partes if p.dispara]:
         if any(p.dispara for p in automaticas):
             origem = "coletor"
@@ -815,7 +824,8 @@ def _registro_recente(ex: ExecucaoSalva) -> Sinal | None:
 
 def _modificadores_dos_itens(itens: dict[str, Item], matriz: Matriz) -> list[ModificadorAplicado]:
     """Os modificadores cuja origem é um item valem com o item confirmado no máximo dele: o A1 = 4 do `retorno_alto`
-    (>10%/mês ou taxa diária); D1, D3 e B3 só têm um valor acima de zero."""
+    (>10%/mês ou taxa diária); D1, D3 e B3 só têm um valor acima de zero. A evidência citada é a primeira do item de
+    origem (as do item são as marcadas com ele: `_evidencias_do_item`)."""
     aplicados = []
     for id_, dados in matriz.modificadores.items():
         item = itens.get(dados["origem"])
