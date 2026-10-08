@@ -271,7 +271,7 @@ def _formato(modelo: type[BaseModel]) -> dict[str, str]:
     return {campo: _tipo(sub, defs) for campo, sub in esquema["properties"].items()}
 
 
-def _validos_da_matriz(matriz: Any) -> dict[str, str]:
+def validos_da_matriz(matriz: Any) -> dict[str, str]:
     """Os tipos de sinal (os de `estagios` e `prova_aportes_novos`, que alimenta a regra R3) e os ids dos
     modificadores que a P-E responde. Basta que `matriz` tenha `estagios` e `modificadores` (dicionários)."""
     if matriz is None:
@@ -337,7 +337,7 @@ def nova_pendencia(
     validados, omitidos = _limitar([Candidato.model_validate(c) for c in candidatos])
     formato = _formato(definicao.modelo_valor)
     if id == "P-E":
-        formato.update(_validos_da_matriz(matriz))
+        formato.update(validos_da_matriz(matriz))
     return Pendencia(
         id=id,
         itens=list(definicao.itens),

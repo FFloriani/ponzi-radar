@@ -19,8 +19,8 @@ from radar.nos._paginas import (  # noqa: F401
     chave_da_pagina,
     ordenar_paginas,
 )
-from radar.rede import ErroRede, RespostaRede
-from radar.texto import texto_de_html
+from radar.rede import ErroRede
+from radar.texto import decodificar, texto_de_html
 
 _BASE = "https://web.archive.org"
 _CDX = f"{_BASE}/cdx/search/cdx"
@@ -29,9 +29,6 @@ _TIMESTAMP = re.compile(r"\d{14}")
 # o CDX filtra por mimetype, mas o tipo vem do que o servidor declarou: uma imagem, um script ou um
 # documento servido como text/html (página de erro com status 200, por exemplo) não é página de regras
 _EXTENSOES_DE_PAGINA = frozenset({"html", "htm", "xhtml", "shtml", "php", "asp", "aspx", "jsp", "cfm"})
-_BYTES_PARA_META = 4096
-_META_CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?\s*([A-Za-z0-9_.:\-]+)""", re.IGNORECASE)
-_BOM = chr(0xFEFF)
 
 
 def _iso(timestamp: str) -> str:
@@ -182,25 +179,6 @@ def _subpaginas(capturas: list[tuple[str, str]], limite: int) -> list[tuple[str,
     return [recentes[chave] for chave in ordem[: max(0, limite)]]
 
 
-def _decodificar(resposta: RespostaRede) -> str:
-    """Charset do cabeçalho; sem ele, o do `<meta>` do HTML (sites antigos em ISO-8859-1); senão UTF-8.
-
-    O charset vem do site investigado e pode ser qualquer coisa: o nome que o Python não conhece
-    (`LookupError`) e o codec que não decodifica texto (`idna`, `undefined`: `UnicodeError`) caem no
-    UTF-8 com `replace`, nunca derrubam o nó.
-    """
-    if "charset" not in resposta.headers.get("content-type", "").lower():
-        achado = _META_CHARSET.search(resposta.conteudo[:_BYTES_PARA_META])
-        if achado:
-            try:
-                texto = resposta.conteudo.decode(achado.group(1).decode("ascii"), errors="replace")
-            except (LookupError, UnicodeError):
-                pass
-            else:
-                return texto.removeprefix(_BOM)
-    return resposta.texto
-
-
 async def _baixar(s: Servicos, timestamp: str, original: str) -> dict:
     """Snapshot cru (`id_`: sem a barra do Wayback e sem links reescritos), HTML e texto na custódia."""
     url = f"{_BASE}/web/{timestamp}id_/{original}"
@@ -208,7 +186,7 @@ async def _baixar(s: Servicos, timestamp: str, original: str) -> dict:
         resposta = await s.rede.get(url, tipo="api")
     except ErroRede as erro:
         raise ErroNo(f"Wayback: {erro}", permanente=erro.permanente) from erro
-    texto = texto_de_html(_decodificar(resposta))
+    texto = texto_de_html(decodificar(resposta.conteudo, resposta.headers.get("content-type")))
     return {
         "url": original,
         "timestamp": timestamp,

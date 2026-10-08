@@ -35,7 +35,6 @@ from __future__ import annotations
 import asyncio
 import csv
 import io
-import logging
 import re
 import zipfile
 import zlib
@@ -46,13 +45,12 @@ from typing import Literal, TypeVar
 from urllib.parse import urljoin
 
 from pydantic import BaseModel, ValidationError
-from pypdf import PdfReader
 
 from radar.arquivos import gravar_json_atomico, ler_json
 from radar.cnpj_util import normalizar_cnpj
 from radar.modelos import ErroNo
 from radar.rede import ErroRede, Rede, RespostaRede
-from radar.texto import normalizar, texto_de_html
+from radar.texto import normalizar, texto_de_html, texto_de_pdf
 
 URL_CVM = "https://dados.cvm.gov.br/dados/"
 # (valor de `cadastro`, caminho do ZIP em URL_CVM, CSV de pessoas jurídicas dentro do ZIP)
@@ -102,11 +100,6 @@ _LINK_DELIBERACAO = re.compile(r"""href\s*=\s*["']([^"']*/deliberacoes/deli\d+/d
 _BLOCO_DO_TEXTO = re.compile(r"<article\b[^>]*\bcontentTextoGeral\b[^>]*>(.*?)</article>", re.IGNORECASE | re.DOTALL)
 _LINK_DO_DOCUMENTO = re.compile(r"""<a\b[^>]*\bhref\s*=\s*["']([^"']*/anexos/[^"']*\.html?)["']""", re.IGNORECASE)
 _LINK_DO_PDF = re.compile(r"""<a\b[^>]*\bhref\s*=\s*["']([^"']*/anexos/[^"']*\.pdf)["']""", re.IGNORECASE)
-# as deliberações têm 1 ou 2 páginas e 40 a 300 KB; o que passar disso não é uma delas
-_MAX_BYTES_PDF = 10_000_000
-_MAX_PAGINAS_PDF = 60
-# o menor texto de PDF real tinha mais de 2 mil caracteres; abaixo disto é PDF de imagem ou lixo
-_MIN_CARACTERES_PDF = 100
 # um anexo pode ser publicado depois do invólucro: o que está só com o resumo é visto de novo por este prazo
 _DIAS_PARA_RELER = 180
 _MESES_EN = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
@@ -126,8 +119,6 @@ _DATA_BR = re.compile(r"(\d{2})/(\d{2})/(\d{4})")
 _RAIZ = re.compile(r"[0-9A-Z]{8}")
 
 _T = TypeVar("_T", bound=BaseModel)
-
-logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 
 class RegistroCVM(BaseModel):
@@ -258,21 +249,6 @@ def _linhas_olinda(resposta: RespostaRede, rotulo: str) -> list[dict]:
 def _raiz(valor: object) -> str | None:
     texto = _texto(valor).upper()
     return texto if _RAIZ.fullmatch(texto) else None
-
-
-def _texto_do_pdf(dados: bytes) -> str:
-    """O texto do PDF (páginas separadas por linha em branco), ou `""` se não é PDF, é grande demais ou não tem
-    texto para extrair (PDF de imagem). O PDF vem do site da CVM, mas qualquer falha do `pypdf` com ele é só
-    "sem texto": a deliberação fica com o resumo em vez de derrubar o índice."""
-    if len(dados) > _MAX_BYTES_PDF:
-        return ""
-    try:
-        paginas = PdfReader(io.BytesIO(dados)).pages
-        partes = [(paginas[i].extract_text() or "").strip() for i in range(min(len(paginas), _MAX_PAGINAS_PDF))]
-    except Exception:  # PdfReadError, EmptyFileError, ValueError, RecursionError...
-        return ""
-    texto = "\n\n".join(parte for parte in partes if parte)
-    return texto if len(" ".join(texto.split())) >= _MIN_CARACTERES_PDF else ""
 
 
 def _bloco_do_texto(html: str) -> str | None:
@@ -564,7 +540,8 @@ class Indices:
         """O texto do `.htm` do anexo ou, sem ele (ou sem texto nele), o do PDF; `""` se nenhum dos dois serve."""
         for padrao, extrair in (
             (_LINK_DO_DOCUMENTO, lambda r: texto_de_html(r.texto).strip()),
-            (_LINK_DO_PDF, lambda r: _texto_do_pdf(r.conteudo)),
+            # qualquer falha do `pypdf` com o PDF é só "sem texto": a deliberação fica com o resumo
+            (_LINK_DO_PDF, lambda r: texto_de_pdf(r.conteudo)),
         ):
             link = padrao.search(bloco)
             resposta = await self._get_ou_none(urljoin(url, link[1]), "deliberacoes") if link else None

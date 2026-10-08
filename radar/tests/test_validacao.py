@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from datetime import date, datetime
 from pathlib import Path
 
@@ -15,7 +16,8 @@ from radar.modelos import Contexto, ErroNo, Evidencia, Pendencia, Resposta
 from radar.motor import Servicos
 from radar.pendencias.definicoes import nova_pendencia
 from radar.pendencias.validacao import FonteArquivada, Validacao, arquivar_fonte, validar
-from radar.rede import Rede
+from radar.rede import ErroRede, Rede
+from radar.texto import normalizar, texto_de_pdf
 from tests.matriz_spec import MATRIZ_SPEC
 
 AGORA = datetime(2026, 10, 7, 12, 0, 0)
@@ -30,7 +32,12 @@ PAGINA = (
 )
 MOTIVO_NENHUM = "fonte recusada: modo_contato=nenhum não permite acessar o alvo; cite o snapshot do Wayback"
 MOTIVO_FONTE_INVALIDA = "fonte inválida: use sha256:<hex> ou URL http(s)"
+MOTIVO_ALVO = "fonte recusada: o alvo só é acessado pela captura; cite o sha256 da captura ou o snapshot do Wayback"
+MOTIVO_ALVO_CEGO = "fonte recusada: domínio não permitido"
+MOTIVO_CURTO = "trecho curto demais: cite ao menos 12 caracteres literais da fonte"
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+FIXTURES_CVM = Path(__file__).parent / "fixtures" / "cvm"
+IP_PUBLICO = "93.184.216.34"
 
 
 def pagina(cabeca: str = "") -> str:
@@ -58,6 +65,25 @@ def contexto(
     )
 
 
+@pytest.fixture(autouse=True)
+def dns(monkeypatch):
+    """O DNS dos testes: todo nome resolve para um IP público, a menos que o teste diga outro em `dns[nome]`
+    (um IP, uma lista ou uma exceção). Os testes não consultam a internet."""
+    respostas: dict = {}
+
+    def getaddrinfo(host, porta, *args, **kwargs):
+        resposta = respostas.get(host, IP_PUBLICO)
+        if isinstance(resposta, Exception):
+            raise resposta
+        enderecos = [resposta] if isinstance(resposta, str) else resposta
+        return [
+            (socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0)) for ip in enderecos
+        ]
+
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+    return respostas
+
+
 @pytest.fixture
 def ctx(tmp_path):
     return contexto(tmp_path)
@@ -71,6 +97,11 @@ def ctx_retro(tmp_path):
 @pytest.fixture
 def ctx_nenhum(tmp_path):
     return contexto(tmp_path, modo_contato="nenhum")
+
+
+@pytest.fixture
+def ctx_cego(tmp_path):
+    return contexto(tmp_path).model_copy(update={"modo_cego": True})
 
 
 @pytest.fixture
@@ -145,7 +176,6 @@ async def test_html_em_iso_8859_1_sem_cabecalho_de_charset(ctx, serv):
     [
         ("txt", "Saque suspenso até segunda ordem".encode()),
         ("json", json.dumps({"aviso": "Saque suspenso até segunda ordem"}, ensure_ascii=False).encode()),
-        ("har", '{"log": {"mensagem": "Saque suspenso até segunda ordem"}}'.encode()),
         ("txt", b"Saque suspenso at\xe9 segunda ordem"),  # bytes que não são UTF-8 viram U+FFFD, sem erro
     ],
 )
@@ -161,12 +191,45 @@ async def test_artefato_png_aceita_sem_conferir(ctx, serv):
     assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
 
 
-async def test_trecho_em_branco_rejeita(ctx, serv):
+@pytest.mark.parametrize(
+    "trecho",
+    ["", "   ", "a", "%", "1", "ais", "ab cd", "12345 78901", "Rendimentodiariogarantido", "Rendimento\u00ad\u200b"],
+)
+async def test_trecho_curto_demais_rejeita(ctx, serv, trecho):
+    # 12 caracteres e 2 palavras, depois de normalizar: o que passa disso na página não prova nada
+    ref = guardar(serv, f"<p>{TRECHO} 1 % ais a ab cd 12345 78901 Rendimentodiariogarantido</p>")
+    v = await validar(confirmado(ev(ref), ev(ref, trecho)), pend(ctx), ctx, serv)
+    assert v == Validacao(False, MOTIVO_CURTO, "evidencias[1].trecho", [])
+
+
+async def test_trecho_com_12_caracteres_e_2_palavras_vale(ctx, serv):
+    ref = guardar(serv, "<p>chaves 123456 78901 fim</p>")
+    assert (await validar(confirmado(ev(ref, "123456 78901")), pend(ctx), ctx, serv)).aceita
+
+
+async def test_trecho_curto_vale_tambem_para_fonte_que_nao_se_confere(ctx, serv):
+    ref = guardar(serv, PNG, "png")
+    v = await validar(confirmado(ev(ref, "ais")), pend(ctx), ctx, serv)
+    assert (v.aceita, v.motivo) == (False, MOTIVO_CURTO)
+
+
+async def test_trecho_curto_demais_vem_depois_da_fonte(ctx, serv):
     ref = guardar(serv, pagina())
-    resposta = confirmado(ev(ref), ev(ref, "   "))  # a segunda evidência passa pelo modelo, mas não cita nada
-    v = await validar(resposta, pend(ctx), ctx, serv)
-    assert (v.aceita, v.campo) == (False, "evidencias[1].trecho")
-    assert v.motivo.startswith("trecho vazio")
+    v = await validar(confirmado(ev(ref, "ais"), ev("rdap")), pend(ctx), ctx, serv)
+    assert (v.motivo, v.campo) == (MOTIVO_FONTE_INVALIDA, "evidencias[1].fonte")
+
+
+async def test_fonte_har_nao_e_citavel(ctx, serv):
+    ref = guardar(serv, '{"log": {"mensagem": "Saque suspenso até segunda ordem"}}'.encode(), "har")
+    v = await validar(confirmado(ev(ref, "saque suspenso")), pend(ctx), ctx, serv)
+    motivo = "fonte .har não é citável: cite o html ou o texto da página"
+    assert v == Validacao(False, motivo, "evidencias[0].fonte", [])
+
+
+async def test_artefato_bin_aceita_sem_conferir(ctx, serv):
+    ref = guardar(serv, b"\x00\x01 Saque suspenso\xff", "bin")
+    v = await validar(confirmado(ev(ref, "saque suspenso")), pend(ctx), ctx, serv)
+    assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
 
 
 async def test_campo_aponta_a_evidencia_que_falhou(ctx, serv):
@@ -217,8 +280,27 @@ async def test_url_inacessivel_aceita_com_marca(ctx, serv, respx_mock):
     assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
 
 
-async def test_url_que_da_404_tambem_aceita_com_marca(ctx, serv, respx_mock):
-    respx_mock.get(URL).mock(return_value=httpx.Response(404))
+@pytest.mark.parametrize("status", [404, 410])
+async def test_url_que_nao_existe_rejeita(ctx, serv, respx_mock, status):
+    respx_mock.get(URL).mock(return_value=httpx.Response(status))
+    v = await validar(confirmado(ev(URL)), pend(ctx), ctx, serv)
+    assert v == Validacao(
+        False,
+        f"fonte não encontrada (HTTP {status}); cite uma URL existente ou o snapshot do Wayback",
+        "evidencias[0].fonte",
+        [],
+    )
+
+
+@pytest.mark.parametrize("status", [403, 429, 500, 502])
+async def test_outro_erro_http_aceita_com_marca(ctx, serv, respx_mock, status):
+    respx_mock.get(URL).mock(return_value=httpx.Response(status))
+    v = await validar(confirmado(ev(URL)), pend(ctx), ctx, serv)
+    assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
+
+
+async def test_falha_de_transporte_aceita_com_marca(ctx, serv, respx_mock):
+    respx_mock.get(URL).mock(side_effect=httpx.ConnectError("sem rota"))
     v = await validar(confirmado(ev(URL)), pend(ctx), ctx, serv)
     assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
 
@@ -275,11 +357,47 @@ async def test_data_detectada_posterior_ao_as_of_rejeita(tmp_path, serv, respx_m
     assert (v.aceita, v.motivo, v.campo) == (False, "data_fonte posterior ao as_of", "evidencias[0].data_fonte")
 
 
-async def test_data_fonte_informada_vale_mais_que_a_detectada(tmp_path, serv, respx_mock):
+@pytest.mark.parametrize(
+    "cabeca",
+    [
+        '<meta property="article:published_time" content="2025-03-01">',
+        '<meta name="date" content="2025-03-01">',
+        '<script type="application/ld+json">{"datePublished":"2025-03-01"}</script>',
+    ],
+)
+async def test_data_detectada_forte_posterior_rejeita_mesmo_com_data_fonte_anterior(tmp_path, serv, respx_mock, cabeca):
+    # a página se diz publicada depois do as_of: a data_fonte que o Claude declarou não a salva
     ctx = contexto(tmp_path, as_of=date(2025, 2, 15))
-    servir(respx_mock, URL, pagina('<meta property="article:published_time" content="2025-03-01">'))
+    servir(respx_mock, URL, pagina(cabeca))
+    v = await validar(confirmado(ev(URL, data_fonte=date(2025, 1, 5))), pend(ctx), ctx, serv)
+    assert v == Validacao(False, "data_fonte posterior ao as_of", "evidencias[0].data_fonte", [])
+
+
+async def test_data_detectada_forte_anterior_e_data_fonte_anterior_aceita(tmp_path, serv, respx_mock):
+    ctx = contexto(tmp_path, as_of=date(2025, 2, 15))
+    servir(respx_mock, URL, pagina('<meta property="article:published_time" content="2025-01-01">'))
+    v = await validar(confirmado(ev(URL, data_fonte=date(2025, 1, 5))), pend(ctx), ctx, serv)
+    assert v == Validacao(True, None, None, [])
+
+
+async def test_time_posterior_nao_derruba_a_data_fonte_informada(tmp_path, serv, respx_mock):
+    # o <time> costuma ser a data de um evento: só vale quando falta a data_fonte
+    ctx = contexto(tmp_path, as_of=date(2025, 2, 15))
+    servir(respx_mock, URL, pagina('<time datetime="2025-03-01">lançamento</time>'))
     v = await validar(confirmado(ev(URL, data_fonte=date(2025, 1, 5))), pend(ctx), ctx, serv)
     assert v.aceita
+
+
+async def test_time_sozinho_vale_quando_falta_a_data_fonte(tmp_path, serv, respx_mock):
+    ctx = contexto(tmp_path, as_of=date(2025, 2, 15))
+    servir(respx_mock, URL, pagina('<time datetime="2025-03-01">lançamento</time>'))
+    v = await validar(confirmado(ev(URL, data_fonte=None)), pend(ctx), ctx, serv)
+    assert (v.aceita, v.motivo) == (False, "data_fonte posterior ao as_of")
+
+
+async def test_execucao_atual_nao_confere_a_data_detectada(ctx, serv, respx_mock):
+    servir(respx_mock, URL, pagina('<meta property="article:published_time" content="2027-03-01">'))
+    assert (await validar(confirmado(ev(URL)), pend(ctx), ctx, serv)).aceita
 
 
 async def test_sem_data_marca_data_desconhecida(ctx, serv):
@@ -464,6 +582,8 @@ URLS_RECUSADAS = [
     "http://0.0.0.0/x",
     "http://224.0.0.1/x",
     "http://240.0.0.1/x",
+    "http://100.64.0.1/x",
+    "http://100.127.255.254/x",
     "http://[::1]/x",
     "http://[::]/x",
     "http://[fe80::1]/x",
@@ -499,10 +619,99 @@ async def test_validar_converte_a_recusa_em_rejeicao(ctx, serv):
     assert v.motivo.startswith("fonte recusada: ")
 
 
-async def test_ip_publico_e_permitido(ctx, serv, respx_mock):
-    servir(respx_mock, "http://93.184.216.34/pagina", pagina())
-    fonte = await arquivar_fonte("http://93.184.216.34/pagina", ctx, serv)
+async def test_ip_publico_e_permitido(ctx, serv, respx_mock, dns):
+    dns[IP_PUBLICO] = AssertionError("IP literal não se resolve")
+    servir(respx_mock, f"http://{IP_PUBLICO}/pagina", pagina())
+    fonte = await arquivar_fonte(f"http://{IP_PUBLICO}/pagina", ctx, serv)
     assert "Rendimento de 1,5% ao dia" in fonte.texto
+
+
+async def test_host_punycode_invalido_e_recusado(ctx, serv, respx_mock):
+    with pytest.raises(ErroNo, match=r"^fonte recusada: host inválido"):
+        await arquivar_fonte("https://xn--a-----.example.org/x", ctx, serv)
+    v = await validar(confirmado(ev("https://xn--a-----.example.org/x")), pend(ctx), ctx, serv)
+    assert (v.aceita, v.campo) == (False, "evidencias[0].fonte")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://web.archive.org/save/https://outro.example.org/",
+        "https://web.archive.org//save/https://outro.example.org/",
+        "https://WEB.ARCHIVE.ORG/save",
+        "https://exemplo-com-br.translate.goog/pagina?_x_tr_sl=pt",
+        "https://translate.goog/x",
+    ],
+)
+async def test_servico_que_visita_o_alvo_e_recusado(ctx, serv, url, respx_mock):
+    with pytest.raises(ErroNo) as erro:
+        await arquivar_fonte(url, ctx, serv)
+    assert (erro.value.mensagem, erro.value.permanente) == ("fonte recusada: serviço que visita o alvo", True)
+    assert respx_mock.calls.call_count == 0
+
+
+async def test_wayback_de_snapshot_e_permitido(ctx, serv, respx_mock):
+    url = "https://web.archive.org/web/20250101000000/http://outro.example.org/termos"
+    servir(respx_mock, url, pagina())
+    assert (await validar(confirmado(ev(url)), pend(ctx), ctx, serv)).aceita
+
+
+@pytest.mark.parametrize(
+    "enderecos",
+    [
+        ["10.0.0.5"],
+        ["127.0.0.1"],
+        [IP_PUBLICO, "192.168.1.9"],
+        ["100.64.0.9"],
+        ["::1"],
+        ["fe80::1%eth0"],
+        ["::ffff:10.0.0.1"],
+    ],
+)
+async def test_nome_que_resolve_para_ip_interno_e_recusado(ctx, serv, dns, respx_mock, enderecos):
+    dns["127.0.0.1.nip.io"] = enderecos
+    with pytest.raises(ErroNo) as erro:
+        await arquivar_fonte("https://127.0.0.1.nip.io/pagina", ctx, serv)
+    assert erro.value.permanente is True
+    assert erro.value.mensagem.startswith("fonte recusada: ")
+    assert respx_mock.calls.call_count == 0
+    v = await validar(confirmado(ev("https://127.0.0.1.nip.io/pagina")), pend(ctx), ctx, serv)
+    assert (v.aceita, v.campo) == (False, "evidencias[0].fonte")
+
+
+async def test_nome_que_resolve_para_ip_publico_e_permitido(ctx, serv, dns, respx_mock):
+    dns["noticias.example.org"] = [IP_PUBLICO, "2606:2800:220:1:248:1893:25c8:1946"]
+    servir(respx_mock, URL, pagina())
+    assert (await arquivar_fonte(URL, ctx, serv)).texto
+
+
+async def test_nome_que_nao_resolve_segue_para_a_rede(ctx, serv, dns, respx_mock):
+    # quem falha é a Rede, com ErroRede: na `validar` vira trecho_nao_conferido
+    dns["noticias.example.org"] = socket.gaierror(-2, "Name or service not known")
+    respx_mock.get(URL).mock(side_effect=httpx.ConnectError("sem rota"))
+    v = await validar(confirmado(ev(URL)), pend(ctx), ctx, serv)
+    assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
+
+
+async def test_redirect_para_nome_que_resolve_para_ip_interno_e_recusado(ctx, serv, dns, respx_mock):
+    dns["interno.example.org"] = "10.9.8.7"
+    respx_mock.get("https://curto.example.org/a").mock(
+        return_value=httpx.Response(302, headers={"location": "https://interno.example.org/admin"})
+    )
+    with pytest.raises(ErroNo, match=r"^fonte recusada: "):
+        await arquivar_fonte("https://curto.example.org/a", ctx, serv)
+
+
+async def test_com_proxy_configurado_o_dns_fica_com_o_proxy(tmp_path, dns, respx_mock):
+    dns["noticias.example.org"] = AssertionError("com proxy quem resolve é o proxy")
+    config = Config(rede=RedeConfig(proxy="http://127.0.0.1:3128", limites={"*": 0}))
+    rede = Rede(config.rede, dormir=_nao_dormir)
+    try:
+        s = Servicos(config=config, rede=rede, custodia=Custodia(tmp_path), matriz=MATRIZ_SPEC)
+        servir(respx_mock, URL, pagina())
+        assert (await arquivar_fonte(URL, contexto(tmp_path), s)).texto
+    finally:
+        await rede.fechar()
 
 
 async def test_redirect_para_destino_interno_e_recusado(ctx, serv, respx_mock):
@@ -564,10 +773,59 @@ async def test_modo_nenhum_permite_o_wayback(ctx_nenhum, serv, respx_mock):
     assert v.aceita
 
 
-async def test_modo_captura_permite_o_dominio_do_alvo(ctx, serv, respx_mock):
-    servir(respx_mock, "https://exemplo.com.br/termos", pagina())
-    fonte = await arquivar_fonte("https://exemplo.com.br/termos", ctx, serv)
-    assert fonte.texto
+@pytest.mark.parametrize(
+    "url", ["https://exemplo.com.br/termos", "https://app.Exemplo.com.br:8443/termos", "http://exemplo.com.br./"]
+)
+async def test_qualquer_modo_recusa_o_dominio_do_alvo(ctx, serv, url, respx_mock):
+    # só o nó captura toca o alvo: nem no modo captura a fonte pode ser uma página dele
+    with pytest.raises(ErroNo) as erro:
+        await arquivar_fonte(url, ctx, serv)
+    assert (erro.value.mensagem, erro.value.permanente) == (MOTIVO_ALVO, True)
+    v = await validar(confirmado(ev(url)), pend(ctx), ctx, serv)
+    assert v == Validacao(False, MOTIVO_ALVO, "evidencias[0].fonte", [])
+    assert respx_mock.calls.call_count == 0
+
+
+async def test_redirect_para_o_alvo_e_recusado_no_modo_captura(ctx, serv, respx_mock):
+    respx_mock.get("https://curto.example.org/a").mock(
+        return_value=httpx.Response(302, headers={"location": "https://exemplo.com.br/"})
+    )
+    with pytest.raises(ErroNo) as erro:
+        await arquivar_fonte("https://curto.example.org/a", ctx, serv)
+    assert erro.value.mensagem == MOTIVO_ALVO
+
+
+async def test_modo_cego_recusa_o_alvo_com_mensagem_neutra(tmp_path, serv):
+    for modo in ("captura", "nenhum"):
+        ctx = contexto(tmp_path, modo_contato=modo).model_copy(update={"modo_cego": True})
+        v = await validar(confirmado(ev("https://app.exemplo.com.br/termos")), pend(ctx), ctx, serv)
+        assert v == Validacao(False, MOTIVO_ALVO_CEGO, "evidencias[0].fonte", [])
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://meuexemplo.com.br/", "https://exemplo.com.br.outro.org/", "https://exemplo.org/", "https://exemplo.com/"],
+)
+async def test_dominio_parecido_com_o_alvo_e_permitido(ctx, serv, respx_mock, url):
+    servir(respx_mock, url, pagina())
+    assert (await arquivar_fonte(url, ctx, serv)).texto
+
+
+ALVO_IDN = "investimentoseguro-ação.com.br"
+ALVO_PUNYCODE = ALVO_IDN.encode("idna").decode("ascii")
+
+
+@pytest.mark.parametrize("modo", ["captura", "nenhum"])
+@pytest.mark.parametrize("host", [ALVO_IDN, ALVO_PUNYCODE, "www." + ALVO_IDN, "app." + ALVO_PUNYCODE, ALVO_IDN.upper()])
+async def test_alvo_idn_e_recusado_nas_duas_grafias(tmp_path, serv, respx_mock, modo, host):
+    ctx = contexto(tmp_path, modo_contato=modo, alvo=ALVO_PUNYCODE)
+    esperado = MOTIVO_ALVO if modo == "captura" else MOTIVO_NENHUM
+    with pytest.raises(ErroNo) as erro:
+        await arquivar_fonte(f"https://{host}/termos", ctx, serv)
+    assert erro.value.mensagem == esperado
+    v = await validar(confirmado(ev(f"https://{host}/termos")), pend(ctx), ctx, serv)
+    assert v == Validacao(False, esperado, "evidencias[0].fonte", [])
+    assert respx_mock.calls.call_count == 0
 
 
 # --- arquivar_fonte --------------------------------------------------------------------------------------
@@ -604,7 +862,14 @@ async def test_arquivar_fonte_usa_o_user_agent_de_navegador(ctx, serv, respx_moc
         ("image/webp", b"RIFF....WEBP", ".webp", ""),
         ("image/avif", b"....ftypavif", ".img", ""),
         ("application/pdf", b"%PDF-1.4", ".pdf", None),
-        (None, b"<p>sem content-type</p>", ".html", "sem content-type"),
+        ("application/octet-stream", b"%PDF-1.7\n%\xe2\xe3", ".pdf", None),  # a assinatura vale mais que o tipo
+        ("text/html", b"%PDF-1.7\n%\xe2\xe3", ".pdf", None),
+        (None, b"%PDF-1.4", ".pdf", None),
+        ("application/octet-stream", b"\x00\x01\x02", ".bin", None),
+        ("application/zip", b"PK\x03\x04", ".bin", None),
+        (None, b"<p>sem content-type</p>", ".bin", None),
+        ("text/csv", b"a,b", ".txt", "a,b"),
+        ("image/svg+xml", b"<svg/>", ".xml", "<svg/>"),
     ],
 )
 async def test_arquivar_fonte_extensao_e_texto_pelo_content_type(ctx, serv, respx_mock, tipo, corpo, ext, texto):
@@ -663,7 +928,6 @@ async def test_data_de_publicacao_prioridade_entre_as_fontes(ctx, serv, respx_mo
     ]
     for cabeca, esperada in esperadas:
         respx_mock.get(URL).mock(return_value=httpx.Response(200, html=pagina(cabeca)))
-        serv.rede._cache.clear()  # a Rede devolveria a página da rodada anterior
         assert (await arquivar_fonte(URL, ctx, serv)).data_publicacao == esperada
 
 
@@ -671,3 +935,124 @@ async def test_data_de_publicacao_com_json_ld_aninhado_fundo_nao_derruba(ctx, se
     fundo = "[" * 100_000 + "]" * 100_000
     servir(respx_mock, URL, pagina(f'<script type="application/ld+json">{fundo}</script>'))
     assert (await arquivar_fonte(URL, ctx, serv)).data_publicacao is None
+
+
+async def test_arquivar_fonte_nao_usa_o_cache_da_rede(ctx, serv, respx_mock):
+    # a fonte arquivada precisa ser a página de agora, não a que a Rede guardou antes
+    rota = servir(respx_mock, URL, pagina())
+    await arquivar_fonte(URL, ctx, serv)
+    await arquivar_fonte(URL, ctx, serv)
+    assert rota.call_count == 2
+
+
+# --- teto de tamanho --------------------------------------------------------------------------------------
+
+
+async def test_corpo_acima_de_10_mb_nao_e_guardado_e_fica_sem_conferir(ctx, serv, respx_mock):
+    grande = httpx.Response(200, content=b"x" * 10_000_001, headers={"content-type": "text/plain"})
+    respx_mock.get(URL).mock(return_value=grande)
+    v = await validar(confirmado(ev(URL)), pend(ctx), ctx, serv)
+    assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
+    assert not (ctx.pasta / "custodia.log").exists()
+    with pytest.raises(ErroRede, match="10 MB"):
+        await arquivar_fonte(URL, ctx, serv)
+
+
+async def test_corpo_de_exatos_10_mb_e_guardado(ctx, serv, respx_mock):
+    corpo = httpx.Response(200, content=b"x" * 10_000_000, headers={"content-type": "text/plain"})
+    respx_mock.get(URL).mock(return_value=corpo)
+    fonte = await arquivar_fonte(URL, ctx, serv)
+    assert len(serv.custodia.ler(fonte.ref)) == 10_000_000
+
+
+# --- modo cego: o trecho pode citar os marcadores ---------------------------------------------------------
+
+PAGINA_CEGA = "<p>Exemplo Invest paga 1% ao mês aos clientes, com cadastro em exemplo.com.br</p>"
+MASCARA = {"Exemplo Invest": "[EMPRESA]", "exemplo.com.br": "[ALVO]"}
+
+
+async def test_modo_cego_aceita_o_trecho_com_marcador(ctx_cego, serv):
+    ref = guardar(serv, PAGINA_CEGA)
+    for trecho in ("[EMPRESA] paga 1% ao mês", "[empresa] PAGA 1% ao mes", "cadastro em [ALVO]"):
+        v = await validar(confirmado(ev(ref, trecho)), pend(ctx_cego), ctx_cego, serv, MASCARA)
+        assert v == Validacao(True, None, None, []), trecho
+
+
+async def test_modo_cego_continua_aceitando_o_texto_sem_mascara(ctx_cego, serv):
+    ref = guardar(serv, PAGINA_CEGA)
+    v = await validar(confirmado(ev(ref, "Exemplo Invest paga 1% ao mês")), pend(ctx_cego), ctx_cego, serv, MASCARA)
+    assert v.aceita
+
+
+async def test_modo_cego_marcador_que_nao_esta_na_fonte_rejeita(ctx_cego, serv):
+    ref = guardar(serv, PAGINA_CEGA)
+    for trecho in ("[PESSOA_1] paga 1% ao mês", "[ALVO] paga 1% ao mês"):
+        v = await validar(confirmado(ev(ref, trecho)), pend(ctx_cego), ctx_cego, serv, MASCARA)
+        assert (v.aceita, v.motivo, v.campo) == (False, "trecho não encontrado na fonte", "evidencias[0].trecho")
+
+
+async def test_marcador_sem_mascara_ou_fora_do_modo_cego_rejeita(ctx, ctx_cego, serv):
+    ref = guardar(serv, PAGINA_CEGA)
+    resposta = confirmado(ev(ref, "[EMPRESA] paga 1% ao mês"))
+    assert not (await validar(resposta, pend(ctx_cego), ctx_cego, serv)).aceita  # sem máscara
+    assert not (await validar(resposta, pend(ctx), ctx, serv, MASCARA)).aceita  # execução aberta
+
+
+async def test_modo_cego_com_url(ctx_cego, serv, respx_mock):
+    servir(respx_mock, URL, PAGINA_CEGA)
+    v = await validar(confirmado(ev(URL, "[EMPRESA] paga 1% ao mês")), pend(ctx_cego), ctx_cego, serv, MASCARA)
+    assert v.aceita
+
+
+# --- PDF --------------------------------------------------------------------------------------------------
+
+PDF_509 = (FIXTURES_CVM / "deli509.pdf").read_bytes()
+
+
+async def test_pdf_confere_o_trecho_sem_os_espacos(ctx, serv):
+    # a extração parte palavras ("COSTA F ERREIRA"): o trecho certo só casa quando os espaços saem dos dois lados
+    trecho = "Frederick Domingos Costa Ferreira, CPF nº 636.126.311-87"
+    assert normalizar(trecho) not in normalizar(texto_de_pdf(PDF_509))
+    ref = guardar(serv, PDF_509, "pdf")
+    v = await validar(confirmado(ev(ref, trecho)), pend(ctx), ctx, serv)
+    assert v == Validacao(True, None, None, [])
+
+
+async def test_pdf_com_trecho_ausente_rejeita(ctx, serv):
+    ref = guardar(serv, PDF_509, "pdf")
+    v = await validar(confirmado(ev(ref, "Fidelitas Investimentos pagou 10% ao dia")), pend(ctx), ctx, serv)
+    assert (v.aceita, v.motivo, v.campo) == (False, "trecho não encontrado na fonte", "evidencias[0].trecho")
+
+
+async def test_pdf_sem_texto_extraivel_aceita_com_marca(ctx, serv):
+    ref = guardar(serv, (FIXTURES_CVM / "sem_texto.pdf").read_bytes(), "pdf")
+    v = await validar(confirmado(ev(ref, "qualquer trecho que o pdf tenha")), pend(ctx), ctx, serv)
+    assert v == Validacao(True, None, None, ["trecho_nao_conferido"])
+
+
+async def test_pdf_que_nao_e_pdf_aceita_com_marca(ctx, serv):
+    ref = guardar(serv, b"isto nao e um pdf de verdade", "pdf")
+    v = await validar(confirmado(ev(ref, "qualquer trecho que o pdf tenha")), pend(ctx), ctx, serv)
+    assert v.marcas == ["trecho_nao_conferido"]
+
+
+@pytest.mark.parametrize("tipo", ["application/pdf", "application/octet-stream", None])
+async def test_url_de_pdf(ctx, serv, respx_mock, tipo):
+    headers = {"content-type": tipo} if tipo else {}
+    respx_mock.get("https://cvm.example.org/deli509.pdf").mock(
+        return_value=httpx.Response(200, content=PDF_509, headers=headers)
+    )
+    fonte = await arquivar_fonte("https://cvm.example.org/deli509.pdf", ctx, serv)
+    assert serv.custodia.caminho(fonte.ref).suffix == ".pdf"
+    assert "DELIBERAÇÃO CVM" in fonte.texto
+    trecho = "Frederick Domingos Costa Ferreira, CPF nº 636.126.311-87"
+    v = await validar(confirmado(ev("https://cvm.example.org/deli509.pdf", trecho)), pend(ctx), ctx, serv)
+    assert v.aceita
+
+
+async def test_pdf_no_modo_cego(ctx_cego, serv):
+    ref = guardar(serv, PDF_509, "pdf")
+    mascara = {"FIDELITAS INVESTIMENTOS LTDA": "[EMPRESA]"}
+    trecho = "[EMPRESA]., CNPJ nº 06.151.776/0001- 99"
+    v = await validar(confirmado(ev(ref, trecho)), pend(ctx_cego), ctx_cego, serv, mascara)
+    assert v.aceita

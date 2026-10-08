@@ -641,7 +641,7 @@ async def test_pdf_ausente_ou_sem_texto_extraivel_fica_so_com_o_resumo(respx_moc
 
 
 async def test_pdf_grande_demais_nao_e_lido(respx_mock, indices, monkeypatch):
-    import radar.indices as modulo
+    import radar.texto as modulo  # o limite mora em `texto_de_pdf`, que os índices usam
 
     reg = mocar_deliberacoes(respx_mock)
     reg.jsp.mock(return_value=httpx.Response(200, text=_listagem(509)))

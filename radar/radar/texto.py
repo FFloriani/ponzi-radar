@@ -1,9 +1,16 @@
-"""Texto visível de HTML e normalização para comparar trechos e nomes."""
+"""Texto visível de HTML, normalização para comparar trechos e nomes, decodificação de bytes e texto de PDF."""
 
 from __future__ import annotations
 
+import io
+import logging
+import re
 import unicodedata
 from html.parser import HTMLParser
+
+from pypdf import PdfReader
+
+from radar.rede import RespostaRede
 
 # conteúdo que um visitante não lê: some junto com tudo que estiver dentro
 _DESCARTADAS = frozenset({"script", "style", "noscript", "template"})
@@ -18,6 +25,18 @@ _BLOCOS = frozenset({
 })
 
 _ASPAS = str.maketrans({"‘": "'", "’": "'", "“": '"', "”": '"', "„": '"'})
+
+_BYTES_PARA_META = 4096
+_META_CHARSET = re.compile(rb"""<meta[^>]+charset\s*=\s*["']?\s*([A-Za-z0-9_.:\-]+)""", re.IGNORECASE)
+_BOM = chr(0xFEFF)
+
+# as deliberações têm 1 ou 2 páginas e 40 a 300 KB; o que passar disso não é uma delas
+_MAX_BYTES_PDF = 10_000_000
+_MAX_PAGINAS_PDF = 60
+# o menor texto de PDF real tinha mais de 2 mil caracteres; abaixo disto é PDF de imagem ou lixo
+_MIN_CARACTERES_PDF = 100
+
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 
 class _Extrator(HTMLParser):
@@ -63,7 +82,48 @@ def texto_de_html(html: str) -> str:
 
 
 def normalizar(s: str) -> str:
-    """Forma comparável: sem acentos, caixa baixa, aspas retas e espaços colapsados."""
+    """Forma comparável: sem acentos, caixa baixa, aspas retas e espaços colapsados.
+
+    Os caracteres invisíveis de formatação (categoria Cf: hífen opcional, espaço de largura zero, junção, BOM,
+    marcas de direção) somem: um site pode salpicá-los numa palavra sem que o visitante veja.
+    """
     decomposto = unicodedata.normalize("NFKD", s)
-    sem_marcas = "".join(c for c in decomposto if not unicodedata.combining(c))
-    return " ".join(sem_marcas.casefold().translate(_ASPAS).split())
+    visiveis = "".join(c for c in decomposto if not unicodedata.combining(c) and unicodedata.category(c) != "Cf")
+    return " ".join(visiveis.casefold().translate(_ASPAS).split())
+
+
+def decodificar(dados: bytes, content_type: str | None) -> str:
+    """O texto de `dados`: o charset do `Content-Type`; sem ele, o do `<meta>` (sites antigos em ISO-8859-1), se
+    o conteúdo é HTML ou XML ou o tipo é desconhecido (`None`); senão UTF-8 com `replace`.
+
+    O charset vem do site investigado e pode ser qualquer coisa: o nome que o Python não conhece (`LookupError`)
+    e o codec que não decodifica texto (`idna`, `undefined`: `UnicodeError`) caem no UTF-8, nunca levantam.
+    """
+    tipo = (content_type or "").lower()
+    if "charset" not in tipo and (not tipo or "html" in tipo or "xml" in tipo):
+        achado = _META_CHARSET.search(dados[:_BYTES_PARA_META])
+        if achado:
+            try:
+                return dados.decode(achado.group(1).decode("ascii"), errors="replace").removeprefix(_BOM)
+            except (LookupError, UnicodeError):
+                pass
+    cabecalhos = {"content-type": content_type} if content_type else {}
+    return RespostaRede(status=200, url="", conteudo=dados, headers=cabecalhos).texto
+
+
+def texto_de_pdf(dados: bytes) -> str:
+    """O texto do PDF (páginas separadas por linha em branco), ou `""` se não é PDF, é grande demais ou não tem
+    texto para extrair (PDF de imagem). O PDF vem de fora, mas qualquer falha do `pypdf` com ele é só "sem texto".
+
+    A extração parte palavras ("COSTA F ERREIRA"): quem compara com ela deve ignorar os espaços. O texto sai
+    saneado: o `pypdf` decodifica CMap malformado em substituto UTF-16 solto, que não se grava em JSON UTF-8.
+    """
+    if len(dados) > _MAX_BYTES_PDF:
+        return ""
+    try:
+        paginas = PdfReader(io.BytesIO(dados)).pages
+        partes = [(paginas[i].extract_text() or "").strip() for i in range(min(len(paginas), _MAX_PAGINAS_PDF))]
+    except Exception:  # PdfReadError, EmptyFileError, ValueError, RecursionError...
+        return ""
+    texto = "\n\n".join(parte for parte in partes if parte).encode("utf-8", "replace").decode("utf-8")
+    return texto if len(" ".join(texto.split())) >= _MIN_CARACTERES_PDF else ""

@@ -4,20 +4,25 @@
 
 1. esquema do `valor` (e, na P-E, tipos de sinal, modificadores e índices de evidência contra a matriz);
 2. fonte de cada evidência: `sha256:<hex>` da custódia ou URL http(s), que `arquivar_fonte` baixa;
-3. trecho: tem de existir no texto da fonte, comparado sem caixa, acento, aspas curvas nem espaços repetidos;
-4. data: no modo retroativo, `data_fonte` (ou a data detectada na página) não passa do `as_of`.
+3. trecho: com pelo menos 12 caracteres e 2 palavras, e existente no texto da fonte, comparado sem caixa, acento,
+   aspas curvas nem espaços repetidos (PDF: sem nenhum espaço, porque a extração parte palavras). No modo cego,
+   o trecho também pode citar os marcadores da máscara (`[EMPRESA] paga 1% ao mês`);
+4. data: no modo retroativo, nem a `data_fonte` nem a data que a página declara ter sido publicada passam do `as_of`.
 
-A evidência cuja fonte não dá para conferir (rede indisponível, imagem sem OCR) entra com a marca
-`trecho_nao_conferido`; a sem data, com `data_desconhecida`.
+A evidência cuja fonte não dá para conferir (rede indisponível, corpo grande demais, imagem sem OCR, binário, PDF
+sem texto) entra com a marca `trecho_nao_conferido`; a sem data, com `data_desconhecida`.
 
-`arquivar_fonte` é o único lugar por onde uma URL dada pelo Claude chega à rede. Ele recusa o que não é
-fonte pública (esquema que não é http(s), `localhost`, IP interno, e o alvo no `modo_contato="nenhum"`) e
-confere cada salto de redirect com as mesmas regras: sem isso, um endereço público que redireciona para
-`http://127.0.0.1/` passaria. Não resolve DNS: um nome público que aponta para IP interno não é detectado.
+`arquivar_fonte` é o único lugar por onde uma URL dada pelo Claude chega à rede. Ele recusa o que não é fonte
+pública: esquema que não é http(s), `localhost`, IP ou nome que resolve para IP não global, o alvo (só o nó
+`captura` o visita) e serviços que fazem um terceiro visitar o alvo. Cada salto de redirect passa pelas mesmas
+regras: sem isso, um endereço público que redireciona para `http://127.0.0.1/` passaria. Com proxy configurado o
+nome não é resolvido aqui (quem resolve é o proxy). A resolução e a conexão são consultas separadas: um nome que
+muda de IP entre elas (DNS rebinding) não é detectado.
 """
 
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import json
 import re
@@ -33,35 +38,40 @@ from pydantic import ValidationError
 from radar.modelos import Contexto, ErroNo, Pendencia, Resposta
 from radar.motor import Servicos
 from radar.nos.alvo import dominio_registravel
-
-# o mesmo decodificador dos snapshots do Wayback: charset do cabeçalho, senão o do <meta>, senão UTF-8
-from radar.nos.wayback import _decodificar
-from radar.pendencias.definicoes import DEFINICOES, _validos_da_matriz
+from radar.pendencias.definicoes import DEFINICOES, validos_da_matriz
 from radar.pendencias.esquemas import ValorE
-from radar.rede import ErroRede, RespostaRede
-from radar.texto import normalizar, texto_de_html
+from radar.pendencias.mascara import mascarar
+from radar.rede import ErroRede
+from radar.texto import decodificar, normalizar, texto_de_html, texto_de_pdf
 
 MARCA_TRECHO_NAO_CONFERIDO = "trecho_nao_conferido"
 MARCA_DATA_DESCONHECIDA = "data_desconhecida"
 
 _HASH = re.compile(r"sha256:[0-9a-f]{64}")
 _DATA_ISO = re.compile(r"\d{4}-\d{2}-\d{2}", re.ASCII)
+_SALVAR_NO_WAYBACK = re.compile(r"/+save(?:/|$)", re.IGNORECASE)
 _MAX_REDIRECTS = 10  # como a Rede
+_MAX_BYTES = 10_000_000  # corpo maior que isto não é guardado nem lido
 _MAX_ERROS_NO_MOTIVO = 3
+_MIN_CARACTERES_DO_TRECHO = 12
+_MIN_PALAVRAS_DO_TRECHO = 2
 
 _EXT_POR_TIPO = {
     "text/html": "html",
     "application/xhtml+xml": "html",
     "text/plain": "txt",
     "application/json": "json",
+    "application/xml": "xml",
     "application/pdf": "pdf",
     "image/png": "png",
     "image/jpeg": "jpg",
     "image/gif": "gif",
     "image/webp": "webp",
 }
-# o Núcleo não faz OCR: o trecho de uma imagem não se confere
-_IMAGENS = frozenset({"png", "jpg", "jpeg", "gif", "webp", "img"})
+# o tipo que `decodificar` recebe para um artefato da custódia, que não guarda o `Content-Type`
+_TIPO_POR_EXT = {"html": "text/html", "xml": "text/xml"}
+# o Núcleo não faz OCR e não lê binário: o trecho dessas fontes não se confere
+_SEM_TEXTO = frozenset({"png", "jpg", "jpeg", "gif", "webp", "img", "bin"})
 _CLASSES_DE_IP = (
     ("loopback", "is_loopback"),
     ("privado", "is_private"),
@@ -70,13 +80,16 @@ _CLASSES_DE_IP = (
     ("multicast", "is_multicast"),
     ("não especificado", "is_unspecified"),
 )
+_MOTIVO_ALVO_NENHUM = "modo_contato=nenhum não permite acessar o alvo; cite o snapshot do Wayback"
+_MOTIVO_ALVO = "o alvo só é acessado pela captura; cite o sha256 da captura ou o snapshot do Wayback"
+_MOTIVO_ALVO_CEGO = "domínio não permitido"  # no modo cego a mensagem não diz que o endereço é o do alvo
 
 
 @dataclass(frozen=True)
 class FonteArquivada:
-    """`texto` é o texto visível (HTML passa por `texto_de_html`; imagem fica vazia); `data_publicacao` é a
-    data detectada na página (`article:published_time`, `meta name=date`, `datePublished` do JSON-LD ou
-    `<time datetime>`, nessa ordem de prioridade) ou `None`."""
+    """`texto` é o texto visível (HTML passa por `texto_de_html`, PDF por `texto_de_pdf`; imagem e binário ficam
+    vazios); `data_publicacao` é a data detectada na página (`article:published_time`, `meta name=date`,
+    `datePublished` do JSON-LD ou `<time datetime>`, nessa ordem de prioridade) ou `None`."""
 
     ref: str
     texto: str
@@ -94,18 +107,11 @@ class Validacao:
     marcas: list[str] = field(default_factory=list)
 
 
-# --- decodificação ----------------------------------------------------------------------------------------
-
-
-def decodificar(conteudo: bytes, ext: str, headers: dict[str, str] | None = None) -> str:
-    """O texto de um artefato. HTML: charset do cabeçalho, senão o do `<meta>` (sites antigos em ISO-8859-1),
-    senão UTF-8. O resto: UTF-8 com `replace`."""
-    resposta = RespostaRede(status=200, url="", conteudo=conteudo, headers=headers or {})
-    return _decodificar(resposta) if ext == "html" else resposta.texto
-
-
-def _ext_do_tipo(content_type: str) -> str:
-    """A extensão do artefato mais próxima do `Content-Type`; sem ele (ou desconhecido), `html`."""
+def _ext_do_tipo(content_type: str, corpo: bytes) -> str:
+    """A extensão do artefato: `pdf` se o corpo começa por `%PDF-` (seja qual for o tipo declarado), senão a mais
+    próxima do `Content-Type`; tipo ausente ou desconhecido é `bin`."""
+    if corpo.startswith(b"%PDF-"):
+        return "pdf"
     tipo = content_type.partition(";")[0].strip().lower()
     if tipo in _EXT_POR_TIPO:
         return _EXT_POR_TIPO[tipo]
@@ -117,7 +123,7 @@ def _ext_do_tipo(content_type: str) -> str:
         return "img"
     if tipo.startswith("text/"):
         return "txt"
-    return "html"
+    return "bin"
 
 
 # --- data de publicação -----------------------------------------------------------------------------------
@@ -189,14 +195,17 @@ class _Datas(HTMLParser):
             self._json = None
 
 
-def _data_de_publicacao(html: str) -> date | None:
+def _datas_de_publicacao(html: str) -> tuple[date | None, date | None]:
+    """`(forte, qualquer)`. A forte é a que a página declara no `<head>` ou no JSON-LD; a outra acrescenta o
+    `<time datetime>`, que costuma ser a data de um evento e só vale quando não há nada melhor."""
     datas = _Datas()
     datas.feed(html)
     datas.close()
-    return datas.article or datas.meta_date or datas.json_ld or datas.time
+    forte = datas.article or datas.meta_date or datas.json_ld
+    return forte, forte or datas.time
 
 
-# --- destino permitido (SSRF e modo_contato) --------------------------------------------------------------
+# --- destino permitido (SSRF, alvo e serviços que o visitam) ----------------------------------------------
 
 
 def _recusa(motivo: str) -> ErroNo:
@@ -217,28 +226,64 @@ def _ip_literal(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | No
 
 
 def _classe_nao_publica(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | None:
+    """Por que o IP não é um destino público, ou `None` se é. Tudo que não é global conta (CGNAT, documentação,
+    reservado...), além do multicast, que o `is_global` deixa passar."""
     ip = getattr(ip, "ipv4_mapped", None) or ip  # ::ffff:127.0.0.1 vale pelo IPv4 dentro dele
-    return next((nome for nome, atributo in _CLASSES_DE_IP if getattr(ip, atributo)), None)
+    classe = next((nome for nome, atributo in _CLASSES_DE_IP if getattr(ip, atributo)), None)
+    return classe or (None if ip.is_global else "não global")
 
 
-def _checar_destino(url: str, ctx: Contexto) -> None:
+async def _enderecos_do_nome(host: str, timeout: float) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Os endereços do nome. Nome que não resolve (ou resolução que demora demais) devolve `[]`: quem falha em
+    seguida é a conexão da `Rede`, com `ErroRede`."""
+    try:
+        infos = await asyncio.wait_for(
+            asyncio.get_running_loop().getaddrinfo(host, None, type=socket.SOCK_STREAM), timeout
+        )
+    except (OSError, TimeoutError):  # `socket.gaierror` é um `OSError`
+        return []
+    enderecos = []
+    for info in infos:
+        try:
+            enderecos.append(ipaddress.ip_address(info[4][0]))
+        except ValueError:
+            continue
+    return enderecos
+
+
+async def _checar_destino(url: str, ctx: Contexto, s: Servicos) -> None:
     """`ErroNo` permanente "fonte recusada: ..." se `url` não é uma fonte pública que se possa visitar."""
     try:
         destino = httpx.URL(url)
+        # o host de rede (IDNA/punycode), não o `.host`, que vem em Unicode e não bateria com `ctx.alvo`
+        host = destino.raw_host.decode("ascii").rstrip(".").lower()
+        _ = destino.host  # levanta para um rótulo punycode inválido, que a Rede também não conseguiria usar
     except httpx.InvalidURL as erro:
         raise _recusa(f"URL inválida ({erro})") from erro
+    except UnicodeError as erro:
+        raise _recusa(f"host inválido ({erro})") from erro
     if destino.scheme not in ("http", "https"):
         raise _recusa(f"esquema não permitido ({destino.scheme or 'nenhum'}); use http ou https")
-    host = destino.host.rstrip(".").lower()
     if not host:
         raise _recusa("URL sem host")
     if host == "localhost" or host.endswith(".localhost"):
         raise _recusa(f"host local não permitido: {host}")
+    # serviços que fazem um terceiro visitar o alvo ao vivo: a visita seria dele, mas a pedido nosso
+    if host == "translate.goog" or host.endswith(".translate.goog"):
+        raise _recusa("serviço que visita o alvo")
+    if host == "web.archive.org" and _SALVAR_NO_WAYBACK.match(destino.path):
+        raise _recusa("serviço que visita o alvo")
     ip = _ip_literal(host)
     if ip is not None and (classe := _classe_nao_publica(ip)):
         raise _recusa(f"IP não público ({classe}): {host}")
-    if ctx.modo_contato == "nenhum" and dominio_registravel(host) == ctx.alvo:
-        raise _recusa("modo_contato=nenhum não permite acessar o alvo; cite o snapshot do Wayback")
+    if dominio_registravel(host) == ctx.alvo:
+        if ctx.modo_cego:
+            raise _recusa(_MOTIVO_ALVO_CEGO)
+        raise _recusa(_MOTIVO_ALVO_NENHUM if ctx.modo_contato == "nenhum" else _MOTIVO_ALVO)
+    if ip is None and not s.config.rede.proxy:
+        for endereco in await _enderecos_do_nome(host, s.config.rede.timeout_s):
+            if classe := _classe_nao_publica(endereco):
+                raise _recusa(f"o nome {host} resolve para IP não público ({classe}): {endereco}")
 
 
 # --- arquivar_fonte ---------------------------------------------------------------------------------------
@@ -253,12 +298,19 @@ def _proximo_salto(base: str, location: str, url: str) -> str:
         ) from erro
 
 
-async def _arquivar(url: str, ctx: Contexto, s: Servicos) -> tuple[FonteArquivada, str]:
-    """A fonte arquivada e a extensão com que ficou na custódia."""
+@dataclass(frozen=True)
+class _Arquivo:
+    fonte: FonteArquivada
+    ext: str
+    data_forte: date | None
+
+
+async def _arquivar(url: str, ctx: Contexto, s: Servicos) -> _Arquivo:
     atual = url
     for _ in range(_MAX_REDIRECTS + 1):
-        _checar_destino(atual, ctx)
-        resposta = await s.rede.get(atual, tipo="navegador", seguir_redirect=False)
+        await _checar_destino(atual, ctx, s)
+        # sem cache: a fonte arquivada tem de ser a página de agora
+        resposta = await s.rede.get(atual, tipo="navegador", seguir_redirect=False, usar_cache=False)
         location = resposta.headers.get("location")
         if not (300 <= resposta.status < 400 and location):
             break
@@ -266,34 +318,69 @@ async def _arquivar(url: str, ctx: Contexto, s: Servicos) -> tuple[FonteArquivad
     else:
         raise ErroRede(f"GET {url}: mais de {_MAX_REDIRECTS} redirects seguidos", permanente=True, url=url)
 
-    ext = _ext_do_tipo(resposta.headers.get("content-type", ""))
-    ref = s.custodia.guardar(resposta.conteudo, ext, tipo="fonte", origem=url)
-    if ext in _IMAGENS:
-        return FonteArquivada(ref, "", None), ext
-    texto = decodificar(resposta.conteudo, ext, resposta.headers)
+    conteudo = resposta.conteudo
+    if len(conteudo) > _MAX_BYTES:
+        raise ErroRede(
+            f"GET {url}: corpo de {len(conteudo)} bytes passa do teto de 10 MB; não foi guardado",
+            permanente=True,
+            url=url,
+        )
+    tipo = resposta.headers.get("content-type", "")
+    ext = _ext_do_tipo(tipo, conteudo)
+    ref = s.custodia.guardar(conteudo, ext, tipo="fonte", origem=url)
+    if ext in _SEM_TEXTO:
+        return _Arquivo(FonteArquivada(ref, "", None), ext, None)
+    if ext == "pdf":
+        return _Arquivo(FonteArquivada(ref, await asyncio.to_thread(texto_de_pdf, conteudo), None), ext, None)
+    texto = decodificar(conteudo, tipo)
     if ext == "html":
-        return FonteArquivada(ref, texto_de_html(texto), _data_de_publicacao(texto)), ext
-    return FonteArquivada(ref, texto, None), ext
+        forte, qualquer = _datas_de_publicacao(texto)
+        return _Arquivo(FonteArquivada(ref, texto_de_html(texto), qualquer), ext, forte)
+    return _Arquivo(FonteArquivada(ref, texto, None), ext, None)
 
 
 async def arquivar_fonte(url: str, ctx: Contexto, s: Servicos) -> FonteArquivada:
     """Baixa `url` pela `Rede` e guarda na custódia (`tipo="fonte"`, `origem=url`).
 
     `ErroNo` permanente "fonte recusada: ..." se o destino (da URL ou de qualquer redirect) não é permitido;
-    `ErroRede` se a página não pôde ser baixada. Uma URL repetida na mesma execução sai do cache da `Rede`.
+    `ErroRede` se a página não pôde ser baixada ou o corpo passa de 10 MB.
     """
-    return (await _arquivar(url, ctx, s))[0]
+    return (await _arquivar(url, ctx, s)).fonte
 
 
 # --- validar ----------------------------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Fonte:
-    """`texto` é o normalizado, ou `None` quando não dá para conferir o trecho."""
+    """`texto` é o texto visível da fonte, ou `None` quando não dá para conferir o trecho nela."""
 
     texto: str | None
     data_detectada: date | None = None
+    data_forte: date | None = None
+    pdf: bool = False
+    _normal: str | None = field(default=None, repr=False)
+    _mascarada: str | None = field(default=None, repr=False)
+
+    def _chave(self, texto: str) -> str:
+        normal = normalizar(texto)
+        return "".join(normal.split()) if self.pdf else normal
+
+    def contem(self, procurado: str, mascara: dict[str, str] | None) -> bool:
+        """O trecho (já normalizado) está no texto? PDF: sem espaços dos dois lados. Com `mascara`, também vale o
+        que o Claude enxergaria: o texto com os termos trocados pelos marcadores."""
+        assert self.texto is not None
+        if self.pdf:
+            procurado = "".join(procurado.split())
+        if self._normal is None:
+            self._normal = self._chave(self.texto)
+        if procurado in self._normal:
+            return True
+        if not mascara:
+            return False
+        if self._mascarada is None:
+            self._mascarada = self._chave(mascarar(self.texto, mascara))
+        return procurado in self._mascarada
 
 
 def _rejeitar(motivo: str, campo: str) -> Validacao:
@@ -313,7 +400,7 @@ def _resumo(erro: ValidationError) -> str:
 def _validar_pe(valor: ValorE, total_evidencias: int, matriz: Any) -> Validacao | None:
     """Os tipos e modificadores têm de ser os que a `nova_pendencia` listou ao Claude (`tipos_validos` e
     `modificadores_validos`), e cada índice tem de apontar para uma evidência da resposta."""
-    validos = _validos_da_matriz(matriz)
+    validos = validos_da_matriz(matriz)
     tipos = set(filter(None, validos["tipos_validos"].split("|")))
     modificadores = set(filter(None, validos["modificadores_validos"].split("|")))
     for sinal in valor.sinais:
@@ -346,31 +433,43 @@ def _validar_valor(resposta: Resposta, pendencia: Pendencia, s: Servicos) -> Val
     return None
 
 
-def _fonte_da_custodia(ref: str, s: Servicos) -> _Fonte:
+async def _fonte_da_custodia(ref: str, s: Servicos) -> _Fonte:
     try:
         caminho = s.custodia.caminho(ref)
         conteudo = caminho.read_bytes()
     except FileNotFoundError:
         raise ErroNo("fonte não encontrada na custódia", permanente=True) from None
     ext = caminho.suffix.lstrip(".").lower()
-    if ext in _IMAGENS:
+    if ext == "har":
+        raise ErroNo("fonte .har não é citável: cite o html ou o texto da página", permanente=True)
+    if ext in _SEM_TEXTO:
         return _Fonte(None)
-    texto = decodificar(conteudo, ext)
-    return _Fonte(normalizar(texto_de_html(texto) if ext == "html" else texto))
+    if ext == "pdf":
+        return _Fonte(await asyncio.to_thread(texto_de_pdf, conteudo) or None, pdf=True)
+    texto = decodificar(conteudo, _TIPO_POR_EXT.get(ext, "text/plain"))
+    return _Fonte(texto_de_html(texto) if ext == "html" else texto)
 
 
 async def _fonte_da_url(url: str, ctx: Contexto, s: Servicos) -> _Fonte:
     try:
-        arquivada, ext = await _arquivar(url, ctx, s)
-    except ErroRede:
+        arquivo = await _arquivar(url, ctx, s)
+    except ErroRede as erro:
+        if erro.status in (404, 410):
+            raise ErroNo(
+                f"fonte não encontrada (HTTP {erro.status}); cite uma URL existente ou o snapshot do Wayback",
+                permanente=True,
+            ) from erro
         return _Fonte(None)  # não deu para baixar: o trecho fica sem conferir, e a resposta não é culpada
-    return _Fonte(None if ext in _IMAGENS else normalizar(arquivada.texto), arquivada.data_publicacao)
+    texto = None if arquivo.ext in _SEM_TEXTO else arquivo.fonte.texto
+    if arquivo.ext == "pdf":
+        texto = texto or None  # PDF sem texto extraível não se confere
+    return _Fonte(texto, arquivo.fonte.data_publicacao, arquivo.data_forte, pdf=arquivo.ext == "pdf")
 
 
 async def _carregar_fonte(fonte: str, ctx: Contexto, s: Servicos) -> _Fonte:
-    """`ErroNo` com o motivo exato da rejeição quando a fonte é inválida, não está na custódia ou foi recusada."""
+    """`ErroNo` com o motivo exato da rejeição quando a fonte é inválida, não existe ou foi recusada."""
     if _HASH.fullmatch(fonte):
-        return _fonte_da_custodia(fonte, s)
+        return await _fonte_da_custodia(fonte, s)
     if fonte.lower().startswith(("http://", "https://")):
         return await _fonte_da_url(fonte, ctx, s)
     raise ErroNo("fonte inválida: use sha256:<hex> ou URL http(s)", permanente=True)
@@ -381,11 +480,17 @@ def _marcar(marcas: list[str], marca: str) -> None:
         marcas.append(marca)
 
 
-async def validar(resposta: Resposta, pendencia: Pendencia, ctx: Contexto, s: Servicos) -> Validacao:
+async def validar(
+    resposta: Resposta,
+    pendencia: Pendencia,
+    ctx: Contexto,
+    s: Servicos,
+    mascara: dict[str, str] | None = None,
+) -> Validacao:
     """Confere a resposta do Claude à `pendencia` (spec 7.4). Ver o docstring do módulo para a ordem.
 
     `nao_encontrado` e `inconclusivo` sem evidências pulam os passos 2 a 4; com evidências, elas são
-    validadas como as de qualquer outra resposta.
+    validadas como as de qualquer outra resposta. `mascara` (a de `montar_mascara`) só vale com `ctx.modo_cego`.
     """
     if (rejeicao := _validar_valor(resposta, pendencia, s)) is not None:
         return rejeicao
@@ -403,20 +508,27 @@ async def validar(resposta: Resposta, pendencia: Pendencia, ctx: Contexto, s: Se
             return _rejeitar(erro.mensagem, f"evidencias[{i}].fonte")
         fontes.append(carregadas[fonte])
 
+    mascara_ativa = mascara if ctx.modo_cego else None
     marcas: list[str] = []
     for i, (evidencia, fonte) in enumerate(zip(resposta.evidencias, fontes, strict=True)):
         procurado = normalizar(evidencia.trecho)
-        if not procurado:  # "" está em qualquer texto: um trecho em branco não cita nada
-            return _rejeitar("trecho vazio: cite o trecho literal da fonte", f"evidencias[{i}].trecho")
+        # um trecho de uma letra, de "%" ou de uma palavra comum está em qualquer página
+        if len(procurado) < _MIN_CARACTERES_DO_TRECHO or len(procurado.split()) < _MIN_PALAVRAS_DO_TRECHO:
+            return _rejeitar(
+                f"trecho curto demais: cite ao menos {_MIN_CARACTERES_DO_TRECHO} caracteres literais da fonte",
+                f"evidencias[{i}].trecho",
+            )
         if fonte.texto is None:
             _marcar(marcas, MARCA_TRECHO_NAO_CONFERIDO)
-        elif procurado not in fonte.texto:
+        elif not fonte.contem(procurado, mascara_ativa):
             return _rejeitar("trecho não encontrado na fonte", f"evidencias[{i}].trecho")
 
     for i, (evidencia, fonte) in enumerate(zip(resposta.evidencias, fontes, strict=True)):
-        data = evidencia.data_fonte or fonte.data_detectada
-        if data is None:
-            _marcar(marcas, MARCA_DATA_DESCONHECIDA)
-        elif ctx.retroativo and data > ctx.as_of:
+        # a data declarada vale, ou a detectada na página; mas uma data forte da página depois do as_of derruba
+        # a evidência mesmo com uma data_fonte anterior
+        datas = [d for d in (evidencia.data_fonte or fonte.data_detectada, fonte.data_forte) if d is not None]
+        if ctx.retroativo and any(data > ctx.as_of for data in datas):
             return _rejeitar("data_fonte posterior ao as_of", f"evidencias[{i}].data_fonte")
+        if not datas:
+            _marcar(marcas, MARCA_DATA_DESCONHECIDA)
     return Validacao(True, marcas=marcas)
