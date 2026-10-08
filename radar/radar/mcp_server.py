@@ -96,13 +96,13 @@ _MUDOU = "a pendência mudou durante a validação; consulte ver_pendencia de no
 
 _REF = re.compile(r"sha256:[0-9a-f]{64}")
 # os marcadores numerados da máscara: um termo novo cujo número já marca outro valor ganha o próximo livre
-_NUMERADO = re.compile(r"\[(PESSOA|CNPJ)_(\d+)\]")
+_NUMERADO = re.compile(r"\[(PESSOA|CNPJ|PROCESSO|DELIBERACAO)_(\d+)\]")
 # os marcadores de CNPJ: um CNPJ (nas duas formas) que já tem marcador o mantém
 _DE_CNPJ = re.compile(r"\[CNPJ(?:_\d+)?\]")
 _TOKEN_DE_CNPJ = re.compile(r"\[CNPJ(?:_\d+)?\]", re.IGNORECASE)
 _SEPARADORES_DO_CNPJ = re.compile(r"[.\-/\s]")
-# os nós que coletam: no modo cego, ver_pendencia e ver_artefato esperam todos parados (a máscara vem das saídas)
-_PARADOS = frozenset({"feito", "pulado", "erro", "bloqueado", "aguardando"})
+# no modo cego, ver_pendencia e ver_artefato esperam os coletores sem trabalho por fazer (a máscara vem das saídas)
+_TERMINAIS = frozenset({"feito", "pulado", "erro", "bloqueado"})
 # o `Content-Type` com que cada artefato de texto é decodificado; o resto (fora o PDF e o PNG) não é exibido
 _TIPO_DO_TEXTO = {".html": "text/html", ".txt": "text/plain", ".json": "application/json"}
 _EXIBIVEIS = frozenset({".pdf", *_TIPO_DO_TEXTO})
@@ -262,7 +262,8 @@ def _unir_mascara(base: dict[str, str], nova: dict[str, str]) -> bool:
         if not novos:
             continue
         ja_tem = next((vistos[t.casefold()] for t in termos if t.casefold() in vistos), None)
-        if _DE_CNPJ.fullmatch(marcador) and ja_tem is not None:
+        # o valor (o CNPJ nas duas formas, o NUP, a deliberação e a URL dela) que já tem marcador o mantém
+        if ja_tem is not None and (_DE_CNPJ.fullmatch(marcador) or _NUMERADO.fullmatch(marcador)):
             marcador = ja_tem
         elif marcador in base.values() and (numerado := _NUMERADO.fullmatch(marcador) or _DE_CNPJ.fullmatch(marcador)):
             marcador = _proximo_livre(base, numerado.group(1) if numerado.re is _NUMERADO else "CNPJ")
@@ -613,9 +614,19 @@ class _Radar:
 
     @staticmethod
     def _coleta_parada(ex: _Execucao) -> bool:
-        """Todos os nós coletores (os que não são `pend_*`) terminaram ou aguardam pendência: a máscara já tem o que
-        eles acharam."""
-        return all(st in _PARADOS for no, st in ex.motor.status().items() if not no.startswith("pend_"))
+        """Nenhum coletor (nó que não é `pend_*`) tem trabalho por fazer: nenhum `executando` e nenhum `pendente` com
+        todas as dependências terminais (pronto para rodar). O `pendente` atrás de um nó `aguardando`, direto ou por
+        uma cadeia de pendentes, está esperando a pendência e conta como parado (R2): com a P-CNPJ aberta, `registros`
+        e os nós da CVM esperam o `cnpj`, e o Claude precisa ver a P-CNPJ para destravá-los."""
+        status = ex.motor.status()
+        for no, st in status.items():
+            if no.startswith("pend_"):
+                continue
+            if st == "executando":
+                return False
+            if st == "pendente" and all(status.get(dep) in _TERMINAIS for dep in ex.motor.dependencias(no)):
+                return False
+        return True
 
     async def _cega_ocupada(self, ex: _Execucao) -> bool:
         """No modo cego, `ver_pendencia` e `ver_artefato` esperam o trabalho de fundo e os coletores parados (I9)."""
@@ -828,7 +839,8 @@ _DESCRICOES = {
         "A pendência completa: pergunta, critérios, candidatos (trecho, valor, artefato sha256 e posição), "
         "formato_resposta, restrições (as_of, modo_cego) e conteudo_do_alvo; aberta=false se já foi respondida; "
         "aviso diz quantos candidatos ficaram de fora por tamanho. No modo cego, o que identifica o alvo vem "
-        "mascarado ([ALVO], [EMPRESA], [CNPJ], [CNPJ_n], [PESSOA_n]) e, com trabalho rodando, devolve em_andamento; "
+        "mascarado ([ALVO], [EMPRESA], [CNPJ], [CNPJ_n], [PESSOA_n], [PROCESSO_n], [DELIBERACAO_n]) e, com trabalho "
+        "rodando, devolve em_andamento; "
         "na P-CNPJ do modo cego, o valor cnpj pode ser o token ([CNPJ_n]) que aparece na pendência. "
         f"{AVISO_NAO_CONFIAVEL}"
     ),

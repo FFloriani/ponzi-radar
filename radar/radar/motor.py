@@ -166,6 +166,10 @@ class Motor:
     def status(self) -> dict[str, StatusNo]:
         return dict(self._status)
 
+    def dependencias(self, nome: str) -> tuple[str, ...]:
+        """As dependências do nó (obrigatórias, opcionais e `exige_um_de`), na ordem declarada."""
+        return self._grafo[nome]
+
     def saidas(self, nome: str) -> dict | None:
         saidas = self._saidas.get(nome)
         return copy.deepcopy(saidas) if saidas is not None else None

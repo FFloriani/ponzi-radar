@@ -1383,3 +1383,72 @@ async def test_modo_cego_so_mostra_pendencia_e_artefato_com_os_coletores_parados
 
 def test_instrucoes_avisam_que_o_modo_cego_so_protege_o_canal_mcp():
     assert "casos_dir" in mcp_server.INSTRUCOES and "config.local.toml" in mcp_server.INSTRUCOES
+
+
+# ---------------------------------------------------------------------------- portão do modo cego com a P-CNPJ aberta (R2)
+
+
+class Sancionador(NoBase):
+    """Coletor depois do `cnpj`, como `registros`, `cvm_sancionador` e `cvm_alertas` no DAG real."""
+
+    nome = "cvm_sancionador"
+    entradas = ("cnpj",)
+
+    async def executar(self, ctx, entradas, respostas, s):
+        return Feito({"processos": []})
+
+
+async def test_modo_cego_serve_com_a_p_cnpj_aberta_e_coletor_depois_do_cnpj(abrir, tmp_path):
+    # o coletor atrás do `cnpj` aguardando está esperando a pendência, não trabalhando: o portão não pode prendê-lo
+    nos = [AlvoNo(), Coleta(), _extracao_com_cnpjs(), CnpjPelaResposta(), Sancionador()]
+    srv = await abrir(nos)
+    run_id = await iniciar(srv, modo_cego=True)
+    st = await chamar(srv, "status", run_id=run_id)
+    assert (st["nos"]["cnpj"], st["nos"]["cvm_sancionador"]) == ("aguardando", "pendente")
+    pendencia = await chamar(srv, "ver_pendencia", run_id=run_id, id="P-CNPJ")
+    assert pendencia["id"] == "P-CNPJ" and pendencia["aberta"] is True
+    texto = (await chamar(srv, "ver_artefato", run_id=run_id, sha256=artefatos(tmp_path, run_id)["html"]))["texto"]
+    assert "CNPJ [CNPJ_1]" in texto
+
+
+# ---------------------------------------------------------------------------- NUP e deliberação no modo cego (R3)
+
+NUP = "19957000011202001"
+URL_905 = "https://conteudo.cvm.gov.br/legislacao/deliberacoes/deli0900/deli905.html"
+
+
+def _nos_com_processo_e_deliberacao() -> list[NoBase]:
+    empresa = {"cnpj": "12345678000195", "razao_social": "EXEMPLO PARTICIPACOES LTDA",
+               "socios": [{"nome": "FULANO BELTRANO"}]}  # fmt: skip
+    processo = {"nup": NUP, "objeto": "Apurar oferta irregular", "data_abertura": "2020-03-10", "fase": "Julgamento",
+                "acusado": "EXEMPLO PARTICIPACOES LTDA", "situacao": "Acusado envia defesa", "vinculo": "razao_social",
+                "nome_curto": False}  # fmt: skip
+    deliberacao = {"tipo": "nome", "valor": "exemplo participacoes ltda", "numero": 905, "data": "2025-11-25",
+                   "url": URL_905, "trecho": "Deliberação CVM nº 905: EXEMPLO PARTICIPACOES LTDA oferece contratos"}
+    return [
+        AlvoNo(), Coleta(), Fixo("extracao", {"candidatos": [], "fonte": "captura", "truncado": {}}),
+        Fixo("cnpj", empresa), Fixo("cvm_sancionador", {"processos": [processo], "motivo": None}),
+        Fixo("cvm_alertas", {"correspondencias": [deliberacao], "cobertura": {"com_texto_integral": 1, "so_resumo": 0}}),
+        PendNo("pend_d1"), PendNo("pend_c4"),
+    ]  # fmt: skip
+
+
+async def test_modo_cego_esconde_o_nup_e_o_numero_da_deliberacao(abrir, tmp_path):
+    srv = await abrir(_nos_com_processo_e_deliberacao())
+    run_id = await iniciar(srv, modo_cego=True)
+    d1 = json.dumps(await chamar(srv, "ver_pendencia", run_id=run_id, id="P-D1"), ensure_ascii=False)
+    assert NUP not in d1 and "19957" not in d1 and "[PROCESSO_1]" in d1
+    c4 = json.dumps(await chamar(srv, "ver_pendencia", run_id=run_id, id="P-C4"), ensure_ascii=False)
+    assert "905" not in c4 and "deli0900" not in c4 and "[DELIBERACAO_1]" in c4
+    # fora do modo cego, nada muda
+    aberto = await iniciar(srv)
+    assert NUP in json.dumps(await chamar(srv, "ver_pendencia", run_id=aberto, id="P-D1"), ensure_ascii=False)
+
+
+def test_unir_mascara_numera_processo_e_deliberacao_e_mantem_o_token_do_valor():
+    base = {"905": "[DELIBERACAO_1]"}
+    # a URL da 905 entra com o marcador que o número já tem; a 509 não divide o marcador com a 905
+    assert mcp_server._unir_mascara(base, {"905": "[DELIBERACAO_1]", URL_905: "[DELIBERACAO_1]"}) is True
+    assert base == {"905": "[DELIBERACAO_1]", URL_905: "[DELIBERACAO_1]"}
+    assert mcp_server._unir_mascara(base, {"509": "[DELIBERACAO_1]"}) is True and base["509"] == "[DELIBERACAO_2]"
+    assert mcp_server._unir_mascara(base, {NUP: "[PROCESSO_1]"}) is True and base[NUP] == "[PROCESSO_1]"

@@ -547,3 +547,41 @@ def test_cnpj_confirmado_e_cnpj_e_os_outros_candidatos_ganham_numero():
 
 def test_marcador_numerado_de_cnpj_e_marcador():
     assert MARCADOR.fullmatch("[CNPJ_12]") and MARCADOR.fullmatch("[cnpj]") and not MARCADOR.fullmatch("[CNPJ_]")
+
+
+# --- processos e deliberações (R3) -------------------------------------------------------------------------
+
+URL_905 = "https://conteudo.cvm.gov.br/legislacao/deliberacoes/deli0900/deli905.html"
+URL_509 = "https://conteudo.cvm.gov.br/legislacao/deliberacoes/deli0500/deli509.html"
+
+
+def test_nup_e_numero_de_deliberacao_viram_marcador():
+    # uma busca do NUP ou da deliberação devolve o acusado, isto é, a empresa: no modo cego eles também se escondem
+    saidas = {
+        "cvm_sancionador": {"processos": [{"nup": "19957000011202001"}, {"nup": "19957000022201801"}, {"nup": None}]},
+        "cvm_alertas": {"correspondencias": [
+            {"tipo": "nome", "numero": 905, "url": URL_905},
+            {"tipo": "nome", "numero": 905, "url": URL_905},  # a mesma deliberação por outro nome: um marcador só
+            {"tipo": "cnpj", "numero": 509, "url": URL_509},
+            {"tipo": "nome", "numero": 12, "url": None},  # número curto demais: casaria com qualquer número do texto
+        ]},
+    }  # fmt: skip
+    assert montar_mascara(saidas, sem_artefatos) == {
+        "19957000011202001": "[PROCESSO_1]", "19957.000011/2020-01": "[PROCESSO_1]",
+        "19957000022201801": "[PROCESSO_2]", "19957.000022/2018-01": "[PROCESSO_2]",
+        "905": "[DELIBERACAO_1]", URL_905: "[DELIBERACAO_1]",
+        "509": "[DELIBERACAO_2]", URL_509: "[DELIBERACAO_2]",
+    }  # fmt: skip
+
+
+def test_mascarar_nup_e_deliberacao_no_texto():
+    saidas = {
+        "cvm_sancionador": {"processos": [{"nup": "19957000011202001"}]},
+        "cvm_alertas": {"correspondencias": [{"tipo": "nome", "numero": 905, "url": URL_905}]},
+    }
+    mascara = montar_mascara(saidas, sem_artefatos)
+    texto = f"Deliberação CVM nº 905 ({URL_905}); processo 19957.000011/2020-01 e 19957000011202001; 19050 fica."
+    assert mascarar(texto, mascara) == (
+        "Deliberação CVM nº [DELIBERACAO_1] ([DELIBERACAO_1]); processo [PROCESSO_1] e [PROCESSO_1]; 19050 fica."
+    )
+    assert MARCADOR.fullmatch("[PROCESSO_3]") and MARCADOR.fullmatch("[DELIBERACAO_12]")

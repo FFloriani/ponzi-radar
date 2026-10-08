@@ -1,8 +1,9 @@
 """Máscara do modo cego (spec 7.5): o que identifica o alvo vira marcador antes de chegar ao Claude.
 
 `montar_mascara` junta, das saídas dos nós, os termos que revelam o site (`[ALVO]`), a empresa (`[EMPRESA]`), o
-CNPJ (`[CNPJ]` o confirmado, `[CNPJ_n]` os candidatos) e os sócios (`[PESSOA_n]`); `mascarar` aplica o dicionário a
-um texto.
+CNPJ (`[CNPJ]` o confirmado, `[CNPJ_n]` os candidatos), os sócios (`[PESSOA_n]`) e o que uma busca levaria até a
+empresa: o NUP dos processos sancionadores (`[PROCESSO_n]`) e o número das deliberações da CVM (`[DELIBERACAO_n]`);
+`mascarar` aplica o dicionário a um texto.
 
 A comparação é sobre o texto dobrado (sem acento, sem caixa, sem caracteres invisíveis), com o mapa de volta às
 posições do original: o que fica de fora do termo achado continua como estava. Entre as palavras de um termo vale
@@ -32,7 +33,11 @@ _PARTES_DO_TERMO = re.compile(r"[\s.\-/]+")
 _SEPARADORES_DO_TITULO = re.compile(r"\s*[|–—·:]\s*|\s+-\s+")
 _CNPJ = re.compile(r"[0-9a-z]{12}[0-9]{2}")
 # os marcadores que `montar_mascara` produz
-MARCADOR = re.compile(r"\[(?:alvo|empresa|cnpj(?:_\d+)?|pessoa_\d+)\]", re.IGNORECASE)
+MARCADOR = re.compile(r"\[(?:alvo|empresa|cnpj(?:_\d+)?|pessoa_\d+|processo_\d+|deliberacao_\d+)\]", re.IGNORECASE)
+# o NUP do processo sancionador: 17 dígitos, que a CVM também escreve como 19957.000011/2020-01
+_NUP = re.compile(r"\d{17}")
+# o número de deliberação com menos dígitos que isto casaria com qualquer número do texto
+_DIGITOS_DA_DELIBERACAO = 3
 # Palavras (dobradas) de forma jurídica, de setor e de vitrine: a razão social, o `og:site_name` e o domínio as
 # trazem, mas elas não identificam uma marca. Uma parte do título que só tem essas palavras em comum com eles não é
 # o nome do site ("Investimentos" em "EXEMPLO INVESTIMENTOS LTDA" ou em exemploinvestimentos.com.br). `invest` fica
@@ -188,7 +193,10 @@ def montar_mascara(saidas: dict[str, dict], ler_artefato: Callable[[str], bytes]
     - `cnpj.cnpj`, formatado e só com os caracteres (numérico ou alfanumérico) -> `[CNPJ]`;
     - `rdap.cnpj_titular` e os candidatos `cnpj` da `extracao`, nas duas formas -> `[CNPJ_n]`, um número por CNPJ
       (I9: a P-CNPJ abre antes de o nó `cnpj` achar a empresa, e o rodapé com o CNPJ não pode sair cru);
-    - `cnpj.socios[].nome` -> `[PESSOA_n]`, com n a posição do sócio no quadro.
+    - `cnpj.socios[].nome` -> `[PESSOA_n]`, com n a posição do sócio no quadro;
+    - `cvm_sancionador.processos[].nup` (como veio, só os dígitos e formatado) -> `[PROCESSO_n]`;
+    - o `numero` (com 3 dígitos ou mais) e a `url` de cada deliberação em `cvm_alertas.correspondencias` (as candidatas da
+      P-C4 e as que casaram por CNPJ ou domínio) -> `[DELIBERACAO_n]` (R3).
 
     Termos com menos de 4 caracteres não entram. Um termo que já entrou (sem diferenciar maiúsculas) não entra
     de novo; o primeiro marcador vale.
@@ -196,11 +204,11 @@ def montar_mascara(saidas: dict[str, dict], ler_artefato: Callable[[str], bytes]
     mascara: dict[str, str] = {}
     vistos: set[str] = set()
 
-    def adicionar(termo: Any, marcador: str) -> None:
+    def adicionar(termo: Any, marcador: str, minimo: int = _MINIMO_DE_CARACTERES) -> None:
         if not isinstance(termo, str):
             return
         termo = " ".join(termo.split())
-        if len(termo) < _MINIMO_DE_CARACTERES or termo.casefold() in vistos:
+        if len(termo) < minimo or termo.casefold() in vistos:
             return
         vistos.add(termo.casefold())
         mascara[termo] = marcador
@@ -256,6 +264,30 @@ def montar_mascara(saidas: dict[str, dict], ler_artefato: Callable[[str], bytes]
     for n, socio in enumerate(socios if isinstance(socios, list) else [], start=1):
         if isinstance(socio, dict):
             adicionar(socio.get("nome"), f"[PESSOA_{n}]")
+
+    processos = _no(saidas, "cvm_sancionador").get("processos")
+    numerados = 0
+    for processo in processos if isinstance(processos, list) else []:
+        nup = processo.get("nup") if isinstance(processo, dict) else None
+        if not isinstance(nup, str) or not nup.strip() or nup.strip().casefold() in vistos:
+            continue
+        numerados += 1
+        marcador = f"[PROCESSO_{numerados}]"
+        adicionar(nup, marcador)
+        if _NUP.fullmatch(digitos := re.sub(r"\D", "", nup)):
+            adicionar(digitos, marcador)
+            adicionar(f"{digitos[:5]}.{digitos[5:11]}/{digitos[11:15]}-{digitos[15:]}", marcador)
+
+    correspondencias = _no(saidas, "cvm_alertas").get("correspondencias")
+    numerados = 0
+    for correspondencia in correspondencias if isinstance(correspondencias, list) else []:
+        numero = correspondencia.get("numero") if isinstance(correspondencia, dict) else None
+        texto = str(numero) if isinstance(numero, int) and not isinstance(numero, bool) else ""
+        if len(texto) < _DIGITOS_DA_DELIBERACAO or texto in vistos:
+            continue
+        numerados += 1
+        adicionar(texto, f"[DELIBERACAO_{numerados}]", minimo=_DIGITOS_DA_DELIBERACAO)
+        adicionar(correspondencia.get("url"), f"[DELIBERACAO_{numerados}]")  # o invólucro deliNNN.html diz o número
     return mascara
 
 
