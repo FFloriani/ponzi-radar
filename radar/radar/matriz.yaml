@@ -1,0 +1,78 @@
+versao: "2026-10-07"
+faixas:            # eixo 1
+  - {de: 0,  ate: 4,  classe: "sem sinal estrutural forte"}
+  - {de: 5,  ate: 9,  classe: "suspeito"}
+  - {de: 10, ate: 16, classe: "provável"}
+  - {de: 17, ate: 34, classe: "característico"}
+itens:
+  A1: {nome: "Retorno fixo ou garantido", max: 4, limites_pct_mes: [1.2, 3.0, 10.0], taxa_diaria: 4}
+  A2: {nome: "Série de retornos lisa", max: 2}
+  A3: {nome: "Origem do retorno não verificável e sem custodiante", max: 2}
+  B1: {nome: "Remuneração por captar ou indicar", max: 3, valores: {indicacao_remunerada: 2, recrutar_para_sacar: 3}}
+  B2: {nome: "Pagamento em token ou moeda interna", max: 2}
+  B3: {nome: "Carência com multa pesada", max: 1}
+  B4: {nome: "Cobrança para liberar saque", max: 3}
+  C1: {nome: "Sem registro ou autorização (CVM/BCB)", max: 3}
+  C2: {nome: "Contrato com nome atípico", max: 2}
+  C3: {nome: "Conta de PF/terceiro, sem CNPJ, atividade incoerente ou offshore", max: 2}
+  C4: {nome: "Alerta oficial vigente", max: 3}
+  D1: {nome: "Responsáveis com histórico de fraude", max: 3}
+  D2: {nome: "Clone de esquema conhecido", max: 2}
+  D3: {nome: "Identidade nova", max: 1, meses_limite: 12}
+  D4: {nome: "Credibilidade emprestada", max: 1}
+regras_corte:
+  - {id: R1, tipo: classe_minima, classe: "provável", condicoes: [{item: A1, op: ">=", valor: 3}, {item: C1, op: ">", valor: 0}]}
+  - {id: R2, tipo: classe_minima, classe: "característico", condicoes: [{item: B4, op: ">", valor: 0}]}
+  - {id: R3, tipo: classe_fixa, classe: "confirmado", sinal: prova_aportes_novos}
+estagios:          # eixo 2: tipo de sinal → estágio
+  saques_funcionando: E1
+  depoimentos: E1
+  expansao_acelerada: E2
+  influenciadores: E2
+  eventos: E2
+  escalada_taxa: E3
+  plano_novo: E3
+  troca_contrato: E3
+  carencia_maior: E3
+  novas_geografias: E3
+  atraso_pagamento: E4
+  limite_saque: E4
+  manutencao_sistema: E4
+  taxa_para_sacar: E4
+  pico_reclamacoes: E4
+  culpa_terceiros: E4
+  token_proprio: E5
+  saldo_migrado: E5
+  pagamento_parcelado: E5
+  acordos: E5
+  recuperacao_judicial: E5
+  site_fora_do_ar: E6
+  pagamentos_parados: E6
+  operacao_policial: E6
+  fuga_operador: E6
+  retomada_prometida: E7
+  lideres_novo_esquema: E7
+janelas:           # tabela "Leitura combinada" do relatório; texto descritivo, não previsão
+  E0: "muito variável: dias no canal online; ~12 meses de vida total com promessa >30%/mês; ~30 meses nos esquemas BR com cripto"
+  E1: "muito variável: dias no canal online; ~12 meses de vida total com promessa >30%/mês; ~30 meses nos esquemas BR com cripto"
+  E2: "a mais incerta: depende da velocidade de captação; o corte estatal pode vir sem aviso"
+  E3: "meses: a escalada precedeu o 1º calote em ~10 meses na Albânia; entradas ≈ saídas precederam o fim em 0–3 meses"
+  E4: "semanas: mediana de ~1,5 mês até a parada no Brasil (n=9); 0 a 4 meses fora"
+  E5: "de ~1 mês a 7–10 meses, conforme os freios (token, limites, reorganização)"
+  E6: "colapso em curso ou consumado"
+  E7: "pós-colapso: anos; atenção à reciclagem dos líderes"
+modificadores:     # direção observada nos casos; associação, não causalidade
+  retorno_alto:          {direcao: encurta, origem: A1}           # >10%/mês ou taxa diária
+  historico_fraude:      {direcao: encurta, origem: D1}
+  identidade_nova:       {direcao: encurta, origem: D3}
+  carencia_longa:        {direcao: alonga,  origem: B3}           # adia o estresse visível
+  midia_de_massa:        {direcao: encurta, origem: P-E}
+  colapso_vizinho:       {direcao: encurta, origem: P-E}          # setor, cidade ou rede de líderes, últimos 3 meses
+  alerta_base_aberta:    {direcao: encurta, origem: P-E}          # alerta oficial com captação aberta
+  passivo_em_btc_alta:   {direcao: encurta, origem: P-E}          # hipótese, amostra pequena
+  choque_liquidez_macro: {direcao: encurta, origem: P-E}          # só esquemas de baixa volatilidade
+  afinidade_fechada:     {direcao: alonga,  origem: P-E}
+  idosos_alvo:           {direcao: alonga,  origem: P-E}
+  defensores_ativos:     {direcao: alonga,  origem: P-E}
+  freios_terminais:      {direcao: alonga,  origem: P-E}          # alonga a fase final, não evita o fim
+  investigacao_em_curso: {direcao: corte_sem_aviso, origem: P-E}

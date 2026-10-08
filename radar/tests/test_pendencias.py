@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -533,7 +534,7 @@ def test_pe_lista_so_os_modificadores_da_pe(ctx):
 
 
 def test_pe_nao_repete_prova_aportes_novos_se_a_matriz_ja_a_tem(ctx):
-    matriz = type(MATRIZ_SPEC)(estagios={"atraso_pagamento": "E4", "prova_aportes_novos": "E6"}, modificadores={})
+    matriz = SimpleNamespace(estagios={"atraso_pagamento": "E4", "prova_aportes_novos": "E6"}, modificadores={})
     p = nova_pendencia("P-E", ctx, [], "pend_e", matriz)
     assert p.formato_resposta["tipos_validos"] == "atraso_pagamento|prova_aportes_novos"
     assert p.formato_resposta["modificadores_validos"] == ""

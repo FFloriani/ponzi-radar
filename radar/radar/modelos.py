@@ -90,7 +90,8 @@ class Item(BaseModel):
 
 class Sinal(BaseModel):
     tipo: str
-    estagio: str
+    # `None`: o sinal não marca estágio (o `prova_aportes_novos` alimenta a regra de corte R3, não o eixo 2)
+    estagio: str | None
     data: date | None
     tipo_fonte: str
     evidencia: Evidencia | None = None

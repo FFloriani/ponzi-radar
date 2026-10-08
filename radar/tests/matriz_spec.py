@@ -1,15 +1,10 @@
-"""A matriz mínima dos testes dos nós `pend_*`: só `estagios` e `modificadores`, copiados da spec (8.1).
+"""A matriz dos testes dos nós `pend_*` e da validação: a de verdade (`radar/matriz.yaml`, spec 8.1).
 
-Serve até a Tarefa 14 criar o `carregar_matriz`; a P-E só lê esses dois dicionários.
+A P-E só lê `estagios` e `modificadores` dela (`definicoes.validos_da_matriz`, por duck typing).
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from types import SimpleNamespace
+from radar.pontuacao import carregar_matriz
 
-import yaml
-
-MATRIZ_SPEC = SimpleNamespace(
-    **yaml.safe_load((Path(__file__).parent / "fixtures" / "matriz_spec.yaml").read_text(encoding="utf-8"))
-)
+MATRIZ_SPEC = carregar_matriz()
