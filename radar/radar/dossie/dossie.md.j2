@@ -1,3 +1,4 @@
+{% set custodia = (cab.hash_custodia|cod) if cab.hash_custodia else (("custódia ilegível — rode " ~ (("radar verificar " ~ cab.run_id)|cod)) if cab.custodia_ilegivel else "sem registros na custódia") %}
 # Dossiê de risco: {{ cab.alvo|md }}
 
 ## 1. Identificação
@@ -8,7 +9,7 @@
 - **Modo de contato:** {{ cab.modo_contato }}
 - **Modo cego:** {{ cab.modo_cego }}
 - **Matriz:** versão {{ cab.matriz_versao|md }}, hash {{ cab.matriz_hash|cod }}
-- **Hash final da custódia:** {{ cab.hash_custodia|cod if cab.hash_custodia else "sem registros na custódia" }}
+- **Hash final da custódia:** {{ custodia }}
 
 ## 2. Veredito
 
@@ -34,7 +35,7 @@
 - **Sinal que o define:** {{ v.sinal.tipo|md }}, {{ v.sinal.data }}, fonte {{ v.sinal.tipo_fonte|md }}{{ (" " ~ (v.sinal.fonte|cod)) if v.sinal.fonte else "" }}
 - **Janela observada:** {{ v.janela|md }}
 {% else %}
-- **Estágio:** sem estágio (nenhum sinal confirmado)
+- **Estágio:** sem estágio (nenhum sinal de estágio)
 {% endif %}
 {% if v.modificadores %}
 - **Modificadores:**
@@ -54,7 +55,7 @@ O item `não verificado` ou `inconclusivo` aparece como intervalo de pontos (de 
 | Item | Estado | Pontos | Origem | Marcas | Trecho | Fonte | Hash | Nota |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 {% for l in itens %}
-| {{ l.item|md }} | {{ l.estado }} | {{ l.pontos }} | {{ l.origem }} | {{ l.marcas|map("cod")|join(", ") if l.marcas else l.sem_marcas }} | {{ l.trecho|md(160) }} | {{ (l.meta|md ~ " — " ~ (l.fonte|cod)) if l.fonte else "" }} | {{ l.hash|cod }} | {{ l.nota|md }} |
+| {{ l.item|md }} | {{ l.estado }} | {{ l.pontos }} | {{ l.origem }} | {{ l.marcas|map("cod")|join(", ") if l.marcas else l.sem_marcas }} | {{ l.trecho|md(160) }} | {{ l.meta|md }}{{ (" — " ~ (l.fonte|cod)) if l.fonte else "" }} | {{ l.hash|cod }} | {{ l.nota|md }} |
 {% endfor %}
 
 ## 4. Linha do tempo
@@ -182,7 +183,7 @@ O que não pôde ser verificado nunca vale zero: abre o intervalo do escore (se�
 
 {% if lacunas.nos %}
 {% for n in lacunas.nos %}
-- `{{ n.no }}` — {{ n.status|md }}{{ (": " ~ (n.motivo|md)) if n.motivo else "" }}
+- `{{ n.no }}` — {{ n.status|md }}{{ (": " ~ (n.motivo|md)) if n.motivo else "" }}{{ (" (para resolver: " ~ (n.resolve|md) ~ ")") if n.resolve else "" }}
 {% endfor %}
 {% else %}
 Todos os nós terminaram.
@@ -218,7 +219,7 @@ Comparado com a execução anterior {{ mud.anterior|cod }} (as_of {{ mud.as_of }
 
 ## 9. Anexo: artefatos e verificação
 
-Hash final da cadeia: {{ cab.hash_custodia|cod if cab.hash_custodia else "sem registros na custódia" }}
+Hash final da cadeia: {{ custodia }}
 
 {% if artefatos %}
 | Seq | Tipo | Origem | Hash |

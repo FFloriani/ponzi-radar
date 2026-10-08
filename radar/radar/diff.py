@@ -30,6 +30,7 @@ from radar.pontuacao import (
     pontuar_eixo1,
     pontuar_eixo2,
     sinais_da_execucao,
+    site_nao_respondeu,
 )
 from radar.texto import escapar_md
 
@@ -99,10 +100,23 @@ class Pontuacao:
     eixo2: Eixo2
 
 
-def carregar_anterior(ex: ExecucaoSalva) -> ExecucaoSalva | None:
-    """A execução anterior de `ex` (`execucao_anterior`), carregada, ou `None`."""
+def ler_anterior(ex: ExecucaoSalva) -> tuple[ExecucaoSalva | None, str | None]:
+    """A execução anterior de `ex` (`execucao_anterior`), carregada, e o aviso que a nomeia se ela existe mas não
+    pôde ser lida (JSON corrompido, arquivo faltando): uma execução antiga ruim não pode impedir a análise nova.
+    `(None, None)`: não há anterior."""
     pasta = execucao_anterior(ex.ctx.pasta)
-    return carregar_execucao(pasta) if pasta is not None else None
+    if pasta is None:
+        return None, None
+    try:
+        return carregar_execucao(pasta), None
+    except (OSError, ValueError, KeyError, TypeError) as erro:
+        nome = f"{pasta.parent.name}/{pasta.name}"
+        return None, f"A execução anterior {nome} não pôde ser lida ({type(erro).__name__})."
+
+
+def carregar_anterior(ex: ExecucaoSalva) -> ExecucaoSalva | None:
+    """A execução anterior de `ex`, carregada, ou `None` se não há ou não pôde ser lida (ver `ler_anterior`)."""
+    return ler_anterior(ex)[0]
 
 
 def pontuar(ex: ExecucaoSalva, matriz: Matriz, anterior: ExecucaoSalva | None) -> Pontuacao:
@@ -182,11 +196,13 @@ class Diff:
       ordem da matriz;
     - `sinais_novos`: sinais do eixo 2 (tipo, estágio, data) e alertas que `b` tem e `a` não tem;
     - `infra`: `hospedagem mudou` (A/AAAA), `NS mudou`, `MX mudou`, `domínio expira em menos de 60 dias` (em `b`, a
-      partir do `as_of` dela) e `site fora do ar` (NXDOMAIN em `b`, ou captura em erro em `b` com sucesso em `a`);
+      partir do `as_of` dela) e `site fora do ar` (NXDOMAIN em `b`, ou o site não respondeu à captura em `b` e
+      respondeu em `a`, pelo critério da pontuação: `pontuacao.site_nao_respondeu`);
     - `socios_entraram` e `socios_sairam`: nomes do quadro de sócios (nunca CPF);
     - `wayback_novas`: capturas do Wayback que `b` tem a mais;
     - `matriz_diferente`: a `a` foi pontuada antes com outra matriz. `eixo1_a_matriz_original` é a conta de então
-      (`None` se o `pontuacao.json` dela não a traz) e `matriz_versoes`, `(versão original, versão atual)`;
+      (`None` se o `pontuacao.json` dela não a traz) e `matriz_versoes`, `(versão original, versão atual)` (com os
+      8 primeiros hex do hash de cada uma quando as versões coincidem);
     - `total_pontos`: a soma dos máximos dos itens (o "de 34" do intervalo).
     """
 
@@ -206,9 +222,9 @@ class Diff:
     matriz_versoes: tuple[str, str] | None = None
 
 
-def _conta_original(a: ExecucaoSalva, matriz: Matriz) -> tuple[str, Eixo1 | None] | None:
-    """`(versão, eixo 1)` com que a `a` foi pontuada, se foi com outra matriz; `None` se a matriz é a mesma, se não
-    há `pontuacao.json` ou se ele não diz com que matriz foi feito (nesses casos vale como igual)."""
+def _conta_original(a: ExecucaoSalva, matriz: Matriz) -> tuple[str, str, Eixo1 | None] | None:
+    """`(versão, hash, eixo 1)` com que a `a` foi pontuada, se foi com outra matriz; `None` se a matriz é a mesma, se
+    não há `pontuacao.json` ou se ele não diz com que matriz foi feito (nesses casos vale como igual)."""
     try:
         dados = ler_json(a.ctx.pasta / NOME_DA_PONTUACAO)
     except (OSError, ValueError):
@@ -218,9 +234,9 @@ def _conta_original(a: ExecucaoSalva, matriz: Matriz) -> tuple[str, Eixo1 | None
         return None
     versao = registro["versao"] if isinstance(registro.get("versao"), str) else "desconhecida"
     try:
-        return versao, Eixo1.model_validate(dados.get("eixo1"))
+        return versao, registro["hash"], Eixo1.model_validate(dados.get("eixo1"))
     except ValidationError:
-        return versao, None
+        return versao, registro["hash"], None
 
 
 def _nome_do_socio(nome: str) -> str:
@@ -260,7 +276,8 @@ def _infra(a: ExecucaoSalva, b: ExecucaoSalva) -> list[str]:
     if expiracao is not None and (expiracao - b.ctx.as_of).days < DIAS_PARA_EXPIRAR:
         infra.append(f"domínio expira em menos de {DIAS_PARA_EXPIRAR} dias")
     nxdomain = dns_b is not None and dns_b.get("nxdomain") is True
-    captura_caiu = status_do_no(b, "captura") == "erro" and status_do_no(a, "captura") == "feito"
+    # o critério é o do E6: HTTP 403/429 (WAF) ou "erro inesperado" não são o site fora do ar
+    captura_caiu = site_nao_respondeu(b) and not site_nao_respondeu(a)
     if nxdomain or captura_caiu:
         infra.append("site fora do ar")
     return infra
@@ -307,6 +324,11 @@ def comparar(a: ExecucaoSalva, b: ExecucaoSalva, matriz: Matriz) -> Diff:
         sairam = [nome for chave, nome in socios_a.items() if chave not in socios_b]
 
     original = _conta_original(a, matriz)
+    versoes = None
+    if original is not None:
+        versoes = (original[0], matriz.versao)
+        if original[0] == matriz.versao:  # a versão não distingue as duas: o hash distingue
+            versoes = (f"{original[0]} (hash {original[1][:8]})", f"{matriz.versao} (hash {matriz.hash[:8]})")
     return Diff(
         eixo1_a=pa.eixo1,
         eixo1_b=pb.eixo1,
@@ -319,9 +341,9 @@ def comparar(a: ExecucaoSalva, b: ExecucaoSalva, matriz: Matriz) -> Diff:
         socios_sairam=sairam,
         wayback_novas=_capturas_novas(a, b),
         matriz_diferente=original is not None,
-        eixo1_a_matriz_original=original[1] if original is not None else None,
+        eixo1_a_matriz_original=original[2] if original is not None else None,
         total_pontos=total_de_pontos(matriz),
-        matriz_versoes=(original[0], matriz.versao) if original is not None else None,
+        matriz_versoes=versoes,
     )
 
 

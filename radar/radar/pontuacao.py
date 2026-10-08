@@ -744,7 +744,7 @@ def _da_pe(ex: ExecucaoSalva, matriz: Matriz) -> tuple[list[Sinal], list[Modific
     return sinais, modificadores
 
 
-def _site_nao_respondeu(ex: ExecucaoSalva) -> bool:
+def site_nao_respondeu(ex: ExecucaoSalva) -> bool:
     """A captura caiu em erro porque o site não está no ar (R-T14-e6). O nó levanta "captura falhou: <motivo>":
     - falha de navegação sem resposta HTTP (DNS, conexão recusada, timeout) conta;
     - "HTTP <código>" na página inicial conta só com 5xx (inclusive os 52x da Cloudflare), 404 e 410. 401, 403, 407,
@@ -766,7 +766,7 @@ def _site_fora_do_ar(ex: ExecucaoSalva, matriz: Matriz, anterior: ExecucaoSalva 
         return None
     dns = _feito(ex, "dns")
     nxdomain = dns is not None and "nxdomain" not in _vazados(dns) and dns.get("nxdomain") is True
-    duas_falhas = anterior is not None and _site_nao_respondeu(ex) and _site_nao_respondeu(anterior)
+    duas_falhas = anterior is not None and site_nao_respondeu(ex) and site_nao_respondeu(anterior)
     if not (nxdomain or duas_falhas):
         return None
     return Sinal(tipo=TIPO_FORA_DO_AR, estagio=estagio, data=ex.ctx.as_of, tipo_fonte=_FONTE_COLETOR)

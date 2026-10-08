@@ -146,7 +146,8 @@ _INVISIVEIS_MD = dict.fromkeys(
 _CPF = re.compile(
     r"(?<!\d)\d{3}\.\d{3}\.\d{3}\s?-\s?\d{2}(?!\d)|\bCPF\b[^\d\n]{0,4}\d{11}(?!\d)", re.IGNORECASE
 )
-_SEQUENCIA_DE_CRASES = re.compile(r"`+")
+# o que o trecho de código não pode ter: ver `codigo_md`
+_PERCENT_DO_CODIGO = {ord("|"): "%7C", ord("\\"): "%5C", ord("`"): "%60"}
 _CPF_OMITIDO = "(CPF omitido)"
 
 
@@ -172,12 +173,10 @@ def escapar_md(valor: object, limite: int | None = None) -> str:
 def codigo_md(valor: object) -> str:
     """`valor` como trecho de código numa célula de tabela: URLs e hashes ficam sem escape e sem link.
 
-    O `|` leva `\\` (a tabela o remove) e a cerca é mais longa que qualquer sequência de crases do texto.
+    Dentro do trecho o Markdown não escapa nada, e a tabela corta a célula no `|` conforme a contagem de barras que
+    vêm antes dele (`a\\|b` vira `a\\\\|b`, e o resto do conteúdo pode sair do trecho e virar link). Por isso `|`,
+    `\\` e a crase saem em percent-encoding (`%7C`, `%5C`, `%60`), como numa URL, e a cerca é sempre uma crase só.
     Texto vazio dá `""`.
     """
-    texto = _em_uma_linha(valor).replace("|", "\\|")
-    if not texto:
-        return ""
-    cerca = "`" * (max((len(m) for m in _SEQUENCIA_DE_CRASES.findall(texto)), default=0) + 1)
-    margem = " " if texto.startswith("`") or texto.endswith("`") else ""
-    return f"{cerca}{margem}{texto}{margem}{cerca}"
+    texto = _em_uma_linha(valor).translate(_PERCENT_DO_CODIGO)
+    return f"`{texto}`" if texto else ""

@@ -10,7 +10,7 @@ import pytest
 from radar.arquivos import gravar_json_atomico
 from radar.diff import Diff, comparar, renderizar_diff, texto_classe, texto_intervalo
 from radar.execucao import carregar_execucao
-from radar.pontuacao import Eixo1
+from radar.pontuacao import Eixo1, site_nao_respondeu
 from tests.execucao_em_disco import AGORA, MATRIZ, PETROBRAS, gravar, pend_e_com, resposta, saidas_base, sinal_e
 
 ONTEM = AGORA - timedelta(days=1)
@@ -222,8 +222,42 @@ def test_diff_site_fora_do_ar_por_nxdomain(tmp_path):
     assert comparar(a, b, MATRIZ).infra == ["site fora do ar"]
 
 
-def test_diff_site_fora_do_ar_por_captura_que_falhou_so_no_b(tmp_path):
-    a, b = duas(tmp_path, b={"status": {"captura": ("erro", "captura falhou: timeout")}})
+@pytest.mark.parametrize(
+    "motivo,fora_do_ar",
+    [
+        ("captura falhou: timeout", True),
+        ("captura falhou: net::ERR_CONNECTION_REFUSED", True),
+        ("captura falhou: HTTP 503", True),
+        ("captura falhou: HTTP 521", True),
+        ("captura falhou: HTTP 404", True),
+        # o site respondeu e recusou o visitante (WAF, bloqueio geográfico): não é o site fora do ar (R-T14-e6)
+        ("captura falhou: HTTP 403", False),
+        ("captura falhou: HTTP 429", False),
+        # erro do nosso código, não do site
+        ("erro inesperado: KeyError: 'paginas'", False),
+        ("motivo de erro", False),
+    ],
+)
+def test_diff_site_fora_do_ar_por_captura_que_falhou_so_no_b(tmp_path, motivo, fora_do_ar):
+    a, b = duas(tmp_path, b={"status": {"captura": ("erro", motivo)}})
+    assert comparar(a, b, MATRIZ).infra == (["site fora do ar"] if fora_do_ar else [])
+
+
+def test_diff_site_fora_do_ar_usa_o_criterio_da_pontuacao(tmp_path):
+    """Mesma função do E6: o que o E6 chama de "site não respondeu" é o que o diff chama de "fora do ar"."""
+    motivos = ["captura falhou: timeout", "captura falhou: HTTP 403", "erro inesperado: KeyError", "captura falhou: HTTP 502"]
+    for n, motivo in enumerate(motivos):
+        a, b = duas(tmp_path / f"caso{n}", b={"status": {"captura": ("erro", motivo)}})
+        assert (comparar(a, b, MATRIZ).infra == ["site fora do ar"]) is site_nao_respondeu(b)
+
+
+def test_diff_captura_que_ja_respondia_403_e_agora_cai_e_novidade(tmp_path):
+    """A 403 em `a` não é "fora do ar"; o 503 em `b` é: a queda é nova."""
+    a, b = duas(
+        tmp_path,
+        a={"status": {"captura": ("erro", "captura falhou: HTTP 403")}},
+        b={"status": {"captura": ("erro", "captura falhou: HTTP 503")}},
+    )
     assert comparar(a, b, MATRIZ).infra == ["site fora do ar"]
 
 
@@ -358,3 +392,22 @@ def test_renderizar_diff_intervalo_e_classe_que_mudaram(tmp_path):
     texto = renderizar_diff(comparar(a, b, MATRIZ))
     assert "Intervalo: 8–10 de 34 → 6–8 de 34" in texto
     assert "Classe: provável → suspeito" in texto
+
+
+def test_diff_matriz_diferente_com_a_mesma_versao_traz_o_hash(tmp_path):
+    """Duas matrizes com a mesma versão (alguém mudou o YAML sem mudar `versao`): só o hash as distingue."""
+    a, b = duas(tmp_path)
+    _pontuacao_json(a.ctx.pasta, "ab" * 32, ANTIGO, versao=MATRIZ.versao)
+    d = comparar(a, b, MATRIZ)
+    assert d.matriz_diferente is True
+    assert d.matriz_versoes == (f"{MATRIZ.versao} (hash abababab)", f"{MATRIZ.versao} (hash {MATRIZ.hash[:8]})")
+    texto = renderizar_diff(d)
+    assert "(hash abababab)" in texto and f"(hash {MATRIZ.hash[:8]})" in texto
+
+
+def test_diff_matriz_diferente_com_versoes_diferentes_nao_poe_hash(tmp_path):
+    a, b = duas(tmp_path)
+    _pontuacao_json(a.ctx.pasta, "ab" * 32, ANTIGO, versao="2026-09-01")
+    d = comparar(a, b, MATRIZ)
+    assert d.matriz_versoes == ("2026-09-01", MATRIZ.versao)
+    assert "hash" not in renderizar_diff(d)

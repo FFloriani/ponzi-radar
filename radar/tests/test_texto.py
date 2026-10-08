@@ -163,8 +163,24 @@ def test_escapar_md_corta_depois_de_mascarar_o_cpf():
 
 def test_codigo_md_para_celula_de_tabela():
     assert codigo_md("https://x.example/a_b*c") == "`https://x.example/a_b*c`"
-    assert codigo_md("a|b") == "`a\\|b`"
-    assert codigo_md("com `crase`") == "`` com `crase` ``"
-    assert codigo_md("duas ``crases`` aqui") == "```duas ``crases`` aqui```"
     assert codigo_md("a\nb\N{LINE SEPARATOR}c") == "`a b c`"
     assert codigo_md("") == "" and codigo_md(None) == ""
+
+
+@pytest.mark.parametrize(
+    "entrada,saida",
+    [
+        ("a|b", "`a%7Cb`"),
+        ("a" + chr(92) + "b", "`a%5Cb`"),
+        ("com `crase` e ``duas``", "`com %60crase%60 e %60%60duas%60%60`"),
+        # a barra antes da barra vertical: o encoding não deixa sobrar nenhuma das duas
+        ("a" + chr(92) + "|[x](u)", "`a%5C%7C[x](u)`"),
+        ("a" + chr(92) * 2 + "|b", "`a%5C%5C%7Cb`"),
+    ],
+)
+def test_codigo_md_nao_deixa_barra_vertical_barra_invertida_nem_crase(entrada, saida):
+    """Dentro do trecho o Markdown não escapa nada e a célula da tabela fecha no `|` conforme a barra que vem antes:
+    o que sobrasse deixaria o resto do valor (`[x](u)`) fora do trecho e virava link."""
+    assert codigo_md(entrada) == saida
+    resultado = codigo_md(entrada)
+    assert resultado.count("`") == 2 and "|" not in resultado and chr(92) not in resultado

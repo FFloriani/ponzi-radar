@@ -12,6 +12,8 @@ import pytest
 from jinja2 import UndefinedError
 
 from radar.custodia import Custodia, hash_final, verificar
+from radar.execucao import carregar_execucao
+from radar.pendencias.definicoes import nova_pendencia
 from radar.dossie import PendenciasAbertas, gerar_dossie
 from radar.pontuacao import Eixo1
 from radar.texto import escapar_md
@@ -31,6 +33,7 @@ from tests.execucao_em_disco import (
     sinal_e,
 )
 
+BS = chr(92)  # barra invertida
 TITULOS = [
     "## 1. Identificação",
     "## 2. Veredito",
@@ -161,7 +164,8 @@ def test_dossie_pode_chegar_a_e_regra_pendente(tmp_path):
 
 def test_dossie_eixo2_sem_sinal(tmp_path):
     s2 = secao(dossie(gravar(tmp_path)), 2)
-    assert "sem estágio" in s2 and "previsão numérica" in s2
+    assert "sem estágio (nenhum sinal de estágio)" in s2 and "previsão numérica" in s2
+    assert "nenhum sinal confirmado" not in s2
 
 
 def test_dossie_eixo2_estagio_sinal_janela_e_modificadores(tmp_path):
@@ -222,6 +226,34 @@ def test_dossie_item_do_coletor_mostra_a_nota_e_nenhum_hash(tmp_path):
     s3 = secao(dossie(gravar(tmp_path)), 3)
     c1 = next(linha for linha in s3.splitlines() if linha.startswith("| C1"))
     assert "coletor" in c1 and "3/3" in c1 and "sem registro na CVM nem no BCB" in c1
+
+
+def test_dossie_item_do_coletor_cita_o_no_na_coluna_fonte(tmp_path):
+    """C1, C3 (parte automática), C4 (pela CVM) e D3: a fonte é o nó do coletor, sem hash."""
+    alerta = {
+        "tipo": "cnpj", "valor": PETROBRAS, "numero": 9, "data": "2026-01-01",
+        "url": "https://cvm.example/9", "trecho": "atuação irregular",
+    }  # fmt: skip
+    pasta = gravar(
+        tmp_path,
+        saidas={
+            "cnpj": {**saidas_base()["cnpj"], "cnae": 4711302},  # fora da seção K, com oferta de investimento: C3
+            "cvm_alertas": {"correspondencias": [alerta], "cobertura": {"com_texto_integral": 1, "so_resumo": 0}},
+        },
+    )
+    linhas = secao(dossie(pasta), 3).splitlines()
+
+    def celula_fonte(item: str) -> str:
+        linha = next(linha for linha in linhas if linha.startswith(f"| {item}"))
+        return linha.split(" | ")[6]
+
+    assert celula_fonte("C1") == "coletor: registros"
+    assert celula_fonte("C3") == "coletor: cnpj"
+    assert celula_fonte("D3") == "coletor: rdap, cnpj"
+    # o C4 pela CVM traz também a evidência da deliberação
+    assert celula_fonte("C4").startswith("coletor: cvm_alertas; oficial, 2026-01-01 — `https://cvm.example/9`")
+    # item que não é do coletor não leva a marca
+    assert "coletor" not in celula_fonte("A1") and "coletor" not in celula_fonte("D2")
 
 
 def test_dossie_item_nao_verificado_mostra_o_intervalo_de_pontos(tmp_path):
@@ -467,6 +499,9 @@ def test_dossie_lacunas_com_wayback_sem_snapshot(tmp_path):
     s7 = secao(md_, 7)
     assert "sem snapshot até 2019-06-01" in s7
     assert "wayback_snapshot" in s7 and "extracao" in s7 and "dependência com erro: wayback_snapshot" in s7
+    assert "`wayback_snapshot` — erro: sem snapshot até 2019-06-01 (para resolver: rodar de novo a análise)" in s7
+    assert "`extracao` — bloqueado: dependência com erro: wayback_snapshot (para resolver: resolver a dependência wayback_snapshot)" in s7
+    assert "`pend_a3` — bloqueado: dependência bloqueada: pend_a1 (para resolver: resolver a dependência pend_a1)" in s7
     assert "A1 — não verificado" in s7
     # nada vira zero: o intervalo se abre
     assert re.search(r"\d+–\d+ de 34", secao(md_, 2))
@@ -479,16 +514,47 @@ def test_dossie_lacunas_listam_cada_no_que_nao_terminou_com_o_motivo(tmp_path):
                 "captura": ("pulado", "modo_contato=nenhum"), "cvm_alertas": "aguardando"},
     )  # fmt: skip
     s7 = secao(dossie(pasta), 7)
-    assert "`ct` — erro: crt.sh: resposta inválida" in s7
-    assert "`rdap` — bloqueado: dependência com erro: alvo" in s7
+    assert "`ct` — erro: crt.sh: resposta inválida (para resolver: rodar de novo a análise)" in s7
+    assert "`rdap` — bloqueado: dependência com erro: alvo (para resolver: resolver a dependência alvo)" in s7
     assert "`captura` — pulado: modo_contato=nenhum" in s7
     assert "`cvm_alertas` — aguardando" in s7
+
+
+def test_dossie_lacunas_so_listam_pulado_que_deixa_dado_sem_cobertura(tmp_path):
+    pasta = gravar(
+        tmp_path,
+        status={
+            "dns": ("pulado", "só atual"),
+            "captura": ("pulado", "modo_contato=nenhum"),
+            "pend_a3": ("pulado", "dependência pulada: pend_a1"),
+            "wayback_snapshot": ("pulado", "captura ok"),
+            "pend_a2": ("pulado", "sem histórico de rentabilidade"),
+            "pend_d4": ("pulado", "sem oferta de investimento"),
+        },
+    )
+    s7 = secao(dossie(pasta), 7)
+    assert "`dns` — pulado: só atual" in s7
+    assert "`captura` — pulado: modo_contato=nenhum" in s7
+    assert "`pend_a3` — pulado: dependência pulada: pend_a1" in s7
+    # pulado sem resolução: o dado não existe nessa execução, rodar de novo não muda
+    assert "`dns` — pulado: só atual (" not in s7
+    for benigno in ["wayback_snapshot", "captura ok", "pend_a2", "pend_d4", "sem histórico de rentabilidade"]:
+        assert benigno not in s7, benigno
+
+
+def test_dossie_lacuna_de_no_aguardando_manda_responder_a_pendencia(tmp_path):
+    s7 = secao(dossie(gravar(tmp_path, abertas=("P-B",)), forcar=True), 7)
+    assert "`pend_b` — aguardando (para resolver: responder a P-B)" in s7
 
 
 def test_dossie_lacunas_inconclusivo_e_nao_verificado(tmp_path):
     a1 = resposta("inconclusivo", evidencias_=[])
     s7 = secao(dossie(gravar(tmp_path, saidas={"pend_a1": a1})), 7)
     assert "A1 — inconclusivo" in s7 and "D2 — não verificado" in s7
+    # a P-A1 já foi respondida (inconclusivo): precisa de outra resposta, com evidência
+    assert "A1 — inconclusivo (para resolver: responder de novo a P-A1 com evidência)" in s7
+    # o D2 não depende de pendência: nada a responder
+    assert next(linha for linha in s7.splitlines() if linha.startswith("- D2")).count("para resolver") == 0
 
 
 def test_dossie_lacunas_nao_listam_item_confirmado_nem_nao_se_aplica(tmp_path):
@@ -617,13 +683,15 @@ def test_dossie_nao_escreve_nada_se_a_montagem_falha(tmp_path, monkeypatch):
     ]  # fmt: skip
 
 
-def test_dossie_custodia_ilegivel_nao_gera_dossie(tmp_path):
+def test_dossie_custodia_ilegivel_manda_rodar_o_verificar(tmp_path):
     pasta = gravar(tmp_path)
     with (pasta / "custodia.log").open("a", encoding="utf-8", newline="\n") as f:
         f.write("isto nao e json\n")
-    with pytest.raises(ValueError, match="custodia.log"):
-        gerar_dossie(pasta, MATRIZ)
-    assert not (pasta / "dossie.md").exists()
+    md_ = dossie(pasta)  # a última linha do log ilegível não impede o dossiê
+    mensagem = "custódia ilegível — rode `radar verificar exemplo-com-br/2026-10-07_120000`"
+    assert mensagem in secao(md_, 1) and mensagem in secao(md_, 9)
+    assert "sem registros na custódia" not in md_
+    assert REF_PAGINA in secao(md_, 9)  # as linhas legíveis seguem no anexo
 
 
 def test_dossie_sem_estado_json_levanta(tmp_path):
@@ -675,3 +743,85 @@ def test_dossie_conteudo_hostil_do_site_nao_cria_titulo_nem_html(tmp_path):
     # o que veio de fora sai com "\" antes de "<" e de "[": texto, não tag nem link
     assert not re.search(r"(?<!\\)<", md_) and not re.search(r"(?<!\\)\[x\]", md_)
     assert md_.count("\n## 9. Anexo") == 1
+
+
+# ---------------------------------------------------------------------------- retroativa, anterior ilegível, fonte hostil
+
+
+def test_dossie_retroativo_nao_compara_com_execucao_atual(tmp_path):
+    """Passado contra presente não diz nada ("estágio caiu" porque a retroativa não vê os sinais de hoje)."""
+    gravar(tmp_path, agora=AGORA - timedelta(days=1), saidas={"pend_e": pend_e_com(sinal_e("atraso_pagamento"))})
+    pasta = gravar(tmp_path, as_of=date(2019, 7, 1))
+    (pasta / "diff.md").write_text("velho", encoding="utf-8")
+    md_ = dossie(pasta)
+    s8 = secao(md_, 8)
+    assert "Execução retroativa: sem comparação com execuções atuais." in s8
+    assert "Estágio" not in s8 and "estágio" not in s8.replace("Mudanças", "")
+    assert not (pasta / "diff.md").exists()
+
+
+def test_dossie_retroativo_pontua_sem_olhar_a_anterior(tmp_path):
+    """A anterior ilegível também não conta: a retroativa nem tenta lê-la."""
+    anterior = gravar(tmp_path, agora=AGORA - timedelta(days=1))
+    (anterior / "evidencias.json").write_text("{isto não é json", encoding="utf-8")
+    pasta = gravar(tmp_path, as_of=date(2019, 7, 1))
+    assert "Execução retroativa: sem comparação" in secao(dossie(pasta), 8)
+
+
+def test_dossie_anterior_ilegivel_nao_impede_o_dossie_novo(tmp_path):
+    anterior = gravar(tmp_path, agora=AGORA - timedelta(days=1))
+    (anterior / "evidencias.json").write_text("{isto não é json", encoding="utf-8")
+    pasta = gravar(tmp_path)
+    s8 = secao(dossie(pasta), 8)
+    assert "A execução anterior exemplo-com-br/2026-10-06_120000 não pôde ser lida (JSONDecodeError). Sem comparação." in s8
+    assert (pasta / "dossie.md").exists() and (pasta / "pontuacao.json").exists()
+    assert not (pasta / "diff.md").exists()
+
+
+def test_dossie_anterior_sem_campos_do_estado_tambem_nao_impede(tmp_path):
+    anterior = gravar(tmp_path, agora=AGORA - timedelta(days=1))
+    estado = json.loads((anterior / "estado.json").read_text(encoding="utf-8"))
+    del estado["nos"]  # estado legível para `execucao_anterior`, mas sem o que `carregar_execucao` precisa
+    (anterior / "estado.json").write_text(json.dumps(estado), encoding="utf-8")
+    s8 = secao(dossie(gravar(tmp_path)), 8)
+    assert "2026-10-06_120000 não pôde ser lida (KeyError)" in s8
+
+
+def test_dossie_fonte_com_barra_e_barra_vertical_nao_escapa_da_celula(tmp_path):
+    """Dentro do trecho de código não há escape: barra invertida e barra vertical juntas, seguidas de `[pwn](u)`,
+    têm de sair em percent-encoding, senão o resto da fonte vira link vivo."""
+    hostil = "https://evil.example/a" + BS + "|[pwn](http://evil.example)`x"
+    a1 = resposta(
+        valor={"pct_mes": 5.0, "taxa_diaria": False, "garantido": True},
+        evidencias_=[{"fonte": hostil, "trecho": "paga 5% ao mês garantido", "data_fonte": None, "tipo_fonte": "relato"}],
+    )
+    md_ = dossie(gravar(tmp_path, saidas={"pend_a1": a1}))
+    linhas = [linha for linha in secao(md_, 3).splitlines() if linha.startswith("|")]
+    assert len({celulas(linha) for linha in linhas}) == 1
+    a1_linha = next(linha for linha in linhas if linha.startswith("| A1"))
+    assert "`https://evil.example/a%5C%7C[pwn](http://evil.example)%60x`" in a1_linha
+    # nem a barra invertida nem a barra vertical sobram dentro da célula da fonte
+    fonte = a1_linha.split(" | ")[6]
+    assert BS not in fonte and "|" not in fonte
+
+
+def test_dossie_lacuna_do_item_cita_a_pendencia_que_a_nota_cita(tmp_path):
+    """O C3 fica inconclusivo pela P-CNPJ (não pela P-C que o cobre): é a P-CNPJ que precisa de resposta nova."""
+    pasta = gravar(tmp_path, saidas={"cnpj": {"cnpj": None, "motivo": "não encontrado"}})
+    ctx = carregar_execucao(pasta).ctx
+    estado = json.loads((pasta / "estado.json").read_text(encoding="utf-8"))
+    pendencia = nova_pendencia("P-CNPJ", ctx, [], "cnpj", MATRIZ).model_dump(mode="json")
+    estado["pendencias"]["P-CNPJ"] = {**pendencia, "aberta": False}
+    (pasta / "estado.json").write_text(json.dumps(estado), encoding="utf-8")
+    julgamentos = json.loads((pasta / "julgamentos.json").read_text(encoding="utf-8"))
+    julgamentos.append(
+        {
+            "id": "P-CNPJ#1", "pendencia": "P-CNPJ", "resposta": resposta("inconclusivo", evidencias_=[])["resposta"],
+            "em": "2026-10-07T12:00:00.000+00:00", "substitui": None, "ativa": True,
+        }
+    )  # fmt: skip
+    (pasta / "julgamentos.json").write_text(json.dumps(julgamentos), encoding="utf-8")
+    s7 = secao(dossie(pasta), 7)
+    c3 = next(linha for linha in s7.splitlines() if linha.startswith("- C3"))
+    assert "C3 — inconclusivo" in c3 and "P-CNPJ inconclusiva" in c3
+    assert c3.endswith("(para resolver: responder de novo a P-CNPJ com evidência)")

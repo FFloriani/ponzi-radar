@@ -9,6 +9,7 @@ tabela pelo filtro `cod`.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -25,10 +26,10 @@ from radar.diff import (
     Diff,
     Pontuacao,
     alertas_da_execucao,
-    carregar_anterior,
     comparar,
     data_iso,
     julgamento_ativo,
+    ler_anterior,
     pontuar,
     renderizar_diff,
     saida,
@@ -53,6 +54,15 @@ _DIRECAO = {
     "corte_sem_aviso": "corte possível sem aviso",
 }
 _ORIGENS_COM_JULGAMENTO = frozenset({"regex_confirmada", "claude"})  # as marcas são do julgamento do Claude
+# os itens que o coletor pontua, e os nós de onde vem a conta de cada um (coluna Fonte da tabela)
+_NOS_DO_COLETOR = {"C1": "registros", "C3": "cnpj", "C4": "cvm_alertas", "D3": "rdap, cnpj"}
+# o nó pulado que deixa dado sem cobertura (só o presente, sem visita ao alvo, dependência pulada); os outros
+# pulados (`captura ok`, pendência que não se aplica) não são lacuna
+_PULADO_COM_LACUNA = ("só atual", "modo_contato=nenhum", "dependência pulada")
+_PENDENCIA = re.compile(r"P-[A-Z0-9]+")
+_DEPENDENCIA = re.compile(r"^dependência (?:com erro|bloqueada): (.+)$")
+_SEM_DIFF_RETROATIVA = "Execução retroativa: sem comparação com execuções atuais."
+_SEM_DIFF_PRIMEIRA = "Não há execução anterior deste alvo em modo atual para comparar."
 _PREFIXO_HASH = "sha256:"
 _HASH_CURTO = len(_PREFIXO_HASH) + 12
 _MAX_SANS = 20
@@ -137,8 +147,17 @@ class _Custodia:
 # ---------------------------------------------------------------------------- cabeçalho e veredito
 
 
+def _hash_da_custodia(pasta: Path) -> tuple[str | None, bool]:
+    """`(hash final, custódia ilegível)`: a última linha ilegível do log não impede o dossiê, só o hash."""
+    try:
+        return hash_final(pasta), False
+    except ValueError:
+        return None, True
+
+
 def _cabecalho(ex: ExecucaoSalva, matriz: Matriz, pasta: Path) -> dict:
     ctx = ex.ctx
+    hash_custodia, custodia_ilegivel = _hash_da_custodia(pasta)
     return {
         "alvo": ctx.alvo,
         "url_inicial": ctx.url_inicial,
@@ -150,7 +169,8 @@ def _cabecalho(ex: ExecucaoSalva, matriz: Matriz, pasta: Path) -> dict:
         "run_id": ctx.run_id,
         "matriz_versao": matriz.versao,
         "matriz_hash": matriz.hash,
-        "hash_custodia": hash_final(pasta),
+        "hash_custodia": hash_custodia,
+        "custodia_ilegivel": custodia_ilegivel,
     }
 
 
@@ -237,17 +257,19 @@ def _linhas_dos_itens(ex: ExecucaoSalva, matriz: Matriz, itens: dict[str, Item],
             "sem_marcas": _NA,
             "nota": item.nota or "",
         }
+        coletor = f"coletor: {_NOS_DO_COLETOR[id_]}" if item.origem == "coletor" and id_ in _NOS_DO_COLETOR else ""
         if not evidencias:
-            linhas.append({**primeira, "trecho": _NA, "meta": "", "fonte": "", "hash": ""})
+            linhas.append({**primeira, "trecho": _NA, "meta": coletor, "fonte": "", "hash": ""})
         for n, evidencia in enumerate(evidencias):
             fonte, hash_ = custodia.fonte_e_hash(evidencia)
             data = evidencia.data_fonte.isoformat() if evidencia.data_fonte else "sem data"
+            meta = f"{evidencia.tipo_fonte}, {data}"
             continuacao = dict.fromkeys(primeira, "") | {"item": id_}
             linhas.append(
                 {
                     **(primeira if n == 0 else continuacao),
                     "trecho": evidencia.trecho,
-                    "meta": f"{evidencia.tipo_fonte}, {data}",
+                    "meta": f"{coletor}; {meta}" if coletor else meta,
                     "fonte": fonte,
                     "hash": hash_[:_HASH_CURTO],
                 }
@@ -431,25 +453,58 @@ def _plural(n: int, singular: str, plural: str) -> str:
     return singular if n == 1 else plural
 
 
+def _resolver_no(ex: ExecucaoSalva, no: str, status: str, motivo: str) -> str:
+    """O que resolveria o nó sem resultado. Vazio para `pulado`: o dado não existe nessa execução (só o presente,
+    sem visita ao alvo) e rodar de novo não muda isso."""
+    if status == "bloqueado":
+        dependencia = _DEPENDENCIA.match(motivo)
+        if dependencia is not None:
+            return f"resolver a dependência {dependencia.group(1)}"
+        return f"resolver a dependência ({motivo.rpartition(': ')[2]})" if motivo else "resolver a dependência"
+    if status == "aguardando":
+        abertas = [pid for pid, p in ex.pendencias.items() if p.get("aberta") and p.get("no_origem") == no]
+        return "; ".join(f"responder a {pid}" for pid in abertas)
+    if status in ("erro", "pendente", "executando"):
+        return "rodar de novo a análise"
+    return ""
+
+
+def _nos_sem_resultado(ex: ExecucaoSalva) -> list[dict]:
+    nos = []
+    for no, estado in ex.status.items():
+        status, motivo = estado.get("status"), estado.get("motivo") or ""
+        if status == "feito" or (status == "pulado" and not motivo.startswith(_PULADO_COM_LACUNA)):
+            continue
+        nos.append({"no": no, "status": status, "motivo": motivo, "resolve": _resolver_no(ex, no, status, motivo)})
+    return nos
+
+
+def _resolver_item(ex: ExecucaoSalva, id_: str, item: Item) -> str:
+    """A pendência que resolve o item: a que a nota cita (`P-CNPJ inconclusiva...`) ou, sem citação, a que o cobre.
+    Aberta: responder. Já respondida como `inconclusivo`: responder de novo, com evidência."""
+    citadas = [pid for pid in _PENDENCIA.findall(item.nota or "") if pid in ex.pendencias]
+    pids = citadas or [pid for pid, p in ex.pendencias.items() if id_ in (p.get("itens") or [])]
+    acoes = []
+    for pid in pids:
+        if ex.pendencias[pid].get("aberta"):
+            acoes.append(f"responder a {pid}")
+        elif item.estado == "inconclusivo":
+            acoes.append(f"responder de novo a {pid} com evidência")
+    return "; ".join(acoes)
+
+
 def _lacunas(ex: ExecucaoSalva, itens: dict[str, Item]) -> dict:
-    """Nós sem resultado (com o motivo), itens `nao_verificado` ou `inconclusivo` (com a pendência que os resolve,
-    se está aberta) e o que limita a cobertura das fontes."""
-    nos = [
-        {"no": no, "status": estado.get("status"), "motivo": estado.get("motivo") or ""}
-        for no, estado in ex.status.items()
-        if estado.get("status") != "feito"
-    ]
-    abertas = {pid: p.get("itens") or [] for pid, p in ex.pendencias.items() if p.get("aberta")}
+    """Nós sem resultado e itens `nao_verificado` ou `inconclusivo`, cada um com o que o resolveria, e o que limita a
+    cobertura das fontes. O nó pulado só entra quando deixa dado sem cobertura (`_PULADO_COM_LACUNA`)."""
     em_aberto = []
     for id_, item in itens.items():
         if item.estado in ("nao_verificado", "inconclusivo"):
-            responder = [f"responder a {pid}" for pid, cobertos in abertas.items() if id_ in cobertos]
             em_aberto.append(
                 {
                     "id": id_,
                     "estado": ROTULO_DO_ESTADO[item.estado],
                     "nota": item.nota or "",
-                    "resolve": "; ".join(responder),
+                    "resolve": _resolver_item(ex, id_, item),
                 }
             )
     fontes = []
@@ -464,20 +519,16 @@ def _lacunas(ex: ExecucaoSalva, itens: dict[str, Item]) -> dict:
             "A listagem do Wayback veio truncada (limite do CDX): o total e o primeiro e o último snapshot podem "
             "não cobrir todo o domínio."
         )
-    return {"nos": nos, "itens": em_aberto, "fontes": fontes}
+    return {"nos": _nos_sem_resultado(ex), "itens": em_aberto, "fontes": fontes}
 
 
 # ---------------------------------------------------------------------------- mudanças
 
 
-def _mudancas(anterior: ExecucaoSalva | None, diff: Diff | None) -> dict:
+def _mudancas(anterior: ExecucaoSalva | None, diff: Diff | None, motivo: str) -> dict:
+    """A seção 8: o diff, ou `motivo` (retroativa, anterior ilegível, primeira) se não houve comparação."""
     if anterior is None or diff is None:
-        return {
-            "anterior": "",
-            "as_of": "",
-            "texto": "",
-            "motivo": "Não há execução anterior deste alvo em modo atual para comparar.",
-        }
+        return {"anterior": "", "as_of": "", "texto": "", "motivo": motivo}
     return {
         "anterior": anterior.ctx.run_id,
         "as_of": anterior.ctx.as_of.isoformat(),
@@ -496,6 +547,7 @@ def _contexto(
     pont: Pontuacao,
     anterior: ExecucaoSalva | None,
     diff: Diff | None,
+    motivo_sem_diff: str,
     forcadas: list[str],
 ) -> dict[str, Any]:
     custodia = _Custodia(pasta)
@@ -509,7 +561,7 @@ def _contexto(
         "pessoas": _pessoas_com_vinculo(ex, pont.itens),
         "infra": _infraestrutura(ex),
         "lacunas": _lacunas(ex, pont.itens),
-        "mud": _mudancas(anterior, diff),
+        "mud": _mudancas(anterior, diff, motivo_sem_diff),
         "artefatos": custodia.artefatos(),
     }
 
@@ -540,18 +592,27 @@ def gerar_dossie(pasta: Path, matriz: Matriz, forcar: bool = False) -> Path:
     pasta da execução, e devolve o caminho do `dossie.md`.
 
     Com pendências abertas e sem `forcar` levanta `PendenciasAbertas`; com `forcar` os itens delas valem como
-    `nao_verificado` e o dossiê avisa. O diff compara com `execucao_anterior` (repontuando as duas com `matriz`);
-    sem anterior, o `diff.md` que existisse é apagado. Nada é escrito se a montagem falha.
+    `nao_verificado` e o dossiê avisa. O diff compara com `execucao_anterior` (repontuando as duas com `matriz`).
+    Não há diff, e o `diff.md` que existisse é apagado, quando a execução é retroativa (comparar o passado com
+    uma execução atual não diz nada), quando não há anterior e quando a anterior não pôde ser lida (a seção 8
+    diz qual das três). Um `custodia.log` com a última linha ilegível não impede o dossiê: o cabeçalho manda rodar
+    `radar verificar`. Nada é escrito se a montagem falha.
     """
     pasta = Path(pasta)
     ex = carregar_execucao(pasta)
     abertas = [pid for pid, p in ex.pendencias.items() if p.get("aberta")]
     if abertas and not forcar:
         raise PendenciasAbertas(abertas)
-    anterior = carregar_anterior(ex)
+    anterior, aviso = (None, None) if ex.ctx.retroativo else ler_anterior(ex)
     pont = pontuar(ex, matriz, anterior)
     diff = comparar(anterior, ex, matriz) if anterior is not None else None
-    contexto = _contexto(ex, matriz, pasta, pont, anterior, diff, abertas)
+    if ex.ctx.retroativo:
+        motivo_sem_diff = _SEM_DIFF_RETROATIVA
+    elif aviso is not None:
+        motivo_sem_diff = f"{aviso} Sem comparação."
+    else:
+        motivo_sem_diff = _SEM_DIFF_PRIMEIRA
+    contexto = _contexto(ex, matriz, pasta, pont, anterior, diff, motivo_sem_diff, abertas)
     texto = _AMBIENTE.get_template("dossie.md.j2").render(**contexto)
 
     _gravar_pontuacao(pasta, matriz, pont)
