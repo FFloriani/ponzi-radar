@@ -382,8 +382,11 @@ async def _arquivar(url: str, ctx: Contexto, s: Servicos, ips_do_alvo: frozenset
     atual = url
     for _ in range(_MAX_REDIRECTS + 1):
         await _checar_destino(atual, ctx, s, ips_do_alvo)
-        # sem cache: a fonte arquivada tem de ser a página de agora
-        resposta = await s.rede.get(atual, tipo="navegador", seguir_redirect=False, usar_cache=False)
+        # sem cache: a fonte arquivada tem de ser a página de agora. O teto vale durante a leitura: um corpo enorme
+        # ou infinito, induzido por conteúdo hostil, não chega à memória
+        resposta = await s.rede.get(
+            atual, tipo="navegador", seguir_redirect=False, usar_cache=False, max_bytes=_MAX_BYTES
+        )
         location = resposta.headers.get("location")
         if not (300 <= resposta.status < 400 and location):
             break
@@ -392,12 +395,6 @@ async def _arquivar(url: str, ctx: Contexto, s: Servicos, ips_do_alvo: frozenset
         raise ErroRede(f"GET {url}: mais de {_MAX_REDIRECTS} redirects seguidos", permanente=True, url=url)
 
     conteudo = resposta.conteudo
-    if len(conteudo) > _MAX_BYTES:
-        raise ErroRede(
-            f"GET {url}: corpo de {len(conteudo)} bytes passa do teto de 10 MB; não foi guardado",
-            permanente=True,
-            url=url,
-        )
     tipo = resposta.headers.get("content-type", "")
     ext = _ext_do_tipo(tipo, conteudo)
     ref = s.custodia.guardar(conteudo, ext, tipo="fonte", origem=url)

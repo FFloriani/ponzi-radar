@@ -13,6 +13,8 @@
 [rede]
 ## proxy: vazio por padrão. Exemplo (Tor): proxy = "socks5://127.0.0.1:9050"
 # ua_navegador = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+## ua_api: com proxy configurado, o padrão abaixo vira "radar/0.1" (sem identificar o analista); um valor
+## escolhido aqui vale sempre.
 # ua_api = "radar-piramides/0.1 (pesquisa; github.com/FFloriani/piramide-pentest)"
 # timeout_s = 30.0
 # tentativas = 4

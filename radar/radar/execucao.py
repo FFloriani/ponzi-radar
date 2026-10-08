@@ -175,12 +175,15 @@ def slug_cego(dominio: str, segredo: bytes) -> str:
 def criar_servicos(
     config: Config, pasta: Path, rede: Rede, indices: Any = None, matriz: Any = None
 ) -> Servicos:
-    """Os serviços de uma execução: a custódia é a da `pasta`; rede, índices e matriz são compartilhados."""
+    """Os serviços de uma execução: a custódia é a da `pasta`; índices e matriz são compartilhados. `rede` é a
+    sessão da execução (`Rede.sessao()`: cache e cookies próprios, limite por host compartilhado), que quem a criou
+    fecha."""
     return Servicos(config=config, rede=rede, custodia=Custodia(pasta), indices=indices, matriz=matriz)
 
 
 def criar_indices(config: Config, rede: Rede) -> Indices:
-    """Os índices (CVM, BCB...) que todas as execuções compartilham: o cache fica em `casos_dir/_indices`."""
+    """Os índices (CVM, BCB...) que todas as execuções compartilham: o cache fica em `casos_dir/_indices`. `rede` é a
+    raiz (não a sessão de uma execução): os índices têm validade própria e não usam o cache dela."""
     return Indices(Path(config.casos_dir) / _PASTA_INDICES, rede, config.indices.ttl_horas)
 
 

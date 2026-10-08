@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 import radar.rede as modulo_rede
-from radar.config import RedeConfig
+from radar.config import UA_API, RedeConfig
 from radar.rede import ErroRede, Rede, RespostaRede
 from radar.texto import normalizar, texto_de_html
 
@@ -243,13 +243,14 @@ async def test_usar_cache_false_vai_a_rede_e_renova_o_cache(respx_mock):
     rota = respx_mock.get("https://api.x/fresco").mock(
         side_effect=[httpx.Response(200, text="velho"), httpx.Response(200, text="novo")]
     )
+    rota.side_effect = [httpx.Response(200, text=t) for t in ("velho", "novo", "depois")]
     r = rede_sem_espera()
     assert (await r.get("https://api.x/fresco")).texto == "velho"
     fresca = await r.get("https://api.x/fresco", usar_cache=False)
     assert (fresca.texto, fresca.de_cache, rota.call_count) == ("novo", False, 2)
-    # a resposta renovada passa a ser a do cache
+    # I4: `usar_cache=False` não guarda (os ZIPs e PDFs dos índices não ficam na memória) e tira a velha do cache
     seguinte = await r.get("https://api.x/fresco")
-    assert (seguinte.texto, seguinte.de_cache, rota.call_count) == ("novo", True, 2)
+    assert (seguinte.texto, seguinte.de_cache, rota.call_count) == ("depois", False, 3)
 
 
 async def test_cache_e_por_instancia(respx_mock):
@@ -645,3 +646,110 @@ def test_texto_de_html_entidades_e_espacos():
 def test_texto_de_html_tolera_html_quebrado_e_vazio():
     assert texto_de_html("") == ""
     assert texto_de_html("<div><p>aberto<div>outro") == "aberto\noutro"
+
+
+# ---------------------------------------------------------------- sessão por execução (I4)
+
+
+async def test_sessao_tem_cache_proprio(respx_mock):
+    rota = respx_mock.get("https://dns.x/q").mock(side_effect=[httpx.Response(200, text=t) for t in ("1", "2", "3")])
+    raiz = rede_sem_espera()
+    a, b = raiz.sessao(), raiz.sessao()
+    assert (await a.get("https://dns.x/q")).texto == "1"
+    assert (await a.get("https://dns.x/q")).texto == "1"  # a mesma execução: do cache
+    assert (await b.get("https://dns.x/q")).texto == "2"  # outra execução: resposta nova
+    assert rota.call_count == 2
+    for rede in (a, b, raiz):
+        await rede.fechar()
+
+
+async def test_sessao_divide_o_limite_por_host(respx_mock):
+    respx_mock.get(url__startswith="https://lento.x/").mock(return_value=httpx.Response(200))
+    esperas = []
+    raiz = Rede(cfg(limites={"*": 0, "lento.x": 2.0}), dormir=lambda s: registrar(esperas, s), relogio=lambda: 100.0)
+    await raiz.sessao().get("https://lento.x/1")
+    await raiz.sessao().get("https://lento.x/2")  # outra sessão, o mesmo host: a cortesia com a fonte continua
+    assert esperas == [2.0]
+
+
+async def test_sessao_tem_cookies_proprios(respx_mock):
+    respx_mock.get("https://fonte.x/entrar").mock(
+        return_value=httpx.Response(200, headers={"set-cookie": "rastreio=analista-1; Path=/"})
+    )
+    rota = respx_mock.get("https://fonte.x/pagina").mock(return_value=httpx.Response(200))
+    raiz = rede_sem_espera()
+    a, b = raiz.sessao(), raiz.sessao()
+    await a.get("https://fonte.x/entrar")
+    await a.get("https://fonte.x/pagina")
+    await b.get("https://fonte.x/pagina")
+    assert "rastreio=analista-1" in rota.calls[0].request.headers.get("cookie", "")
+    assert "cookie" not in rota.calls[1].request.headers  # a outra execução não leva o cookie
+    for rede in (a, b, raiz):
+        await rede.fechar()
+
+
+async def test_cache_tem_teto_de_memoria_e_descarta_os_mais_antigos(respx_mock, monkeypatch):
+    monkeypatch.setattr(modulo_rede, "TETO_DO_CACHE_BYTES", 250)
+    rotas = {n: respx_mock.get(f"https://api.x/{n}").mock(return_value=httpx.Response(200, content=b"x" * 100))
+             for n in "abc"}  # fmt: skip
+    r = rede_sem_espera()
+    for n in "abc":
+        await r.get(f"https://api.x/{n}")
+    assert (await r.get("https://api.x/c")).de_cache is True
+    assert (await r.get("https://api.x/a")).de_cache is False  # o mais antigo saiu para caber o terceiro
+    assert rotas["a"].call_count == 2
+
+
+async def test_resposta_grande_demais_para_o_cache_nao_e_guardada(respx_mock, monkeypatch):
+    monkeypatch.setattr(modulo_rede, "TETO_DO_CACHE_BYTES", 50)
+    rota = respx_mock.get("https://api.x/grande").mock(return_value=httpx.Response(200, content=b"x" * 100))
+    r = rede_sem_espera()
+    await r.get("https://api.x/grande")
+    await r.get("https://api.x/grande")
+    assert rota.call_count == 2
+
+
+async def test_cabecalhos_do_cache_nao_mudam_com_quem_os_le(respx_mock):
+    respx_mock.get("https://api.x/h").mock(return_value=httpx.Response(200, headers={"x-a": "1"}))
+    r = rede_sem_espera()
+    (await r.get("https://api.x/h")).headers["x-a"] = "alterado"
+    assert (await r.get("https://api.x/h")).headers["x-a"] == "1"
+
+
+async def test_ua_de_api_neutro_com_proxy(monkeypatch):
+    # com proxy (ou Tor) o UA padrão das APIs não pode dizer quem é o analista
+    com_proxy = Rede(cfg(proxy="socks5://127.0.0.1:9050"))
+    sem_proxy = Rede(cfg())
+    escolhido = Rede(cfg(proxy="socks5://127.0.0.1:9050", ua_api="meu-ua/1.0"))
+    assert com_proxy.ua_api == "radar/0.1"
+    assert sem_proxy.ua_api == UA_API and escolhido.ua_api == "meu-ua/1.0"
+    assert com_proxy.sessao().ua_api == "radar/0.1"
+    for rede in (com_proxy, sem_proxy, escolhido):
+        await rede.fechar()
+
+
+# ---------------------------------------------------------------- teto do corpo (item barato da revisão final)
+
+
+async def test_max_bytes_corta_a_leitura_e_e_erro_permanente(respx_mock):
+    rota = respx_mock.get("https://api.x/enorme").mock(return_value=httpx.Response(200, content=b"x" * 5000))
+    r = rede_sem_espera()
+    with pytest.raises(ErroRede) as e:
+        await r.get("https://api.x/enorme", max_bytes=1000)
+    assert e.value.permanente is True and "corpo acima do teto de 1000 bytes" in str(e.value)
+    assert rota.call_count == 1  # sem nova tentativa
+    ok = await r.get("https://api.x/enorme", max_bytes=5000)
+    assert len(ok.conteudo) == 5000 and ok.status == 200
+
+
+async def test_max_bytes_conta_o_corpo_descomprimido(respx_mock):
+    import gzip
+
+    corpo = gzip.compress(b"a" * 20_000)  # pequeno na rede, grande na memória
+    respx_mock.get("https://api.x/bomba").mock(
+        return_value=httpx.Response(200, content=corpo, headers={"content-encoding": "gzip"})
+    )
+    with pytest.raises(ErroRede):
+        await rede_sem_espera().get("https://api.x/bomba", max_bytes=10_000)
+    ok = await rede_sem_espera().get("https://api.x/bomba", max_bytes=30_000)
+    assert ok.conteudo == b"a" * 20_000

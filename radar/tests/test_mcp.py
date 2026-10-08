@@ -1269,3 +1269,29 @@ async def test_prompt_analisar_site(abrir):
 def test_espera_padrao():
     # a constante é do módulo, para os testes a trocarem
     assert mcp_server.ESPERA_S == 50
+
+
+# ---------------------------------------------------------------------------- sessão de rede por execução (I4)
+
+
+class DnsPelaRede(NoBase):
+    """Pergunta o A do alvo ao DoH pela `Rede` da execução."""
+
+    nome = "dns"
+    entradas = ("alvo",)
+
+    async def executar(self, ctx, entradas, respostas, s):
+        dados = await s.rede.get_json("https://cloudflare-dns.com/dns-query", params={"name": ctx.alvo, "type": "A"})
+        return Feito({"A": [dados["ip"]]})
+
+
+async def test_execucoes_no_mesmo_servidor_veem_respostas_novas(abrir, respx_mock, tmp_path):
+    # o servidor fica aberto por dias: "analisa de novo" não pode devolver o DNS da primeira execução
+    respx_mock.get("https://cloudflare-dns.com/dns-query").mock(
+        side_effect=[httpx.Response(200, json={"ip": ip}) for ip in ("203.0.113.1", "203.0.113.2")]
+    )
+    srv = await abrir([AlvoNo(), DnsPelaRede()])
+    primeira = await iniciar(srv)
+    segunda = await iniciar(srv)
+    assert ler_json(pasta(tmp_path, primeira) / "evidencias.json")["dns"]["A"] == ["203.0.113.1"]
+    assert ler_json(pasta(tmp_path, segunda) / "evidencias.json")["dns"]["A"] == ["203.0.113.2"]

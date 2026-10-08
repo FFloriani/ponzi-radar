@@ -81,14 +81,17 @@ def _custodia_sem_registros(pasta: Path) -> list[str]:
 
 
 async def _rodar(config: Config, ctx: Contexto) -> list[Pendencia]:
-    """Roda os nós da execução até o fim e devolve as pendências que ficaram abertas. A rede é fechada no fim."""
+    """Roda os nós da execução até o fim e devolve as pendências que ficaram abertas. A sessão de rede da execução e
+    a rede dos índices são fechadas no fim."""
     rede = Rede(config.rede)
+    sessao = rede.sessao()
     try:
-        servicos = criar_servicos(config, ctx.pasta, rede, criar_indices(config, rede), carregar_matriz())
+        servicos = criar_servicos(config, ctx.pasta, sessao, criar_indices(config, rede), carregar_matriz())
         motor = Motor(ctx, nos_do_nucleo(), servicos)
         await motor.executar()
         return motor.pendencias_abertas()
     finally:
+        await sessao.fechar()
         await rede.fechar()
 
 

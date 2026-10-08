@@ -334,8 +334,9 @@ class _Execucao:
 
 
 class _Radar:
-    """O que as ferramentas fazem. `Rede`, `Indices` e a matriz são um só para o servidor; o `Motor` de cada
-    `run_id` fica em memória e é recarregado do disco (`Motor.carregar`) quando não está."""
+    """O que as ferramentas fazem. `Indices` (com a `Rede` raiz) e a matriz são um só para o servidor; cada execução
+    tem a sua sessão de rede (`Rede.sessao()`: cache e cookies próprios, o limite por host compartilhado). O `Motor`
+    de cada `run_id` fica em memória e é recarregado do disco (`Motor.carregar`) quando não está."""
 
     def __init__(self, config: Config, nos: list[NoBase] | None) -> None:
         self.config = config
@@ -352,6 +353,8 @@ class _Radar:
         for tarefa in pendentes:
             tarefa.cancel()
         await asyncio.gather(*pendentes, return_exceptions=True)
+        for ex in self._execucoes.values():
+            await ex.servicos.rede.fechar()
         await self.rede.fechar()
 
     # --- execuções -----------------------------------------------------------------------------
@@ -366,8 +369,15 @@ class _Radar:
             return aberta
         if not (pasta / "estado.json").is_file():
             return {"erro": "execução não encontrada"}
-        servicos = criar_servicos(self.config, pasta, self.rede, self.indices, self.matriz)
-        aberta = _Execucao(Motor.carregar(pasta, self._nos(), servicos), servicos)
+        servicos = criar_servicos(self.config, pasta, self.rede.sessao(), self.indices, self.matriz)
+        try:
+            aberta = _Execucao(Motor.carregar(pasta, self._nos(), servicos), servicos)
+        except BaseException:
+            # a sessão criada para esta execução não serve: fecha em segundo plano (aqui não há await)
+            tarefa = asyncio.get_running_loop().create_task(servicos.rede.fechar())
+            self._tarefas.add(tarefa)
+            tarefa.add_done_callback(self._tarefas.discard)
+            raise
         if aberta.cega:
             salva = ler_json(pasta / NOME_DA_MASCARA, {})
             if isinstance(salva, dict):
@@ -530,7 +540,7 @@ class _Radar:
             ctx = iniciar_execucao(alvo, as_of, modo_contato, modo_cego, self.config.casos_dir)
         except ErroIniciar as erro:
             return {"erro": str(erro)}
-        servicos = criar_servicos(self.config, ctx.pasta, self.rede, self.indices, self.matriz)
+        servicos = criar_servicos(self.config, ctx.pasta, self.rede.sessao(), self.indices, self.matriz)
         ex = _Execucao(Motor(ctx, self._nos(), servicos), servicos)
         self._execucoes[ctx.run_id] = ex
         tarefa = self._lancar(ex, ex.motor.executar)

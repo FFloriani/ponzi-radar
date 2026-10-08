@@ -15,6 +15,7 @@ UA_NAVEGADOR = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 )
+# com proxy configurado, a `Rede` troca este padrão por um neutro (`rede.UA_API_NEUTRO`): ele identifica o projeto
 UA_API = "radar-piramides/0.1 (pesquisa; github.com/FFloriani/piramide-pentest)"
 
 

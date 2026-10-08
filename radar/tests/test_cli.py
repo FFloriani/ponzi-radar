@@ -258,12 +258,12 @@ def test_coletar_com_nos_falsos(casos, nos_falsos, redes_fechadas, capsys):
     estado = ler_json(casos / run_id / "estado.json")
     assert estado["nos"]["alvo"]["status"] == "feito" and estado["nos"]["pend_a1"]["status"] == "aguardando"
     assert estado["contexto"]["modo_contato"] == "captura" and estado["contexto"]["modo_cego"] is False
-    # os nós recebem a rede, os índices (cache em casos/_indices) e a matriz
+    # os nós recebem a sessão de rede da execução (I4), os índices (cache em casos/_indices) e a matriz
     (servicos,) = nos_falsos
-    assert servicos.rede is redes_fechadas[0]
+    sessao, raiz = redes_fechadas  # as duas são fechadas no fim, a sessão primeiro
+    assert servicos.rede is sessao and sessao is not raiz
     assert isinstance(servicos.indices, Indices) and servicos.matriz.versao == MATRIZ.versao
     assert servicos.custodia.pasta == casos / run_id
-    assert len(redes_fechadas) == 1  # a rede é fechada no fim
 
 
 def test_coletar_fecha_a_rede_quando_o_motor_falha(casos, redes_fechadas, monkeypatch, capsys):
@@ -272,7 +272,7 @@ def test_coletar_fecha_a_rede_quando_o_motor_falha(casos, redes_fechadas, monkey
 
     monkeypatch.setattr(cli, "nos_do_nucleo", nos)
     assert cli.main(["coletar", "exemplo.com.br"]) == 1
-    assert len(redes_fechadas) == 1
+    assert len(redes_fechadas) == 2  # a sessão da execução e a rede dos índices
     assert "falha interna: RuntimeError" in capsys.readouterr().err
 
 

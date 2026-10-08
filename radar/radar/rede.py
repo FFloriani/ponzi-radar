@@ -1,4 +1,4 @@
-"""Único ponto de saída HTTP do radar: limite por host, novas tentativas, cache e proxy."""
+"""Único ponto de saída HTTP do radar: limite por host, novas tentativas, cache, sessões e proxy."""
 
 from __future__ import annotations
 
@@ -6,13 +6,21 @@ import asyncio
 import json
 import re
 import time
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Literal
 
 import httpx
 
-from radar.config import RedeConfig
+from radar.config import UA_API, RedeConfig
+
+# teto de memória do cache de cada sessão: passando dele, saem as respostas usadas há mais tempo (I4)
+TETO_DO_CACHE_BYTES = 64 * 1024 * 1024
+# o UA das APIs quando há proxy (ou Tor): o padrão diz quem é o analista
+UA_API_NEUTRO = "radar/0.1"
+# cabeçalhos que descrevem o corpo como veio na rede; o corpo lido com teto já está decodificado
+_CABECALHOS_DO_CORPO = frozenset({"content-encoding", "content-length", "transfer-encoding"})
 
 _TETO_RETRY_AFTER_S = 60.0
 _MAX_REDIRECTS = 10
@@ -115,15 +123,33 @@ def _destino_do_redirect(atual: httpx.URL, resposta: httpx.Response, url_pedida:
     return destino
 
 
+@dataclass
+class _Limitador:
+    """O limite por host, um só para a `Rede` e todas as sessões dela: a cortesia com as fontes não muda com o
+    número de execuções abertas."""
+
+    travas: dict[str, asyncio.Lock] = field(default_factory=dict)
+    ultima: dict[str, float] = field(default_factory=dict)
+
+
+def _tamanho(n: int) -> str:
+    return f"{n / 1_000_000:g} MB" if n >= 1_000_000 else f"{n} bytes"
+
+
 class Rede:
-    """Cliente HTTP assíncrono compartilhado por todos os coletores.
+    """Cliente HTTP assíncrono dos coletores.
 
     O limite é por host e conta do FIM da requisição anterior ao mesmo host. Os redirects
     são seguidos aqui, não pelo httpx (até 10 saltos): cada salto é uma requisição como
-    outra qualquer, com o limite do seu host e as suas novas tentativas. O cache é por
-    instância e só guarda respostas com status < 400. O timeout de cada requisição (e de cada
+    outra qualquer, com o limite do seu host e as suas novas tentativas. O timeout de cada requisição (e de cada
     salto) é `config.timeouts[host]` ou, sem entrada para o host, `config.timeout_s`. O proxy
     vem só de `config.proxy`: as variáveis de ambiente (HTTP_PROXY etc.) são ignoradas.
+
+    Sessões (I4): cada execução usa `sessao()`, com cache, cookies e conexões próprios; o limite por host continua
+    um só. O servidor MCP fica aberto por dias, e "analisa de novo" não pode devolver o DNS, o registro e os sócios da
+    primeira execução, nem levar os cookies de um caso para outro. O cache só guarda respostas com status < 400,
+    tem teto de memória (`TETO_DO_CACHE_BYTES`, as usadas há mais tempo saem primeiro) e não guarda o que foi pedido
+    com `usar_cache=False`.
     """
 
     def __init__(
@@ -131,6 +157,8 @@ class Rede:
         config: RedeConfig,
         dormir: Callable[[float], Awaitable[None]] = asyncio.sleep,
         relogio: Callable[[], float] = time.monotonic,
+        *,
+        _limitador: _Limitador | None = None,
     ) -> None:
         self._config = config
         self._dormir = dormir
@@ -143,9 +171,16 @@ class Rede:
             follow_redirects=False,
             trust_env=False,
         )
-        self._travas: dict[str, asyncio.Lock] = {}
-        self._ultima: dict[str, float] = {}
-        self._cache: dict[tuple, RespostaRede] = {}
+        self._limitador = _limitador if _limitador is not None else _Limitador()
+        self._cache: OrderedDict[tuple, RespostaRede] = OrderedDict()
+        self._bytes_no_cache = 0
+        # com proxy, o UA padrão das APIs (que leva o endereço do projeto) vira um neutro; um escolhido na config fica
+        self.ua_api = UA_API_NEUTRO if config.proxy and config.ua_api == UA_API else config.ua_api
+
+    def sessao(self) -> Rede:
+        """Uma sessão para uma execução: cache, cookies e conexões próprios, o mesmo limite por host. Quem a cria a
+        fecha (`fechar()`)."""
+        return type(self)(self._config, self._dormir, self._relogio, _limitador=self._limitador)
 
     async def get(
         self,
@@ -156,11 +191,16 @@ class Rede:
         headers: dict | None = None,
         seguir_redirect: bool = True,
         usar_cache: bool = True,
+        max_bytes: int | None = None,
     ) -> RespostaRede:
-        """`usar_cache=False` ignora a resposta guardada e vai à rede (a nova passa a ser a guardada).
+        """`usar_cache=False` ignora a resposta guardada, vai à rede e não guarda a nova (e tira a velha do cache).
 
         O cache em memória não expira. Quem tem validade própria, como os índices da CVM e do BCB,
         precisa disso para um processo longo não devolver o arquivo baixado horas atrás.
+
+        `max_bytes`: o corpo é lido em partes e, passando do teto (contado já descomprimido), a leitura para e a
+        requisição vira `ErroRede` permanente ("corpo acima do teto"): uma URL de corpo enorme ou infinito não enche
+        a memória.
         """
         if tipo not in ("api", "navegador"):
             raise ValueError(f"tipo de User-Agent desconhecido: {tipo!r}")
@@ -172,7 +212,7 @@ class Rede:
         url_pedida = str(alvo)
 
         cabecalhos = httpx.Headers(
-            {"User-Agent": self._config.ua_navegador if tipo == "navegador" else self._config.ua_api}
+            {"User-Agent": self._config.ua_navegador if tipo == "navegador" else self.ua_api}
         )
         cabecalhos.update(headers or {})
         chave = (
@@ -180,13 +220,18 @@ class Rede:
             tuple(sorted(httpx.QueryParams(params).multi_items())),
             seguir_redirect,
             tuple(sorted(cabecalhos.items())),
+            max_bytes,
         )
-        if usar_cache and (guardada := self._cache.get(chave)) is not None:
-            return replace(guardada, de_cache=True)
+        if not usar_cache:
+            self._descartar(chave)
+        elif (guardada := self._cache.get(chave)) is not None:
+            self._cache.move_to_end(chave)
+            # cópia dos cabeçalhos: quem lê não muda o que está guardado
+            return replace(guardada, de_cache=True, headers=dict(guardada.headers))
 
         atual = alvo
         for salto in range(_MAX_REDIRECTS + 1):
-            resposta = await self._buscar(atual, cabecalhos)
+            resposta = await self._buscar(atual, cabecalhos, max_bytes)
             if not seguir_redirect or not resposta.has_redirect_location:
                 break
             if salto == _MAX_REDIRECTS:
@@ -204,15 +249,32 @@ class Rede:
                     cabecalhos.pop(nome, None)
             atual = destino
 
-        guardada = RespostaRede(
+        nova = RespostaRede(
             status=resposta.status_code,
             url=str(resposta.url),
             conteudo=resposta.content,
             headers=dict(resposta.headers),
             de_cache=False,
         )
-        self._cache[chave] = guardada
-        return guardada
+        if usar_cache:
+            self._guardar(chave, nova)
+        return replace(nova, headers=dict(nova.headers))
+
+    def _descartar(self, chave: tuple) -> None:
+        if (velha := self._cache.pop(chave, None)) is not None:
+            self._bytes_no_cache -= len(velha.conteudo)
+
+    def _guardar(self, chave: tuple, resposta: RespostaRede) -> None:
+        """Guarda no cache, dentro do teto: saem as usadas há mais tempo; a que sozinha passa do teto não entra."""
+        self._descartar(chave)
+        tamanho = len(resposta.conteudo)
+        if tamanho > TETO_DO_CACHE_BYTES:
+            return
+        self._cache[chave] = resposta
+        self._bytes_no_cache += tamanho
+        while self._bytes_no_cache > TETO_DO_CACHE_BYTES:
+            _, velha = self._cache.popitem(last=False)
+            self._bytes_no_cache -= len(velha.conteudo)
 
     async def get_json(self, url: str, **kw: Any) -> Any:
         resposta = await self.get(url, **kw)
@@ -229,7 +291,7 @@ class Rede:
     async def fechar(self) -> None:
         await self._client.aclose()
 
-    async def _buscar(self, alvo: httpx.URL, cabecalhos: httpx.Headers) -> httpx.Response:
+    async def _buscar(self, alvo: httpx.URL, cabecalhos: httpx.Headers, max_bytes: int | None) -> httpx.Response:
         """Uma URL (sem seguir redirect), com novas tentativas. Devolve só status < 400."""
         url = str(alvo)
         host = alvo.host.lower()
@@ -237,7 +299,7 @@ class Rede:
         for n in range(1, total + 1):
             retry_after = None
             try:
-                resposta = await self._requisitar(host, alvo, cabecalhos)
+                resposta = await self._requisitar(host, alvo, cabecalhos, max_bytes)
             except (httpx.UnsupportedProtocol, httpx.InvalidURL) as exc:
                 # a URL do salto já foi validada; o InvalidURL vem do Location que o httpx
                 # tenta resolver mesmo sem seguir o redirect
@@ -279,15 +341,16 @@ class Rede:
         raise AssertionError("inalcançável: o laço sempre retorna ou levanta")  # pragma: no cover
 
     async def _requisitar(
-        self, host: str, alvo: httpx.URL, cabecalhos: httpx.Headers
+        self, host: str, alvo: httpx.URL, cabecalhos: httpx.Headers, max_bytes: int | None = None
     ) -> httpx.Response:
         """Uma requisição respeitando o limite do host. A trava cobre espera + requisição."""
-        trava = self._travas.get(host)
+        limitador = self._limitador
+        trava = limitador.travas.get(host)
         if trava is None:
-            trava = self._travas[host] = asyncio.Lock()
+            trava = limitador.travas[host] = asyncio.Lock()
         async with trava:
             limites = self._config.limites
-            ultima = self._ultima.get(host)
+            ultima = limitador.ultima.get(host)
             if ultima is not None:
                 espera = limites.get(host, limites["*"]) - (self._relogio() - ultima)
                 if espera > 0:
@@ -295,6 +358,33 @@ class Rede:
             # o timeout vale por requisição, no host de cada salto: o Wayback é bem mais lento que o resto
             timeout = self._config.timeouts.get(host, self._config.timeout_s)
             try:
-                return await self._client.get(alvo, headers=cabecalhos, timeout=timeout)
+                if max_bytes is None:
+                    return await self._client.get(alvo, headers=cabecalhos, timeout=timeout)
+                return await self._ler_com_teto(alvo, cabecalhos, timeout, max_bytes)
             finally:
-                self._ultima[host] = self._relogio()
+                limitador.ultima[host] = self._relogio()
+
+    async def _ler_com_teto(
+        self, alvo: httpx.URL, cabecalhos: httpx.Headers, timeout: float, max_bytes: int
+    ) -> httpx.Response:
+        """O GET em partes, parando ao passar de `max_bytes` (o corpo descomprimido). O erro HTTP volta sem corpo:
+        quem decide a nova tentativa é o status."""
+        async with self._client.stream("GET", alvo, headers=cabecalhos, timeout=timeout) as resposta:
+            corpo = bytearray()
+            if resposta.status_code < 400:
+                async for parte in resposta.aiter_bytes():
+                    corpo += parte
+                    if len(corpo) > max_bytes:
+                        raise ErroRede(
+                            f"GET {alvo}: corpo acima do teto de {_tamanho(max_bytes)}; a leitura foi interrompida",
+                            permanente=True,
+                            status=resposta.status_code,
+                            url=str(alvo),
+                        )
+            cabecalhos_da_resposta = [
+                (nome, valor) for nome, valor in resposta.headers.multi_items()
+                if nome.lower() not in _CABECALHOS_DO_CORPO
+            ]  # fmt: skip
+            return httpx.Response(
+                resposta.status_code, headers=cabecalhos_da_resposta, content=bytes(corpo), request=resposta.request
+            )
