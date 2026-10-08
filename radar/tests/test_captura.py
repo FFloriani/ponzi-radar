@@ -574,7 +574,7 @@ async def test_artefatos_na_custodia(servidor_local, tmp_path):
 
     assert b"Plano Ouro" in serv.custodia.ler(pagina["html"])
     texto = texto_de(serv, pagina)
-    assert "Plano Bronze" in texto and "3% ao dia" in texto and "<h2>" not in texto
+    assert "Plano Bronze" in texto and "1,5% ao dia" in texto and "<h2>" not in texto
     assert serv.custodia.ler(pagina["screenshot"]).startswith(PNG)
     entradas_har = json.loads(serv.custodia.ler(pagina["har"]))["log"]["entries"]
     assert [e["request"]["url"] for e in entradas_har] == [url]

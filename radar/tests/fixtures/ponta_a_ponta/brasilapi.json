@@ -1,0 +1,37 @@
+{
+  "cnpj": "11222333000181",
+  "razao_social": "INVESTMAX BRASIL INTERMEDIACAO DE NEGOCIOS LTDA",
+  "nome_fantasia": "INVESTMAX BRASIL",
+  "data_inicio_atividade": "2024-10-08",
+  "cnae_fiscal": 6619399,
+  "cnae_fiscal_descricao": "Outras atividades auxiliares dos serviços financeiros não especificadas anteriormente",
+  "capital_social": 10000,
+  "situacao_cadastral": 2,
+  "descricao_situacao_cadastral": "ATIVA",
+  "data_situacao_cadastral": "2024-10-08",
+  "natureza_juridica": "Sociedade Empresária Limitada",
+  "porte": "MICRO EMPRESA",
+  "identificador_matriz_filial": 1,
+  "descricao_identificador_matriz_filial": "MATRIZ",
+  "uf": "SP",
+  "municipio": "SAO PAULO",
+  "cnaes_secundarios": [],
+  "qsa": [
+    {
+      "pais": null,
+      "nome_socio": "JOAO FICTICIO DA SILVA",
+      "codigo_pais": null,
+      "faixa_etaria": "Entre 31 a 40 anos",
+      "cnpj_cpf_do_socio": "***123456**",
+      "qualificacao_socio": "Sócio-Administrador",
+      "codigo_faixa_etaria": 4,
+      "data_entrada_sociedade": "2024-10-08",
+      "identificador_de_socio": 2,
+      "cpf_representante_legal": "***000000**",
+      "nome_representante_legal": "",
+      "codigo_qualificacao_socio": 49,
+      "qualificacao_representante_legal": "Não informada",
+      "codigo_qualificacao_representante_legal": 0
+    }
+  ]
+}

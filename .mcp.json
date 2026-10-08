@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "radar": {
+      "command": "radar/.venv/Scripts/python.exe",
+      "args": ["-m", "radar.mcp_server"]
+    }
+  }
+}
