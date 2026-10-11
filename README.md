@@ -94,7 +94,7 @@ Se o endereço leva a outro domínio, o radar analisa o destino e registra o red
 
 O destino só é seguido no modo com captura, porque é a captura que vê o redirecionamento. Sem contato ou no modo retroativo, o radar não o vê e analisa o endereço dado: se ele é só um encurtador ou redirecionador, informe o domínio final.
 
-Só a captura toca o site. O `arquivar_fonte` e a validação das respostas recusam o domínio do alvo, o do destino, o de cada página que a captura visitou e o de cada salto do redirecionamento, além dos IPs do domínio analisado e do redirecionador.
+Só a captura toca o site. O `arquivar_fonte` e a validação das respostas recusam o domínio do alvo, o do destino, o da página onde a captura terminou e o de cada salto do redirecionamento, além dos IPs do domínio analisado e do redirecionador. Uma subpágina que leva a um terceiro (o Reclame Aqui, um jornal) não o torna parte do site: ele continua sendo fonte.
 
 ### Linha de comando
 

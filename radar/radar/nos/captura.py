@@ -331,17 +331,19 @@ def _destino_do_redirect(url_final: str, alvo: str) -> tuple[dict | None, dict |
 
 
 def dominios_visitados(captura: Any, alvo: str) -> set[str]:
-    """Os domínios registráveis que a captura visitou e que são o site, além do alvo: o de cada página capturada e o de
-    cada salto do redirect da página inicial (`saltos`), sempre que `_destino_do_redirect` aceitaria aquele domínio como
-    destino (não é o alvo, plataforma, estacionamento nem serviço de terceiro). É o que a validação recusa como fonte
-    junto com o alvo (F1 da revisão final): cobre o rastreador no meio da cadeia (`alvo → trk → destino`), a subpágina
-    que redirecionou para outro domínio e a execução gravada antes do nó `destino`, cuja captura já foi parar no destino
-    sem gravar a saída `destino`. A saída da captura vem do disco e do site investigado: o que não é URL fica de fora."""
+    """Os domínios registráveis que a captura visitou e que são o site, além do alvo: o da página inicial (`paginas[0]`,
+    a URL onde ela terminou) e o de cada salto do redirect dela (`saltos`), sempre que `_destino_do_redirect` aceitaria
+    aquele domínio como destino (não é o alvo, plataforma, estacionamento nem serviço de terceiro). É o que a validação
+    recusa como fonte junto com o alvo (F1 da revisão final): cobre o rastreador no meio da cadeia
+    (`alvo → trk → destino`) e a execução gravada antes do nó `destino`, cuja captura já foi parar no destino sem gravar
+    a saída `destino`. As subpáginas não contam (ruling R-A-F-n1): a `/reclamacoes` que redireciona para o Reclame Aqui
+    não faz do Reclame Aqui o site. A saída da captura vem do disco e do site investigado: o que não é URL fica de fora."""
     if not isinstance(captura, dict):
         return set()
     paginas = captura.get("paginas")
     saltos = captura.get("saltos")
-    urls = [p.get("url") for p in paginas if isinstance(p, dict)] if isinstance(paginas, list) else []
+    inicial = paginas[0] if isinstance(paginas, list) and paginas else None
+    urls = [inicial.get("url")] if isinstance(inicial, dict) else []
     urls += saltos if isinstance(saltos, list) else []
     dominios = set()
     for url in urls:

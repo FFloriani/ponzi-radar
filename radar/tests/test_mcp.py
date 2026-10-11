@@ -1176,6 +1176,7 @@ async def test_sem_o_no_destino_no_dag_a_fonte_url_nao_espera(abrir, respx_mock,
 
 MOTIVO_ALVO = "fonte recusada: o alvo só é acessado pela captura; cite o sha256 da captura ou o snapshot do Wayback"
 TRK = "trk.rastreio.net"  # um rastreador do operador no meio da cadeia de redirect
+RECLAME_AQUI = "reclameaqui.com.br"
 
 
 class CapturaComSaltos(NoBase):
@@ -1188,8 +1189,10 @@ class CapturaComSaltos(NoBase):
 
     async def executar(self, ctx, entradas, respostas, s):
         url = f"https://{DESTINO}/login"
-        return Feito({"paginas": [{"url": url}], "terceiros": [], "bloqueada": False, "falhas": [],
-                      "destino": {"url": url, "dominio": DESTINO}, "redirect_ignorado": None,
+        # a subpágina /reclamacoes do destino redirecionou para o Reclame Aqui: é um terceiro, não o site (N1)
+        reclamacoes = f"https://www.{RECLAME_AQUI}/empresa/ph-investimentos/"
+        return Feito({"paginas": [{"url": url}, {"url": reclamacoes}], "terceiros": [], "bloqueada": False,
+                      "falhas": [], "destino": {"url": url, "dominio": DESTINO}, "redirect_ignorado": None,
                       "saltos": [f"https://{ALVO}/", f"https://{TRK}/c?id=1"]})  # fmt: skip
 
 
@@ -1205,6 +1208,24 @@ async def test_redirect_em_varios_saltos_recusa_os_tres_dominios(abrir, monkeypa
         assert r["motivo"].startswith("fonte recusada: o alvo só é acessado pela captura"), (url, r)
     # o domínio do rastreador (registrável) e o do destino; o do alvo a validação já tem pelo contexto
     assert chamadas[0]["dominio_destino"] == {DESTINO, "rastreio.net"}
+
+
+async def test_subpagina_que_redirecionou_para_um_terceiro_nao_o_torna_fonte_recusada(
+    abrir, tmp_path, monkeypatch, respx_mock, dns_publico
+):
+    # N1 da re-revisão final (ruling R-A-F-n1): a reclamação no Reclame Aqui, para onde uma subpágina do site
+    # redirecionou, continua sendo fonte; só a página inicial e a cadeia de redirect dela contam como o site
+    chamadas = espiar_validar(monkeypatch)
+    srv = await abrir([AlvoNo(), Coleta(), CapturaComSaltos(), DestinoNo(), Pend("pend_a1", "P-A1")])
+    run_id = await iniciar(srv)
+    url = f"https://www.{RECLAME_AQUI}/ph-investimentos/nao-consigo-sacar/"
+    pagina = "<html><body>A ph paga 5% ao mês garantido, mas não consigo sacar há dois meses</body></html>"
+    rota = respx_mock.get(url).mock(return_value=httpx.Response(200, html=pagina))
+    assert "ref" in await chamar(srv, "arquivar_fonte", run_id=run_id, url=url)
+    r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-A1", resposta=resposta_a1(url))
+    assert r["aceita"] is True, r
+    assert rota.call_count == 2  # o arquivamento e a conferência do trecho
+    assert RECLAME_AQUI not in chamadas[0]["dominio_destino"]
 
 
 async def test_execucao_de_antes_da_t1_recusa_o_site_que_a_captura_visitou(abrir, tmp_path, respx_mock, dns_publico):

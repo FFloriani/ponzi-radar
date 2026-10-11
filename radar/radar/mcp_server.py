@@ -633,9 +633,10 @@ class _Radar:
     @staticmethod
     def _dominios_destino(ex: _Execucao) -> set[str]:
         """Os domínios do site que a validação recusa como fonte, além do alvo: o do nó `destino` (depois de um redirect,
-        o do destino) e os que a captura visitou (`captura.dominios_visitados`: as páginas e os saltos do redirect da
-        página inicial, fora plataforma, estacionamento e serviço de terceiro). Na execução gravada antes do nó
-        `destino`, são as páginas da captura antiga que dizem para onde o alvo foi (F1 da revisão final)."""
+        o do destino) e os que a captura visitou (`captura.dominios_visitados`: a página inicial e os saltos do
+        redirect dela, fora plataforma, estacionamento e serviço de terceiro; as subpáginas não contam). Na execução
+        gravada antes do nó `destino`, é a página inicial da captura antiga que diz para onde o alvo foi (F1 da revisão
+        final)."""
         dominios = dominios_visitados(ex.motor.saidas("captura"), ex.motor.ctx.alvo)
         dominio = (ex.motor.saidas("destino") or {}).get("dominio")
         if isinstance(dominio, str) and dominio:

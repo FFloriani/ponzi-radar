@@ -1303,19 +1303,34 @@ async def test_redirect_no_mesmo_host_tambem_e_salto(servidor_local, tmp_path):
     assert r.saidas["saltos"] == [servidor_local + "/inicio"]
 
 
-def test_dominios_visitados_pelas_paginas_e_pelos_saltos():
+def test_dominios_visitados_pela_pagina_inicial_e_pelos_saltos():
     captura = {
         "paginas": [
-            {"url": "https://phinvestimentos.com/login"},
+            {"url": "https://phinvestimentos.com/login"},  # a página inicial, onde ela terminou
             {"url": "https://www.phinvestimentos.com/planos"},
-            {"url": "https://t.me/golpe"},  # plataforma: não é o site
-            {"url": "https://subpagina-que-redirecionou.com.br/x"},
+            {"url": "https://www.reclameaqui.com.br/empresa/ph/"},  # uma subpágina que redirecionou para fora
         ],
         "saltos": ["https://phinv.link/", "https://trk.example.net/c?id=1", "https://sedoparking.com/x"],
     }
-    assert dominios_visitados(captura, "phinv.link") == {
-        "phinvestimentos.com", "subpagina-que-redirecionou.com.br", "example.net"
-    }  # fmt: skip
+    assert dominios_visitados(captura, "phinv.link") == {"phinvestimentos.com", "example.net"}
+
+
+def test_subpagina_que_redireciona_para_um_terceiro_nao_o_torna_o_site():
+    # N1 da re-revisão final (ruling R-A-F-n1): `/reclamacoes` que vai para o Reclame Aqui não faz o Reclame Aqui ser
+    # recusado como fonte; só a página inicial e a cadeia de redirect dela dizem onde o site está
+    captura = {
+        "paginas": [
+            {"url": "https://exemplo.com.br/"},
+            {"url": "https://www.reclameaqui.com.br/empresa/exemplo/"},
+            {"url": "https://g1.globo.com/economia/noticia/golpe.ghtml"},
+            {"url": "https://medium.com/@exemplo/blog"},
+        ],
+        "saltos": [],
+    }
+    assert dominios_visitados(captura, "exemplo.com.br") == set()
+    # a página inicial que terminou fora do alvo continua contando, como na execução gravada antes do nó `destino`
+    inicial_fora = {**captura, "paginas": [{"url": "https://phinvestimentos.com/login"}, *captura["paginas"][1:]]}
+    assert dominios_visitados(inicial_fora, "exemplo.com.br") == {"phinvestimentos.com"}
 
 
 @pytest.mark.parametrize(
