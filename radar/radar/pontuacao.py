@@ -4,6 +4,8 @@
 - `itens_da_execucao` transforma as saídas dos coletores e as respostas às pendências nos 15 itens A1–D4;
 - `pontuar_eixo1` faz o intervalo, a classe e as regras de corte, interpretadas pelo tipo (sem `eval`);
 - `sinais_da_execucao` e `pontuar_eixo2` fazem o estágio E0–E7, a janela e os modificadores.
+- `dominio_reaproveitado` diz se o domínio expirou e foi registrado de novo (histórico de CT ou Wayback bem anterior ao
+  registro): só informa, entra na nota do D3 e no aviso do dossiê, e não muda nenhum ponto.
 
 A R3 é uma regra do eixo 1 que depende de um sinal da P-E (`prova_aportes_novos`): quem monta o dossiê passa a
 `pontuar_eixo1` os sinais devolvidos por `sinais_da_execucao`.
@@ -47,6 +49,7 @@ TIPO_E0 = "registro_recente"
 TIPO_FORA_DO_AR = "site_fora_do_ar"
 _ESTAGIO_E0 = "E0"
 _DIAS_E0 = 90
+_DIAS_REAPROVEITADO = 30  # o histórico do domínio tem de ser mais de 30 dias anterior ao registro
 _FONTE_COLETOR = "coletor"
 # Os motivos de erro da captura (radar/nos/captura.py grava, o E6 lê; I2 da revisão final):
 # - "captura falhou: HTTP <código>": a página inicial respondeu com erro;
@@ -584,9 +587,36 @@ def _item_c4(ex: ExecucaoSalva, matriz: Matriz) -> Item:
     return _item_da_pendencia(ex, "C4", matriz)
 
 
+def dominio_reaproveitado(ex: ExecucaoSalva) -> dict[str, str] | None:
+    """Domínio expirado e registrado de novo: o histórico mais antigo do `ct` (`primeiro_certificado`) ou do
+    `wayback_indice` (`primeiro`) é mais de 30 dias anterior ao `registro` do `rdap`. O histórico pode ser de outro
+    dono. Devolve `{"registro", "historico_desde", "fonte_historico"}` (datas ISO; a fonte é `crt.sh` ou `Wayback`,
+    `crt.sh` no empate) ou `None`.
+
+    Os três nós analisam o mesmo domínio, o do `destino`, e só se comparam datas da mesma execução. Fica quieta (`None`)
+    sem RDAP legível no `as_of`, e sem CT nem Wayback com data: nada se acusa com o que não se sabe. Só informa: não
+    mexe em pontos nem em estado de item."""
+    as_of = ex.ctx.as_of
+    rdap = _feito(ex, "rdap")
+    if rdap is None or (registro := _data_no_as_of(rdap, "registro", as_of)) is None:
+        return None
+    historicos = []
+    for no, campo, fonte in (("ct", "primeiro_certificado", "crt.sh"), ("wayback_indice", "primeiro", "Wayback")):
+        saida = _feito(ex, no)
+        if saida is not None and (data := _data_no_as_of(saida, campo, as_of)) is not None:
+            historicos.append((data, fonte))
+    if not historicos:
+        return None
+    desde, fonte = min(historicos, key=operator.itemgetter(0))  # o min é estável: no empate vale o primeiro (crt.sh)
+    if (registro - desde).days <= _DIAS_REAPROVEITADO:
+        return None
+    return {"registro": registro.isoformat(), "historico_desde": desde.isoformat(), "fonte_historico": fonte}
+
+
 def _item_d3(ex: ExecucaoSalva, matriz: Matriz) -> Item:
     """Domínio registrado ou CNPJ aberto menos de `meses_limite` meses antes do `as_of`. Sem empresa identificada, só
-    o domínio conta; uma data que não se sabe impede o `nao_se_aplica`."""
+    o domínio conta; uma data que não se sabe impede o `nao_se_aplica`. Com o domínio reaproveitado, a nota avisa; os
+    pontos e o estado são os mesmos."""
     info = matriz.itens["D3"]
     as_of = ex.ctx.as_of
     conhecidas: list[tuple[str, date]] = []
@@ -602,7 +632,15 @@ def _item_d3(ex: ExecucaoSalva, matriz: Matriz) -> Item:
         else:
             conhecidas.append((rotulo, data))
 
+    aviso = ""
+    if (reaproveitado := dominio_reaproveitado(ex)) is not None:
+        aviso = (
+            f"domínio registrado de novo em {reaproveitado['registro']}; há histórico desde "
+            f"{reaproveitado['historico_desde']} ({reaproveitado['fonte_historico']}), que pode ser de outro dono"
+        )
+
     def item(estado: EstadoItem, nota: str, pontos: int = 0, origem: str = "coletor") -> Item:
+        nota = f"{nota}; {aviso}" if aviso else nota
         return Item(id="D3", estado=estado, pontos=pontos, maximo=info.max, origem=origem, nota=nota)
 
     if novas := [(r, d) for r, d in conhecidas if as_of < _somar_meses(d, info.meses_limite)]:

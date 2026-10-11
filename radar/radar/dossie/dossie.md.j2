@@ -161,6 +161,9 @@ Dados da empresa indisponíveis: {{ emp.motivo|md }}.
 - **Primeiro certificado:** {{ (infra.ct.get("primeiro_certificado") or "—")|md }}
 - **Certificados até o as_of:** {{ infra.ct.get("total", 0)|md }}
 - **Nomes nos certificados:** {{ infra.sans|join(", ")|md or "—" }}{{ (" (+" ~ infra.sans_a_mais ~ " outros)") if infra.sans_a_mais else "" }}
+{% if infra.reaproveitado %}
+- Atenção: antes de {{ infra.reaproveitado.registro }}, o domínio tinha outro registro (possível outro dono).
+{% endif %}
 {% else %}
 - {{ infra.ct_falta|md }}
 {% endif %}
@@ -172,6 +175,9 @@ Dados da empresa indisponíveis: {{ emp.motivo|md }}.
 - **Último snapshot:** {{ (infra.wayback.get("ultimo") or "—")|md }}
 - **Capturas HTML:** {{ infra.wayback.get("total", 0)|md }}{{ " (listagem truncada)" if infra.wayback.get("truncado") else "" }}
 - **Meses com captura:** {{ infra.meses.quantidade }}{{ (" (de " ~ (infra.meses.primeiro|md) ~ " a " ~ (infra.meses.ultimo|md) ~ ")") if infra.meses.quantidade else "" }}
+{% if infra.reaproveitado %}
+- Atenção: antes de {{ infra.reaproveitado.registro }}, o domínio tinha outro registro (possível outro dono).
+{% endif %}
 {% else %}
 - {{ infra.wayback_falta|md }}
 {% endif %}

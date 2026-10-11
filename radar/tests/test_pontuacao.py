@@ -19,6 +19,7 @@ from radar.pontuacao import (
     Eixo2,
     ModificadorAplicado,
     carregar_matriz,
+    dominio_reaproveitado,
     itens_da_execucao,
     pontos_a1,
     pontuar_eixo1,
@@ -687,6 +688,185 @@ def test_d3_nos_em_erro(matriz):
 def test_d3_sem_cnpj_vale_o_dominio(matriz):
     ex = execucao({"cnpj": {"cnpj": None, "motivo": "não encontrado"}}, julgamentos=[julgamento("P-CNPJ", "nao_encontrado")])
     assert item(ex, "D3").estado == "nao_se_aplica"
+
+
+# ---------------------------------------------------------------------------- domínio reaproveitado (D3)
+
+
+def com_historico(registro: str | None = "2026-09-29", ct: str | None = "2020-11-11",
+                  wayback: str | None = "2014-09-27", **kw) -> ExecucaoSalva:  # fmt: skip
+    """O caso do aceite (phinvestimentos.com): registro RDAP de 2026-09-29, primeiro certificado de 2020-11-11 e
+    primeiro snapshot do Wayback de 2014-09-27."""
+    return execucao(
+        {
+            "rdap": {**base()["rdap"], "registro": registro},
+            "ct": {"primeiro_certificado": ct, "total": 0 if ct is None else 3, "sans": []},
+            "wayback_indice": {
+                "primeiro": wayback, "ultimo": "2026-09-30" if wayback else None,
+                "total": 0 if wayback is None else 9, "por_mes": {}, "truncado": False,
+            },
+        },
+        **kw,
+    )  # fmt: skip
+
+
+NOTA_REAPROVEITADO = (
+    "domínio registrado de novo em 2026-09-29; há histórico desde 2014-09-27 (Wayback), que pode ser de outro dono"
+)
+
+
+def test_dominio_reaproveitado_o_caso_do_aceite():
+    assert dominio_reaproveitado(com_historico()) == {
+        "registro": "2026-09-29", "historico_desde": "2014-09-27", "fonte_historico": "Wayback",
+    }  # fmt: skip
+
+
+def test_dominio_reaproveitado_vale_o_historico_mais_antigo():
+    # só o certificado é anterior: a fonte é o crt.sh
+    so_ct = dominio_reaproveitado(com_historico(wayback="2026-10-01"))
+    assert so_ct == {"registro": "2026-09-29", "historico_desde": "2020-11-11", "fonte_historico": "crt.sh"}
+    # os dois anteriores: o mais antigo
+    assert dominio_reaproveitado(com_historico(ct="2013-01-05"))["fonte_historico"] == "crt.sh"
+    assert dominio_reaproveitado(com_historico(ct="2013-01-05"))["historico_desde"] == "2013-01-05"
+    assert dominio_reaproveitado(com_historico(ct="2016-01-05"))["fonte_historico"] == "Wayback"
+    # empate: o certificado
+    assert dominio_reaproveitado(com_historico(ct="2014-09-27"))["fonte_historico"] == "crt.sh"
+    # só o Wayback tem dado
+    assert dominio_reaproveitado(com_historico(ct=None))["fonte_historico"] == "Wayback"
+
+
+@pytest.mark.parametrize(
+    "dias,sinaliza",
+    [(10, False), (29, False), (30, False), (31, True), (400, True), (0, False), (-5, False)],
+)
+def test_dominio_reaproveitado_so_com_mais_de_30_dias_de_folga(dias, sinaliza):
+    historico = (date(2026, 9, 29) - timedelta(days=dias)).isoformat()
+    resultado = dominio_reaproveitado(com_historico(ct=historico, wayback=historico))
+    assert (resultado is not None) is sinaliza
+
+
+def test_dominio_reaproveitado_historico_depois_do_registro_nao_acusa():
+    assert dominio_reaproveitado(com_historico(registro="2015-03-02", ct="2019-05-20", wayback="2016-01-12")) is None
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        {"rdap": "erro"},
+        {"rdap": ("bloqueado", "dependência com erro: destino")},
+        {"rdap": ("pulado", "só atual")},
+        {"rdap": "pendente"},
+    ],
+)
+def test_dominio_reaproveitado_sem_rdap_fica_quieto(status):
+    ex = execucao(
+        {
+            "ct": {"primeiro_certificado": "2020-11-11", "total": 3, "sans": []},
+            "wayback_indice": {"primeiro": "2014-09-27", "ultimo": "2026-09-30", "total": 9, "por_mes": {}, "truncado": False},
+        },
+        status,
+    )  # fmt: skip
+    assert dominio_reaproveitado(ex) is None
+
+
+@pytest.mark.parametrize("registro", [None, "", "sem data", 20260929, "2026-13-45"])
+def test_dominio_reaproveitado_registro_ilegivel_fica_quieto(registro):
+    assert dominio_reaproveitado(com_historico(registro=registro)) is None
+
+
+def test_dominio_reaproveitado_sem_ct_nem_wayback_fica_quieto():
+    assert dominio_reaproveitado(com_historico(ct=None, wayback=None)) is None
+    # nós em erro, pulados ou sem execução (execução de antes de existirem)
+    sem_nos = execucao({"rdap": {**base()["rdap"], "registro": "2026-09-29"}})  # a base não tem ct nem wayback_indice
+    assert dominio_reaproveitado(sem_nos) is None
+    em_erro = com_historico(status={"ct": "erro", "wayback_indice": ("bloqueado", "dependência com erro: destino")})
+    assert dominio_reaproveitado(em_erro) is None
+    # um dos dois falhou: vale o que o outro mostra
+    so_wayback = com_historico(status={"ct": "erro"})
+    assert dominio_reaproveitado(so_wayback)["fonte_historico"] == "Wayback"
+
+
+@pytest.mark.parametrize("lixo", [123, ["2014-09-27"], {"a": 1}, "ontem", "2014-99-99", ""])
+def test_dominio_reaproveitado_data_de_historico_ilegivel_nao_acusa(lixo):
+    assert dominio_reaproveitado(com_historico(ct=lixo, wayback=lixo)) is None
+
+
+def test_dominio_reaproveitado_saida_que_nao_e_objeto_nao_quebra():
+    ex = com_historico()
+    ex.saidas["ct"] = ["2020-11-11"]
+    ex.saidas["wayback_indice"] = "2014-09-27"
+    assert dominio_reaproveitado(ex) is None
+
+
+def test_dominio_reaproveitado_so_conta_o_que_vale_no_as_of():
+    # modo retroativo: o registro de hoje (2026) é posterior ao as_of, não diz nada do que havia em 2019
+    assert dominio_reaproveitado(com_historico(as_of=RETRO)) is None
+    # o registro de 2015 vale em 2019; o histórico de 2010 é anterior a ele
+    ex = com_historico(registro="2015-03-02", ct="2010-06-01", wayback="2012-01-01", as_of=RETRO)
+    assert dominio_reaproveitado(ex) == {
+        "registro": "2015-03-02", "historico_desde": "2010-06-01", "fonte_historico": "crt.sh",
+    }  # fmt: skip
+    # campo marcado em vazamento_temporal é o de hoje, não o do as_of
+    vazado = com_historico(registro="2015-03-02", ct="2010-06-01", wayback="2012-01-01", as_of=RETRO)
+    vazado.saidas["rdap"]["vazamento_temporal"] = ["registro"]
+    assert dominio_reaproveitado(vazado) is None
+
+
+def test_dominio_reaproveitado_devolve_sempre_o_mesmo_e_nao_mexe_na_execucao():
+    ex = com_historico()
+    antes = {no: dict(s) for no, s in ex.saidas.items() if isinstance(s, dict)}
+    assert dominio_reaproveitado(ex) == dominio_reaproveitado(ex)
+    assert {no: dict(s) for no, s in ex.saidas.items() if isinstance(s, dict)} == antes
+
+
+def test_d3_ganha_a_nota_do_dominio_reaproveitado_sem_mudar_pontos_nem_estado(matriz):
+    ex = com_historico()
+    d3 = item(ex, "D3")
+    # registro de 8 dias antes do as_of: o D3 continua confirmado com 1 ponto
+    assert (d3.estado, d3.pontos, d3.origem) == ("confirmado", 1, "coletor")
+    assert d3.nota == f"domínio registrado em 2026-09-29; {NOTA_REAPROVEITADO}"
+    # o resto da execução pontua igual com ou sem o histórico: só a nota muda
+    controle = com_historico(ct="2026-10-01", wayback="2026-10-01")
+    assert dominio_reaproveitado(controle) is None
+    com, sem = itens_da_execucao(ex, matriz), itens_da_execucao(controle, matriz)
+    assert {i: (x.estado, x.pontos, x.origem) for i, x in com.items()} == {
+        i: (x.estado, x.pontos, x.origem) for i, x in sem.items()
+    }
+    assert {i for i in com if com[i].nota != sem[i].nota} == {"D3"}
+    assert sem["D3"].nota == "domínio registrado em 2026-09-29"
+
+
+@pytest.mark.parametrize(
+    "extra,estado",
+    [
+        ({"cnpj": {**base()["cnpj"], "abertura": "2014-01-10"}}, "nao_se_aplica"),
+        ({"cnpj": {**base()["cnpj"], "abertura": None}}, "nao_verificado"),
+    ],
+)
+def test_d3_nota_do_reaproveitado_tambem_nos_outros_estados(extra, estado, matriz):
+    # domínio de 2015 com histórico desde 2010: não é recente (nao_se_aplica) ou o CNPJ é desconhecido
+    rdap = {**base()["rdap"], "registro": "2015-03-02"}
+    ex = execucao(
+        {
+            **extra, "rdap": rdap,
+            "ct": {"primeiro_certificado": "2012-06-01", "total": 2, "sans": []},
+            "wayback_indice": {"primeiro": "2010-02-03", "ultimo": "2026-09-30", "total": 9, "por_mes": {}, "truncado": False},
+        }
+    )  # fmt: skip
+    d3 = item(ex, "D3")
+    assert (d3.estado, d3.pontos) == (estado, 0)
+    assert d3.nota.endswith(
+        "domínio registrado de novo em 2015-03-02; há histórico desde 2010-02-03 (Wayback), que pode ser de outro dono"
+    )
+    assert d3.nota.count("domínio registrado de novo") == 1
+
+
+def test_d3_sem_dominio_reaproveitado_nao_muda_a_nota(matriz):
+    nota = item(execucao(), "D3").nota
+    assert nota == "domínio registrado em 2015-03-02; CNPJ aberto em 2014-01-10: 12 meses ou mais"
+    # RDAP em erro: o D3 não sabe da data e a nota não cita reaproveitamento
+    ex = com_historico(status={"rdap": "erro"})
+    assert "de novo" not in item(ex, "D3").nota
 
 
 # ---------------------------------------------------------------------------- C4

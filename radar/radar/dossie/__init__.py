@@ -42,7 +42,7 @@ from radar.diff import (
 from radar.execucao import ExecucaoSalva, carregar_execucao
 from radar.modelos import Evidencia, Item, Sinal
 from radar.pendencias.esquemas import ValorD1
-from radar.pontuacao import PREFIXO_CAPTURA_INDISPONIVEL, Matriz
+from radar.pontuacao import PREFIXO_CAPTURA_INDISPONIVEL, Matriz, dominio_reaproveitado
 from radar.texto import codigo_md, escapar_md
 
 __all__ = ["PendenciasAbertas", "gerar_dossie"]
@@ -53,6 +53,7 @@ _DIRECAO = {
     "alonga": "alonga a janela",
     "corte_sem_aviso": "corte possível sem aviso",
 }
+SUFIXO_REGISTRO_ANTERIOR = " (registro anterior do domínio)"
 _ORIGENS_COM_JULGAMENTO = frozenset({"regex_confirmada", "claude"})  # as marcas são do julgamento do Claude
 # os itens que o coletor pontua, e os nós de onde vem a conta de cada um (coluna Fonte da tabela)
 _NOS_DO_COLETOR = {"C1": "registros", "C3": "cnpj", "C4": "cvm_alertas", "D3": "rdap, cnpj"}
@@ -331,18 +332,36 @@ def _evento(data: str | None, evento: str, fonte: str, url: str = "") -> dict:
 
 def _linha_do_tempo(ex: ExecucaoSalva, sinais: list[Sinal], alertas: list[Alerta], custodia: _Custodia) -> list[dict]:
     """Registro do domínio, abertura do CNPJ, primeiro certificado, primeiro e último snapshot, alertas e sinais,
-    por data (o que não tem data vai para o fim)."""
+    por data (o que não tem data vai para o fim).
+
+    Com o domínio reaproveitado, os eventos de histórico do domínio (certificado e snapshots) anteriores ao registro
+    levam o sufixo `SUFIXO_REGISTRO_ANTERIOR` e entra o evento do registro de novo."""
+    reaproveitado = dominio_reaproveitado(ex)
+    registro = reaproveitado["registro"] if reaproveitado is not None else None
+
+    def historico(data: str, rotulo: str, fonte: str) -> dict:
+        anterior = registro is not None and data < registro  # as duas são AAAA-MM-DD: a ordem do texto é a da data
+        return _evento(data, rotulo + SUFIXO_REGISTRO_ANTERIOR if anterior else rotulo, fonte)
+
     eventos = []
     if (rdap := saida(ex, "rdap")) and data_iso(rdap.get("registro")):
         eventos.append(_evento(rdap["registro"][:10], "Domínio registrado", "RDAP"))
+    if reaproveitado is not None:
+        eventos.append(
+            _evento(
+                reaproveitado["registro"],
+                "Domínio registrado de novo; o histórico anterior pode ser de outro dono",
+                f"RDAP e {reaproveitado['fonte_historico']}",
+            )
+        )
     if (cnpj := saida(ex, "cnpj")) and cnpj.get("cnpj") and data_iso(cnpj.get("abertura")):
         eventos.append(_evento(cnpj["abertura"][:10], "CNPJ aberto", f"Receita Federal ({cnpj.get('fonte') or '?'})"))
     if (ct := saida(ex, "ct")) and data_iso(ct.get("primeiro_certificado")):
-        eventos.append(_evento(ct["primeiro_certificado"][:10], "Primeiro certificado TLS", "crt.sh"))
+        eventos.append(historico(ct["primeiro_certificado"][:10], "Primeiro certificado TLS", "crt.sh"))
     if (wayback := saida(ex, "wayback_indice")) is not None:
         for chave, rotulo in (("primeiro", "Primeiro snapshot no Wayback"), ("ultimo", "Último snapshot no Wayback")):
             if data_iso(wayback.get(chave)):
-                eventos.append(_evento(wayback[chave][:10], rotulo, "Wayback CDX"))
+                eventos.append(historico(wayback[chave][:10], rotulo, "Wayback CDX"))
     for alerta in alertas:
         eventos.append(_evento(alerta.data, alerta.rotulo, "alerta oficial", alerta.fonte or ""))
     for sinal in sinais:
@@ -508,6 +527,7 @@ def _infraestrutura(ex: ExecucaoSalva) -> dict:
         "sans_a_mais": max(0, len(sans) - _MAX_SANS),
         "wayback": wayback,
         "wayback_falta": _nao_disponivel(ex, "wayback_indice") if wayback is None else "",
+        "reaproveitado": dominio_reaproveitado(ex),
         "meses": _resumo_dos_meses(meses),
         "captura": captura,
         "captura_falta": _nao_disponivel(ex, "captura") if captura is None else "",

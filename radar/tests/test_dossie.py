@@ -586,6 +586,149 @@ def test_dossie_lista_longa_de_sans_e_cortada(tmp_path):
     assert "sub000.exemplo.com.br" in s6 and "sub059.exemplo.com.br" not in s6 and "+40" in s6
 
 
+# ---------------------------------------------------------------------------- domínio reaproveitado
+
+
+def _reaproveitado(**trocas) -> dict:
+    """As saídas do caso do aceite (phinvestimentos.com): registro RDAP de 2026-09-29, primeiro certificado de
+    2020-11-11 e primeiro snapshot do Wayback de 2014-09-27."""
+    return {
+        "rdap": {**saidas_base()["rdap"], "registro": "2026-09-29"},
+        "ct": {"primeiro_certificado": "2020-11-11", "total": 3, "sans": ["phinvestimentos.com"]},
+        "wayback_indice": {
+            "primeiro": "2014-09-27", "ultimo": "2026-09-30", "total": 9,
+            "por_mes": {"2014-09": 1, "2026-09": 2}, "truncado": False,
+        },
+        **trocas,
+    }  # fmt: skip
+
+
+AVISO_REAPROVEITADO = "Atenção: antes de 2026-09-29, o domínio tinha outro registro (possível outro dono)."
+SUFIXO_REAPROVEITADO = "(registro anterior do domínio)"
+SEM_AVISO = ["registro anterior do domínio", "registrado de novo", "Atenção: antes de", "possível outro dono"]
+
+
+def _subsecao(s6: str, titulo: str, proximo: str) -> str:
+    return s6.split(f"### {titulo}")[1].split(f"### {proximo}")[0]
+
+
+def test_dossie_dominio_reaproveitado_marca_a_linha_do_tempo(tmp_path):
+    s4 = secao(dossie(gravar(tmp_path, saidas=_reaproveitado())), 4)
+    linhas = s4.splitlines()
+    # os eventos de antes do registro levam o sufixo
+    assert f"| 2014-09-27 | Primeiro snapshot no Wayback {SUFIXO_REAPROVEITADO} | Wayback CDX |" in linhas
+    assert f"| 2020-11-11 | Primeiro certificado TLS {SUFIXO_REAPROVEITADO} | crt.sh |" in linhas
+    # os de depois, e o que não é histórico do domínio (CNPJ aberto em 2014), não
+    assert "| 2026-09-30 | Último snapshot no Wayback | Wayback CDX |" in linhas
+    assert "| 2014-01-10 | CNPJ aberto | Receita Federal (brasilapi) |" in linhas
+    # o registro de novo entra ao lado do registro, na data dele
+    registro = "| 2026-09-29 | Domínio registrado | RDAP |"
+    de_novo = "| 2026-09-29 | Domínio registrado de novo; o histórico anterior pode ser de outro dono | RDAP e Wayback |"
+    assert registro in linhas and de_novo in linhas
+    assert linhas.index(registro) < linhas.index(de_novo)
+    datas = ["2014-01-10", "2014-09-27", "2020-11-11", "2026-09-29", "2026-09-30"]
+    posicoes = [s4.index(f"| {d} |") for d in datas]
+    assert posicoes == sorted(posicoes)
+
+
+def test_dossie_dominio_reaproveitado_ultimo_snapshot_de_antes_do_registro_leva_o_sufixo(tmp_path):
+    wayback = {**_reaproveitado()["wayback_indice"], "ultimo": "2018-05-01"}
+    s4 = secao(dossie(gravar(tmp_path, saidas=_reaproveitado(wayback_indice=wayback))), 4)
+    assert f"| 2018-05-01 | Último snapshot no Wayback {SUFIXO_REAPROVEITADO} | Wayback CDX |" in s4.splitlines()
+
+
+def test_dossie_dominio_reaproveitado_avisa_nos_certificados_e_no_wayback(tmp_path):
+    s6 = secao(dossie(gravar(tmp_path, saidas=_reaproveitado())), 6)
+    certificados = _subsecao(s6, "Certificados (crt.sh)", "Wayback")
+    wayback = _subsecao(s6, "Wayback", "Captura do site")
+    assert AVISO_REAPROVEITADO in certificados and AVISO_REAPROVEITADO in wayback
+    assert s6.count(AVISO_REAPROVEITADO) == 2  # o RDAP, o DNS e a captura não levam o aviso
+    # os fatos continuam como o coletor os deu
+    assert "**Primeiro certificado:** 2020-11-11" in certificados and "**Primeiro snapshot:** 2014-09-27" in wayback
+
+
+def test_dossie_dominio_reaproveitado_a_nota_do_d3_e_os_pontos_nao_mudam(tmp_path):
+    texto = dossie(gravar(tmp_path / "a", saidas=_reaproveitado()))
+    d3 = next(linha for linha in secao(texto, 3).splitlines() if linha.startswith("| D3"))
+    assert (
+        "domínio registrado de novo em 2026-09-29; há histórico desde 2014-09-27 (Wayback), "
+        "que pode ser de outro dono"
+    ) in d3
+    assert "confirmado" in d3 and "1/1" in d3
+    # o mesmo caso sem histórico anterior: a única diferença do veredito e da tabela é a nota do D3
+    depois = {"primeiro_certificado": "2026-10-01", "total": 1, "sans": []}
+    wayback = {**_reaproveitado()["wayback_indice"], "primeiro": "2026-10-01"}
+    controle = dossie(gravar(tmp_path / "b", saidas=_reaproveitado(ct=depois, wayback_indice=wayback)))
+    assert all(frase not in controle for frase in SEM_AVISO)
+    assert secao(texto, 2) == secao(controle, 2)
+
+    def sem_d3(t: str) -> list[str]:
+        return [linha for linha in secao(t, 3).splitlines() if not linha.startswith("| D3")]
+
+    assert sem_d3(texto) == sem_d3(controle)
+
+
+def test_dossie_sem_dominio_reaproveitado_nao_avisa(tmp_path):
+    # a execução padrão: domínio de 2015, certificado de 2019 e snapshot de 2016, tudo depois do registro
+    texto = dossie(gravar(tmp_path))
+    for frase in SEM_AVISO:
+        assert frase not in texto, frase
+
+
+@pytest.mark.parametrize(
+    "saidas,status",
+    [
+        ({"ct": {"primeiro_certificado": "2026-09-19", "total": 1, "sans": []},
+          "wayback_indice": {**_reaproveitado()["wayback_indice"], "primeiro": "2026-09-19"}}, {}),  # 10 dias antes
+        ({"ct": {"primeiro_certificado": "2026-08-30", "total": 1, "sans": []},
+          "wayback_indice": {**_reaproveitado()["wayback_indice"], "primeiro": "2026-08-30"}}, {}),  # 30 dias antes
+        ({"ct": {"primeiro_certificado": None, "total": 0, "sans": []},
+          "wayback_indice": {**_reaproveitado()["wayback_indice"], "primeiro": None, "ultimo": None, "total": 0}}, {}),
+        ({}, {"rdap": ("erro", "RDAP: HTTP 503")}),
+        ({}, {"ct": "erro", "wayback_indice": ("bloqueado", "dependência com erro: destino")}),
+    ],
+    ids=["dez_dias", "trinta_dias", "ct_e_wayback_vazios", "rdap_em_erro", "ct_e_wayback_em_erro"],
+)  # fmt: skip
+def test_dossie_dominio_reaproveitado_fica_quieto_sem_motivo(tmp_path, saidas, status):
+    texto = dossie(gravar(tmp_path, saidas={**_reaproveitado(), **saidas}, status=status))
+    for frase in SEM_AVISO:
+        assert frase not in texto, frase
+
+
+def test_dossie_dominio_reaproveitado_so_pelo_certificado(tmp_path):
+    pasta = gravar(tmp_path, saidas=_reaproveitado(), status={"wayback_indice": ("erro", "CDX: HTTP 503")})
+    texto = dossie(pasta)
+    s6 = secao(texto, 6)
+    assert AVISO_REAPROVEITADO in _subsecao(s6, "Certificados (crt.sh)", "Wayback")
+    assert AVISO_REAPROVEITADO not in _subsecao(s6, "Wayback", "Captura do site")  # o nó falhou: só a razão da falha
+    assert "CDX: HTTP 503" in _subsecao(s6, "Wayback", "Captura do site")
+    assert "há histórico desde 2020-11-11 (crt.sh)" in texto
+
+
+def test_dossie_dominio_reaproveitado_no_modo_retroativo_so_vale_com_o_registro_no_as_of(tmp_path):
+    pulados = {"dns": ("pulado", "só atual"), "captura": ("pulado", "só atual")}
+    # o registro de hoje (2026) é posterior ao as_of (2019): não diz nada do que havia em 2019
+    texto = dossie(gravar(tmp_path / "a", as_of=date(2019, 7, 1), saidas=_reaproveitado(), status=pulados))
+    assert all(frase not in texto for frase in SEM_AVISO)
+    # o registro de 2015 vale em 2019 e o certificado de 2010 é anterior a ele
+    rdap = {**saidas_base()["rdap"], "registro": "2015-03-02"}
+    ct = {"primeiro_certificado": "2010-06-01", "total": 1, "sans": []}
+    pasta = gravar(tmp_path / "b", as_of=date(2019, 7, 1), saidas={"rdap": rdap, "ct": ct}, status=pulados)
+    assert "Atenção: antes de 2015-03-02, o domínio tinha outro registro (possível outro dono)." in dossie(pasta)
+
+
+def test_dossie_dominio_reaproveitado_com_data_hostil_nao_cria_titulo_nem_quebra_a_linha(tmp_path):
+    rdap = {**saidas_base()["rdap"], "registro": "2026-09-29\n## titulo falso\n<b>x</b>"}
+    ct = {"primeiro_certificado": "2020-11-11|x\n# outro titulo", "total": 3, "sans": []}
+    texto = dossie(gravar(tmp_path, saidas=_reaproveitado(rdap=rdap, ct=ct)))
+    s4, s6 = secao(texto, 4), secao(texto, 6)
+    assert AVISO_REAPROVEITADO in s6 and "Domínio registrado de novo; o histórico anterior" in s4
+    assert "\n## titulo" not in texto and "\n# outro" not in texto
+    for linha in s4.splitlines():
+        if linha.startswith("|"):
+            assert celulas(linha) == 3, linha
+
+
 # ---------------------------------------------------------------------------- seção 7: lacunas
 
 
