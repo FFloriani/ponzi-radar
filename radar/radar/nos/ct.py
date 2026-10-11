@@ -14,17 +14,18 @@ _DATA = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 class CtNo(NoBase):
-    """Só conta o que já existia no `as_of`: `not_before[:10] <= as_of`."""
+    """Certificados do domínio que o nó `destino` escolheu (o do alvo, ou o do site para onde ele redireciona). Só conta
+    o que já existia no `as_of`: `not_before[:10] <= as_of`."""
 
     nome = "ct"
-    entradas = ("alvo",)
+    entradas = ("destino",)
     saidas = ("primeiro_certificado", "total", "sans")
     as_of = "exato"
 
     async def executar(
         self, ctx: Contexto, entradas: dict[str, dict], respostas: dict, s: Servicos
     ) -> Feito:
-        dominio = quote(entradas["alvo"]["dominio"], safe="")
+        dominio = quote(entradas["destino"]["dominio"], safe="")
         certificados = await buscar_json(s, f"{_URL}?q={dominio}&output=json", "crt.sh")
         if not isinstance(certificados, list):
             raise ErroNo("crt.sh: resposta não é uma lista de certificados", permanente=True)

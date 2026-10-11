@@ -17,6 +17,7 @@ from radar.modelos import Contexto, ErroNo, Feito
 from radar.motor import Motor, NoBase, Servicos
 from radar.nos.alvo import AlvoNo
 from radar.nos.cvm import CvmAlertasNo, CvmSancionadorNo, RegistrosNo, casar_deliberacoes
+from radar.nos.destino import DestinoNo
 from radar.rede import Rede
 from tests.mocks_cvm import mocar_cvm, mocar_deliberacoes, mocar_olinda
 
@@ -53,6 +54,11 @@ def contexto(pasta: Path, as_of: date = HOJE, alvo: str = "exemplo.com.br") -> C
 
 def entrada_alvo(dominio: str = "exemplo.com.br") -> dict:
     return {"alvo": {"dominio": dominio, "slug": dominio.replace(".", "-"), "url_inicial": f"https://{dominio}/"}}
+
+
+def entrada_destino(dominio: str, redirecionado_de: str = "redirecionador.link") -> dict:
+    """O nó `destino` depois de um redirect de `redirecionado_de` para `dominio`."""
+    return {"destino": {"dominio": dominio, "redirecionado_de": redirecionado_de, "url_destino": f"https://{dominio}/"}}
 
 
 def entrada_cnpj(cnpj: str | None, razao_social: str = "EMPRESA SEM REGISTRO LTDA", **extra) -> dict:
@@ -95,6 +101,7 @@ def sem_artefato(saidas: dict) -> dict:
 def test_registros_declaracao():
     no = RegistrosNo()
     assert (no.nome, no.entradas, no.as_of, no.toca_alvo) == ("registros", ("alvo", "cnpj"), "filtravel", False)
+    assert no.opcionais == ("destino",)
     assert no.saidas == (
         "cvm", "bcb", "bcb_dominio", "registrado", "motivo", "vazamento_temporal", "indices_vencidos"
     )  # fmt: skip
@@ -175,6 +182,13 @@ async def test_dominio_verificado_bcb(respx_mock, tmp_path, serv):
     assert {d["raiz_cnpj"] for d in r.saidas["bcb_dominio"]} == {"00000000", "06043050", "24933830", "30822936", "31546476"}
     assert all(d["dominio"] == "bb.com.br" for d in r.saidas["bcb_dominio"])
     assert (r.saidas["registrado"], r.saidas["motivo"]) == (True, None)
+    # depois de um redirect, o domínio verificado é o do destino (o redirecionador não é o site)
+    redirecionador = contexto(tmp_path, alvo="redirecionador.link")
+    entradas = {**entrada_alvo("redirecionador.link"), **entrada_destino("bb.com.br"), **entrada_cnpj(None)}
+    r3 = await RegistrosNo().executar(redirecionador, entradas, {}, serv)
+    assert len(r3.saidas["bcb_dominio"]) == 5 and r3.saidas["registrado"] is True
+    consulta = [e for e in entradas_custodia(serv) if e["origem"] == "dominios_bcb"][-1]
+    assert corpo_da_custodia(serv, consulta)["consulta"]["dominio"] == "bb.com.br"
     # igualdade exata: o domínio parecido não casa
     outro = contexto(tmp_path, alvo="bb.com.br.golpe.com")
     r2 = await RegistrosNo().executar(outro, {**entrada_alvo("bb.com.br.golpe.com"), **entrada_cnpj(PIPELINE)}, {}, serv)
@@ -455,7 +469,7 @@ def test_sem_nada_para_procurar():
 def test_alertas_declaracao():
     no = CvmAlertasNo()
     assert (no.nome, no.entradas, no.opcionais, no.as_of, no.toca_alvo) == (
-        "cvm_alertas", ("alvo",), ("cnpj",), "exato", False
+        "cvm_alertas", ("alvo",), ("cnpj", "destino"), "exato", False
     )
     assert no.saidas == ("correspondencias", "cobertura", "artefato", "indices_vencidos")
 
@@ -486,6 +500,14 @@ async def test_alertas_sem_cnpj_casa_so_por_dominio(respx_mock, tmp_path, serv):
     assert tipos(sem_entrada.saidas["correspondencias"]) == [("dominio", 905)]
     nao_achou = await CvmAlertasNo().executar(ctx, {**entrada_alvo("santotrader.com"), **entrada_cnpj(None)}, {}, serv)
     assert tipos(nao_achou.saidas["correspondencias"]) == [("dominio", 905)]
+    # depois de um redirect, a deliberação que cita o destino é a do site analisado; a chave da consulta também muda
+    redirecionador = contexto(tmp_path, alvo="redirecionador.link")
+    entradas = {**entrada_alvo("redirecionador.link"), **entrada_destino("santotrader.com")}
+    pelo_destino = await CvmAlertasNo().executar(redirecionador, entradas, {}, serv)
+    assert tipos(pelo_destino.saidas["correspondencias"]) == [("dominio", 905)]
+    assert pelo_destino.saidas["correspondencias"][0]["valor"] == "santotrader.com"
+    consulta = json.loads(serv.custodia.ler(pelo_destino.saidas["artefato"]))["consulta"]
+    assert consulta["dominio"] == "santotrader.com"
     outro = await CvmAlertasNo().executar(contexto(tmp_path, alvo="limpo.com.br"), entrada_alvo("limpo.com.br"), {}, serv)
     assert sem_artefato(outro.saidas) == {"correspondencias": [], "cobertura": {"com_texto_integral": 7, "so_resumo": 0}}
 
@@ -590,7 +612,8 @@ async def _rodar(tmp_path, cnpj: dict, as_of: date | None = None):
     rede = Rede(config.rede, dormir=_nao_dormir)
     try:
         indices = Indices(tmp_path / "_indices", rede, 24, agora=lambda: AGORA)
-        nos = [AlvoNo(), _CnpjFalso(cnpj), RegistrosNo(), CvmSancionadorNo(), CvmAlertasNo()]
+        # o `destino` sem a captura (modo nenhum): o domínio analisado é o do alvo
+        nos = [AlvoNo(), DestinoNo(opcionais=()), _CnpjFalso(cnpj), RegistrosNo(), CvmSancionadorNo(), CvmAlertasNo()]
         motor = Motor(ctx, nos, criar_servicos(config, ctx.pasta, rede, indices=indices))
         await motor.executar()
     finally:
@@ -610,8 +633,9 @@ async def test_nos_pelo_motor(respx_mock, tmp_path):
     }
     ctx, motor = await _rodar(tmp_path, cnpj)
     assert motor.status() == {
-        "alvo": "feito", "cnpj": "feito", "registros": "feito", "cvm_sancionador": "feito", "cvm_alertas": "feito"
-    }
+        "alvo": "feito", "destino": "feito", "cnpj": "feito", "registros": "feito", "cvm_sancionador": "feito",
+        "cvm_alertas": "feito",
+    }  # fmt: skip
     ex = carregar_execucao(ctx.pasta)
     registros = ex.saidas["registros"]
     assert (registros["registrado"], registros["motivo"], registros["cvm"], registros["bcb"]) == (False, None, [], [])

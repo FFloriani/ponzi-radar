@@ -23,6 +23,14 @@ PLATAFORMAS = frozenset(
         "t.me", "telegram.org", "wa.me", "whatsapp.com", "linktr.ee", "google.com", "linkedin.com", "kwai.com",
     }
 )  # fmt: skip
+# Serviços de estacionamento de domínio (parking, venda de domínio): o domínio parado ou à venda redireciona para eles,
+# e a página que fica lá é do serviço, não do esquema. Um redirect para eles não troca o domínio analisado.
+SERVICOS_DE_ESTACIONAMENTO = frozenset(
+    {
+        "sedoparking.com", "parkingcrew.net", "bodis.com", "dan.com", "afternic.com", "hugedomains.com", "above.com",
+        "parklogic.com", "undeveloped.com",
+    }
+)  # fmt: skip
 _ESQUEMA = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://")
 # o slug vira nome de pasta: só letras, dígitos, "_" e "-" (nada de "\" ou ".." vindo da entrada),
 # com hífen apenas no meio de cada rótulo
@@ -71,6 +79,11 @@ def _sem_parametros_de_indicacao(query: str) -> tuple[str, list[str]]:
 def e_plataforma(dominio: str) -> bool:
     """`dominio` (registrável) é de uma plataforma de conteúdo de `PLATAFORMAS`."""
     return dominio.strip().lower().rstrip(".") in PLATAFORMAS
+
+
+def e_estacionamento(dominio: str) -> bool:
+    """`dominio` (registrável) é de um serviço de estacionamento de `SERVICOS_DE_ESTACIONAMENTO`."""
+    return dominio.strip().lower().rstrip(".") in SERVICOS_DE_ESTACIONAMENTO
 
 
 def _invalido(entrada: str, motivo: str) -> ErroNo:

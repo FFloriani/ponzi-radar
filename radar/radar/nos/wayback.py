@@ -124,7 +124,8 @@ async def _listar_home(s: Servicos, dominio: str, as_of: date) -> list[tuple[str
 
 
 class WaybackIndiceNo(NoBase):
-    """Linha do tempo das capturas HTML do domínio (e dos subdomínios) até o `as_of`.
+    """Linha do tempo das capturas HTML do domínio (e dos subdomínios) até o `as_of`. O domínio é o que o nó `destino`
+    escolheu: o do alvo, ou o do site para onde ele redireciona.
 
     `total` e `por_mes` contam capturas, não URLs nem dias. `primeiro` e `ultimo` saem do menor e do
     maior timestamp, porque o CDX do domínio não vem em ordem de data. `truncado` é `True` quando o
@@ -132,14 +133,14 @@ class WaybackIndiceNo(NoBase):
     """
 
     nome = "wayback_indice"
-    entradas = ("alvo",)
+    entradas = ("destino",)
     saidas = ("primeiro", "ultimo", "total", "por_mes", "truncado")
     as_of = "exato"
 
     async def executar(
         self, ctx: Contexto, entradas: dict[str, dict], respostas: dict, s: Servicos
     ) -> Feito:
-        capturas, truncado = await _listar_dominio(s, entradas["alvo"]["dominio"], ctx.as_of)
+        capturas, truncado = await _listar_dominio(s, entradas["destino"]["dominio"], ctx.as_of)
         timestamps = sorted(timestamp for timestamp, _ in capturas)
         por_mes = Counter(f"{timestamp[:4]}-{timestamp[4:6]}" for timestamp in timestamps)
         return Feito(
@@ -204,7 +205,8 @@ class WaybackSnapshotNo(NoBase):
 
     Roda se a análise é retroativa, se `modo_contato` é `nenhum`, se a captura não terminou `feito`
     (não há `captura` nas entradas) ou se ela foi bloqueada. Senão: `Pulado("captura ok")`.
-    Busca a página inicial e as subpáginas de regras mais recentes até o `as_of`.
+    Busca a página inicial e as subpáginas de regras mais recentes até o `as_of`, do domínio que o nó `destino`
+    escolheu (o do alvo, ou o do site para onde ele redireciona).
 
     Só a falha da página inicial derruba o nó. Tudo o que vem depois dela (a listagem do domínio e
     cada subpágina, o que inclui erro inesperado ao processar o conteúdo do site) vai para `falhas`
@@ -213,7 +215,7 @@ class WaybackSnapshotNo(NoBase):
     """
 
     nome = "wayback_snapshot"
-    entradas = ("alvo",)
+    entradas = ("destino",)
     opcionais = ("captura",)
     saidas = ("paginas", "falhas", "truncado")
     as_of = "exato"
@@ -230,7 +232,7 @@ class WaybackSnapshotNo(NoBase):
         ):
             return Pulado("captura ok")
 
-        dominio = entradas["alvo"]["dominio"]
+        dominio = entradas["destino"]["dominio"]
         home = await _listar_home(s, dominio, ctx.as_of)
         if not home:
             raise ErroNo(f"sem snapshot até {ctx.as_of.isoformat()}", permanente=True)

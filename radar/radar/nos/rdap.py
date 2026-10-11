@@ -62,21 +62,23 @@ def _cnpj_do_titular(dados: dict) -> str | None:
 
 
 class RdapNo(NoBase):
-    """Só o titular (CNPJ) é dado do presente; a data de registro é a mesma em qualquer `as_of`.
+    """Registro do domínio que o nó `destino` escolheu (o do alvo, ou o do site para onde ele redireciona).
+
+    Só o titular (CNPJ) é dado do presente; a data de registro é a mesma em qualquer `as_of`.
 
     No modo retroativo o CNPJ do titular não é lido (`None`) e fica marcado em
     `vazamento_temporal`, para a pontuação saber que a ausência vem do `as_of`.
     """
 
     nome = "rdap"
-    entradas = ("alvo",)
+    entradas = ("destino",)
     saidas = ("registro", "expiracao", "registrador", "cnpj_titular", "vazamento_temporal")
     as_of = "exato"
 
     async def executar(
         self, ctx: Contexto, entradas: dict[str, dict], respostas: dict, s: Servicos
     ) -> Feito:
-        dominio = entradas["alvo"]["dominio"]
+        dominio = entradas["destino"]["dominio"]
         base = _URL_BR if dominio.endswith(".br") else _URL_GERAL
         dados = await buscar_json(s, base + quote(dominio, safe=""), "RDAP")
         if not isinstance(dados, dict):

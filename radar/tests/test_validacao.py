@@ -932,6 +932,72 @@ async def test_alvo_idn_e_recusado_nas_duas_grafias(tmp_path, serv, respx_mock, 
     assert respx_mock.calls.call_count == 0
 
 
+# --- destino depois de um redirect (melhorias do aceite) --------------------------------------------------
+
+DESTINO = "phinvestimentos.com"
+
+
+@pytest.mark.parametrize(
+    "url", [f"https://{DESTINO}/login", f"https://app.{DESTINO}:8443/termos", f"http://WWW.{DESTINO.upper()}./"]
+)
+async def test_dominio_do_destino_e_recusado_como_o_do_alvo(ctx, serv, respx_mock, url):
+    # o destino do redirect é o site analisado: só a captura o visita
+    with pytest.raises(ErroNo) as erro:
+        await arquivar_fonte(url, ctx, serv, dominio_destino=DESTINO)
+    assert (erro.value.mensagem, erro.value.permanente) == (MOTIVO_ALVO, True)
+    v = await validar(confirmado(ev(url)), pend(ctx), ctx, serv, dominio_destino=DESTINO)
+    assert v == Validacao(False, MOTIVO_ALVO, "evidencias[0].fonte", [])
+    assert respx_mock.calls.call_count == 0
+
+
+async def test_com_destino_o_alvo_continua_recusado(ctx, serv, respx_mock):
+    with pytest.raises(ErroNo) as erro:
+        await arquivar_fonte("https://exemplo.com.br/termos", ctx, serv, dominio_destino=DESTINO)
+    assert erro.value.mensagem == MOTIVO_ALVO
+    assert respx_mock.calls.call_count == 0
+
+
+async def test_redirect_para_o_destino_e_recusado(ctx, serv, respx_mock):
+    respx_mock.get("https://curto.example.org/a").mock(
+        return_value=httpx.Response(302, headers={"location": f"https://www.{DESTINO}/login"})
+    )
+    with pytest.raises(ErroNo) as erro:
+        await arquivar_fonte("https://curto.example.org/a", ctx, serv, dominio_destino=DESTINO)
+    assert erro.value.mensagem == MOTIVO_ALVO
+    v = await validar(confirmado(ev("https://curto.example.org/a")), pend(ctx), ctx, serv, dominio_destino=DESTINO)
+    assert v == Validacao(False, MOTIVO_ALVO, "evidencias[0].fonte", [])
+
+
+async def test_destino_recusado_com_a_mensagem_do_modo(tmp_path, serv):
+    url = f"https://{DESTINO}/login"
+    cego = contexto(tmp_path).model_copy(update={"modo_cego": True})
+    nenhum = contexto(tmp_path, modo_contato="nenhum")
+    for ctx_, esperado in ((cego, MOTIVO_ALVO_CEGO), (nenhum, MOTIVO_NENHUM)):
+        v = await validar(confirmado(ev(url)), pend(ctx_), ctx_, serv, dominio_destino=DESTINO)
+        assert v == Validacao(False, esperado, "evidencias[0].fonte", [])
+
+
+@pytest.mark.parametrize("dominio_destino", [None, "", "  "])
+async def test_sem_destino_o_dominio_dele_e_fonte_comum(ctx, serv, respx_mock, dominio_destino):
+    servir(respx_mock, f"https://{DESTINO}/noticia", pagina())
+    assert (await arquivar_fonte(f"https://{DESTINO}/noticia", ctx, serv, dominio_destino=dominio_destino)).texto
+
+
+async def test_dominio_parecido_com_o_destino_e_permitido(ctx, serv, respx_mock):
+    for url in (f"https://meu{DESTINO}/", f"https://{DESTINO}.outro.org/"):
+        servir(respx_mock, url, pagina())
+        assert (await arquivar_fonte(url, ctx, serv, dominio_destino=DESTINO)).texto
+
+
+@pytest.mark.parametrize("dado", [ALVO_IDN, ALVO_PUNYCODE])
+@pytest.mark.parametrize("host", [ALVO_IDN, ALVO_PUNYCODE, "www." + ALVO_PUNYCODE])
+async def test_destino_idn_e_recusado_nas_duas_grafias(ctx, serv, respx_mock, dado, host):
+    with pytest.raises(ErroNo) as erro:
+        await arquivar_fonte(f"https://{host}/termos", ctx, serv, dominio_destino=dado)
+    assert erro.value.mensagem == MOTIVO_ALVO
+    assert respx_mock.calls.call_count == 0
+
+
 # --- arquivar_fonte --------------------------------------------------------------------------------------
 
 

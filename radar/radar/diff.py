@@ -197,7 +197,8 @@ class Diff:
     - `sinais_novos`: sinais do eixo 2 (tipo, estágio, data) e alertas que `b` tem e `a` não tem;
     - `infra`: `hospedagem mudou` (A/AAAA), `NS mudou`, `MX mudou`, `domínio expira em menos de 60 dias` (em `b`, a
       partir do `as_of` dela) e `site fora do ar` (NXDOMAIN em `b`, ou o site não respondeu à captura em `b` e
-      respondeu em `a`, pelo critério da pontuação: `pontuacao.site_nao_respondeu`);
+      respondeu em `a`, pelo critério da pontuação: `pontuacao.site_nao_respondeu`) e `destino mudou: <a> → <b>` (o
+      domínio que os coletores analisaram, saída do nó `destino`, mudou entre as duas, com a captura feita nas duas);
     - `socios_entraram` e `socios_sairam`: nomes do quadro de sócios (nunca CPF);
     - `wayback_novas`: capturas do Wayback que `b` tem a mais;
     - `matriz_diferente`: a `a` foi pontuada antes com outra matriz. `eixo1_a_matriz_original` é a conta de então
@@ -264,6 +265,17 @@ def _registros_dns(dns: dict, *tipos: str) -> frozenset[str]:
     )
 
 
+def _dominio_analisado(ex: ExecucaoSalva) -> str | None:
+    """O domínio que os coletores analisaram (saída `dominio` do nó `destino`), quando a captura o observou. Sem a
+    captura feita (pulada, em erro) o `destino` volta ao alvo por falta de dado, não porque o redirect sumiu; a
+    execução de antes do nó `destino` não o tem."""
+    destino = saida(ex, "destino")
+    if destino is None or saida(ex, "captura") is None:
+        return None
+    dominio = destino.get("dominio")
+    return dominio.strip().lower() if isinstance(dominio, str) and dominio.strip() else None
+
+
 def _infra(a: ExecucaoSalva, b: ExecucaoSalva) -> list[str]:
     infra: list[str] = []
     dns_a, dns_b = saida(a, "dns"), saida(b, "dns")
@@ -280,6 +292,9 @@ def _infra(a: ExecucaoSalva, b: ExecucaoSalva) -> list[str]:
     captura_caiu = site_nao_respondeu(b) and not site_nao_respondeu(a)
     if nxdomain or captura_caiu:
         infra.append("site fora do ar")
+    destino_a, destino_b = _dominio_analisado(a), _dominio_analisado(b)
+    if destino_a is not None and destino_b is not None and destino_a != destino_b:
+        infra.append(f"destino mudou: {destino_a} → {destino_b}")
     return infra
 
 

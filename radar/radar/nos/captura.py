@@ -1,9 +1,15 @@
 """Nó `captura`: visita passiva do site investigado com o Chromium, artefatos na custódia e detecção de anti-bot.
 
-É o único nó que toca o site do alvo, e só como um visitante comum: `goto` em links, nunca clique,
-preenchimento nem envio de formulário; downloads recusados e service workers bloqueados. O Playwright
-é a exceção à regra "toda saída via `Rede`": o navegador tem pilha de rede própria e recebe o proxy de
-`config.rede`.
+É o único nó que toca o site do alvo (e o do destino, quando a página inicial redireciona para outro domínio), e só
+como um visitante comum: `goto` em links, nunca clique, preenchimento nem envio de formulário; downloads recusados e
+service workers bloqueados. O Playwright é a exceção à regra "toda saída via `Rede`": o navegador tem pilha de rede
+própria e recebe o proxy de `config.rede`.
+
+Destino (melhorias do aceite, T1): o alvo que só redireciona (`phinv.link` → `phinvestimentos.com/login`) não é o site.
+Quando a página inicial termina noutro domínio registrável, que não é plataforma de conteúdo (`alvo.PLATAFORMAS`) nem
+serviço de estacionamento (`alvo.SERVICOS_DE_ESTACIONAMENTO`), as subpáginas saem do host dele e a saída `destino` o
+entrega ao nó `destino`, que o passa aos coletores de domínio. O redirect para plataforma ou estacionamento não troca o
+domínio analisado e fica em `redirect_ignorado`.
 
 Opsec do analista (I5 da revisão final): o WebRTC só usa UDP pelo proxy (`ARGS_DO_NAVEGADOR`) e, com proxy, o
 `RTCPeerConnection` some da página (um STUN do site revelaria o IP real); o navegador usa o próprio User-Agent,
@@ -53,7 +59,7 @@ from radar.config import CapturaConfig, RedeConfig
 from radar.modelos import Contexto, ErroNo, Feito, Pulado
 from radar.motor import NoBase, Servicos
 from radar.nos._paginas import Chave, chave_da_pagina, ordenar_paginas
-from radar.nos.alvo import dominio_registravel
+from radar.nos.alvo import dominio_registravel, e_estacionamento, e_plataforma
 from radar.pontuacao import (
     ERROS_DE_ALCANCE,
     PREFIXO_CAPTURA_INDISPONIVEL,
@@ -264,12 +270,13 @@ async def _fechar_janela(pagina: Page) -> None:
         await pagina.close()
 
 
-def _terceiros(har: bytes, dominio_alvo: str) -> list[str]:
-    """Domínios registráveis das requisições do HAR que não são o do alvo, sem repetição e em ordem.
+def _terceiros(har: bytes, *dominios_do_site: str) -> list[str]:
+    """Domínios registráveis das requisições do HAR que não são os do site (o do alvo e, depois de um redirect, o do
+    destino), sem repetição e em ordem.
 
     IP e nome sem sufixo público (`localhost`) não têm domínio registrável: valem pelo próprio host.
     """
-    alvo = dominio_alvo.lower()
+    do_site = {dominio.lower() for dominio in dominios_do_site if dominio}
     dominios: set[str] = set()
     for entrada in json.loads(har)["log"]["entries"]:
         try:
@@ -279,9 +286,37 @@ def _terceiros(har: bytes, dominio_alvo: str) -> list[str]:
         if not host:  # data:, about:blank...
             continue
         dominio = dominio_registravel(host) or host
-        if dominio != alvo:
+        if dominio not in do_site:
             dominios.add(dominio)
     return sorted(dominios)
+
+
+def _destino_do_redirect(url_final: str, alvo: str) -> tuple[dict | None, dict | None]:
+    """`(destino, redirect_ignorado)` da página inicial que terminou em `url_final`.
+
+    - outro domínio registrável (http ou https): `({"url", "dominio"}, None)`, e os coletores passam a analisá-lo;
+    - plataforma de conteúdo ou serviço de estacionamento: `(None, {"url", "dominio", "motivo"})`, com o motivo
+      `"plataforma"` ou `"estacionamento"`: o destino não vira o alvo;
+    - o próprio domínio do alvo (`www.`, outro subdomínio), host sem domínio registrável (IP, `localhost`, nome sem
+      sufixo público), outro esquema (`about:`, `chrome-error:`) ou URL quebrada: `(None, None)`.
+
+    `url_final` vem do site investigado: nada dela derruba a captura.
+    """
+    try:
+        partes = urlsplit(url_final)
+        host = partes.hostname
+    except ValueError:
+        return None, None
+    if partes.scheme not in ("http", "https") or not host:
+        return None, None
+    dominio = dominio_registravel(host)
+    if not dominio or dominio == alvo.lower():
+        return None, None
+    if e_plataforma(dominio):
+        return None, {"url": url_final, "dominio": dominio, "motivo": "plataforma"}
+    if e_estacionamento(dominio):
+        return None, {"url": url_final, "dominio": dominio, "motivo": "estacionamento"}
+    return {"url": url_final, "dominio": dominio}, None
 
 
 def _host_do_site(url: str) -> str | None:
@@ -311,21 +346,28 @@ def _link_do_site(href: Any, hosts: set[str]) -> str | None:
     return urlunsplit(partes._replace(fragment=""))
 
 
-def _escolher_links(hrefs: list, url_inicial: str, url_final: str, alvo: str, limite: int) -> list[str]:
+def _escolher_links(
+    hrefs: list, url_inicial: str, url_final: str, alvo: str, limite: int, destino: str | None = None
+) -> list[str]:
     """As subpáginas a visitar: até `limite` links do mesmo host da `url_inicial` (com ou sem `www.`).
 
     `url_final` é onde a página inicial terminou depois dos redirects. Ela nunca é revisitada, mas o
     host dela só vale como "mesmo host" se for do domínio registrável do `alvo` (`www.exemplo.com`,
     `app.exemplo.com`). Um golpe que redireciona para `t.me` ou `wa.me` não faz a captura rastrear
-    o Telegram. Links para arquivos, de outro esquema que não http(s) e repetidos depois de tirar o
+    o Telegram. Com `destino` (o domínio registrável da `url_final`, quando o redirect trocou de domínio e
+    `_destino_do_redirect` o aceitou), as subpáginas são só as do host da `url_final`: o redirecionador não é o site.
+    Links para arquivos, de outro esquema que não http(s) e repetidos depois de tirar o
     fragmento ficam de fora. A ordem e o corte de variantes de query são os do `wayback_snapshot`
     (`ordenar_paginas`): as páginas de regras primeiro, as sem query antes das com query, no máximo
     1 variante de query por caminho (a primeira do documento).
     """
-    hosts = {host for host in [_host_do_site(url_inicial)] if host}
     host_final = _host_do_site(url_final)
-    if host_final and dominio_registravel(host_final) == alvo.lower():
-        hosts.add(host_final)
+    if destino:
+        hosts = {host_final} if host_final else set()
+    else:
+        hosts = {host for host in [_host_do_site(url_inicial)] if host}
+        if host_final and dominio_registravel(host_final) == alvo.lower():
+            hosts.add(host_final)
     ja_vistas = {chave for chave in map(chave_da_pagina, [url_inicial, url_final]) if chave is not None}
     candidatas: dict[Chave, tuple[int, str]] = {}
     for posicao, href in enumerate(hrefs):
@@ -443,23 +485,38 @@ def _guardar_desafio(s: Servicos, v: _Visita) -> None:
     s.custodia.guardar(_bytes(v.html), "html", tipo="desafio", origem=v.url)
 
 
+@dataclass
+class _Percurso:
+    """O que a captura levou do site: as páginas (sem o HAR), se a inicial era um desafio anti-bot, as subpáginas que
+    falharam e o redirect da página inicial (`_destino_do_redirect`)."""
+
+    paginas: list[dict]
+    bloqueada: bool
+    falhas: list[dict]
+    destino: dict | None
+    redirect_ignorado: dict | None
+
+
 async def _percorrer(
     contexto: BrowserContext, ctx: Contexto, cfg: CapturaConfig, s: Servicos, guarda: _Guarda
-) -> tuple[list[dict], bool, list[dict]]:
-    """Visita a página inicial e as subpáginas. Devolve `(paginas sem o HAR, bloqueada, falhas)`.
+) -> _Percurso:
+    """Visita a página inicial e as subpáginas.
 
     Falha na página inicial levanta: `_FalhaDeNavegacao` se o `goto` falhou, `PlaywrightError` se o resto da
     leitura falhou, `ErroNo` se o servidor respondeu com erro HTTP (o HTML da página de erro fica na custódia como
     prova) ou se a guarda barrou a página (redirect ou URL final em endereço local: nada dela vai para a custódia).
     Falha numa subpágina, inclusive erro HTTP, endereço local barrado e erro inesperado ao processar o conteúdo do
-    site, vai para `falhas` e as outras seguem.
+    site, vai para `falhas` e as outras seguem. O redirect da página inicial vale também quando ela é um desafio: o
+    domínio de onde o desafio veio é o que o Wayback e os coletores olham.
     """
     inicio = await _visita_guardada(contexto, ctx.url_inicial, cfg, True, guarda)
+    destino, ignorado = _destino_do_redirect(inicio.url, ctx.alvo)
     if inicio.e_desafio:
         _guardar_desafio(s, inicio)
         screenshot = s.custodia.guardar(inicio.screenshot, "png", tipo="screenshot", origem=inicio.url)
         # sem texto e sem seguir links
-        return [{"url": inicio.url, "status": inicio.status, "screenshot": screenshot}], True, []
+        paginas = [{"url": inicio.url, "status": inicio.status, "screenshot": screenshot}]
+        return _Percurso(paginas, True, [], destino, ignorado)
     if inicio.e_erro_http:
         # o site caiu ou recusou o visitante: sem conteúdo para analisar, o motor cai no Wayback
         s.custodia.guardar(_bytes(inicio.html), "html", tipo="pagina", origem=inicio.url)
@@ -467,7 +524,10 @@ async def _percorrer(
 
     paginas = [_guardar_pagina(s, inicio)]
     falhas: list[dict] = []
-    for url in _escolher_links(inicio.links, ctx.url_inicial, inicio.url, ctx.alvo, cfg.max_subpaginas):
+    links = _escolher_links(
+        inicio.links, ctx.url_inicial, inicio.url, ctx.alvo, cfg.max_subpaginas, destino and destino["dominio"]
+    )
+    for url in links:
         try:
             visita = await _visita_guardada(contexto, url, cfg, False, guarda)
             if visita.e_desafio:
@@ -482,7 +542,7 @@ async def _percorrer(
             falhas.append({"url": url, "motivo": str(erro)})
         except Exception as erro:  # o conteúdo é do site investigado: nada dele derruba o nó
             falhas.append({"url": url, "motivo": _motivo(erro)})
-    return paginas, False, falhas
+    return _Percurso(paginas, False, falhas, destino, ignorado)
 
 
 class _EnderecoLocal(Exception):
@@ -528,7 +588,7 @@ async def _capturar(ctx: Contexto, dominio: str, s: Servicos) -> Feito:
                     await contexto.route_web_socket("**/*", guarda.rotear_websocket)
                     await _barrar_enderecos_locais(navegador, guarda)  # o navegador é desta captura e fecha no fim
                     try:
-                        paginas, bloqueada, falhas = await _percorrer(contexto, ctx, cfg, s, guarda)
+                        percurso = await _percorrer(contexto, ctx, cfg, s, guarda)
                     except _EnderecoLocal as erro:
                         raise ErroNo(f"{PREFIXO_FALHA_CAPTURA} {erro}", permanente=False) from erro
                 finally:
@@ -538,22 +598,29 @@ async def _capturar(ctx: Contexto, dominio: str, s: Servicos) -> Feito:
             await navegador.close()
 
     ref_har = s.custodia.guardar(har, "har", tipo="har", origem=ctx.url_inicial)
+    destino = percurso.destino
     return Feito(
         {
-            "paginas": [{**pagina, "har": ref_har} for pagina in paginas],  # um HAR por execução
-            "terceiros": _terceiros(har, dominio),
-            "bloqueada": bloqueada,
-            "falhas": falhas,
+            "paginas": [{**pagina, "har": ref_har} for pagina in percurso.paginas],  # um HAR por execução
+            "terceiros": _terceiros(har, dominio, *([destino["dominio"]] if destino else [])),
+            "bloqueada": percurso.bloqueada,
+            "falhas": percurso.falhas,
+            "destino": destino,
+            "redirect_ignorado": percurso.redirect_ignorado,
         }
     )
 
 
 class CapturaNo(NoBase):
-    """Visita passiva da página inicial e de até `max_subpaginas` links do mesmo host da `url_inicial`.
+    """Visita passiva da página inicial e de até `max_subpaginas` links do mesmo host da `url_inicial` (ou, depois de
+    um redirect para outro domínio, do host onde a página inicial terminou).
 
     Saídas: `paginas` (`url`, `status` HTTP, e `html`, `texto`, `screenshot`, `har` como refs da
-    custódia), `terceiros` (domínios registráveis das requisições, diferentes do alvo), `bloqueada` e
-    `falhas` (as subpáginas que não puderam ser capturadas, com o motivo).
+    custódia), `terceiros` (domínios registráveis das requisições, diferentes do alvo e do destino), `bloqueada`,
+    `falhas` (as subpáginas que não puderam ser capturadas, com o motivo), `destino` (`{"url", "dominio"}` quando a
+    página inicial terminou noutro domínio registrável, senão `None`) e `redirect_ignorado` (`{"url", "dominio",
+    "motivo"}` quando esse domínio é plataforma ou estacionamento e o alvo continua o mesmo, senão `None`); ver
+    `_destino_do_redirect`.
 
     Os erros do nó distinguem o site do analista (I2, ver `_erro_da_captura`): "captura falhou: HTTP <código>" e
     "captura falhou: navegação: ..." falam do site; "captura indisponível: ..." é falha local e não conta para o E6.
@@ -567,7 +634,7 @@ class CapturaNo(NoBase):
 
     nome = "captura"
     entradas = ("alvo",)
-    saidas = ("paginas", "terceiros", "bloqueada", "falhas")
+    saidas = ("paginas", "terceiros", "bloqueada", "falhas", "destino", "redirect_ignorado")
     toca_alvo = True
     as_of = "so_atual"
 

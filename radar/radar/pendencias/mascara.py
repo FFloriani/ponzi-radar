@@ -18,6 +18,7 @@ from collections.abc import Callable, Sequence
 from functools import lru_cache
 from html.parser import HTMLParser
 from typing import Any
+from urllib.parse import urlsplit
 
 from radar.nos.alvo import dominio_registravel
 from radar.texto import decodificar, normalizar
@@ -179,11 +180,22 @@ def _cnpj_formatado(cnpj: str) -> str:
     return f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:]}"
 
 
+def _host(url: Any) -> str | None:
+    """O host da URL (sem porta, em minúsculas), ou `None` se ela não é texto ou não tem host."""
+    if not isinstance(url, str):
+        return None
+    try:
+        return urlsplit(url).hostname
+    except ValueError:  # a URL veio do site investigado
+        return None
+
+
 def montar_mascara(saidas: dict[str, dict], ler_artefato: Callable[[str], bytes]) -> dict[str, str]:
     """Termo -> marcador, a partir das `saidas` dos nós (nome do nó -> saída). `ler_artefato` (normalmente
     `Custodia.ler`) só é chamado para o HTML da página inicial, de onde saem o `<title>` e o `og:site_name`.
 
-    - `alvo.dominio` e `ct.sans` (o domínio e os subdomínios), nas duas grafias se forem IDN -> `[ALVO]`;
+    - `alvo.dominio`, `destino.dominio` e o host de `destino.url_destino` (depois de um redirect, o site para onde o
+      alvo manda) e `ct.sans` (o domínio e os subdomínios), nas duas grafias se forem IDN -> `[ALVO]`;
     - `cnpj.razao_social`, `cnpj.nome_fantasia` e o `og:site_name` da página inicial -> `[EMPRESA]`;
     - cada parte do título da página inicial (partido em `| – — · :` e em " - ") que sem "%" seja o rótulo do
       domínio (inclusive concatenado: "Exemplo Invest" em exemploinvest.com.br) ou divida com o `og:site_name`, o
@@ -215,7 +227,8 @@ def montar_mascara(saidas: dict[str, dict], ler_artefato: Callable[[str], bytes]
 
     rotulos: set[str] = set()  # os rótulos dos domínios do site
     referencias: set[str] = set()  # as palavras de marca do og:site_name, do nome fantasia e da razão social
-    dominios = [_no(saidas, "alvo").get("dominio")]
+    destino = _no(saidas, "destino")
+    dominios = [_no(saidas, "alvo").get("dominio"), destino.get("dominio"), _host(destino.get("url_destino"))]
     sans = _no(saidas, "ct").get("sans")
     for dominio in [*dominios, *(sans if isinstance(sans, list) else [])]:
         if isinstance(dominio, str):

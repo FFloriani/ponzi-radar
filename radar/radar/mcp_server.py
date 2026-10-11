@@ -600,11 +600,19 @@ class _Radar:
 
     @staticmethod
     def _ips_do_alvo(ex: _Execucao) -> set[str] | None:
-        """Os registros A e AAAA da saída do nó `dns`, se ele terminou."""
+        """Os registros A e AAAA da saída do nó `dns`, se ele terminou. O `dns` resolve o domínio que o nó `destino`
+        escolheu: depois de um redirect, os IPs são os do destino."""
         dns = ex.motor.saidas("dns")
         if dns is None:
             return None
         return {ip for tipo in ("A", "AAAA") for ip in dns.get(tipo) or [] if isinstance(ip, str)}
+
+    @staticmethod
+    def _dominio_destino(ex: _Execucao) -> str | None:
+        """O domínio que os coletores analisam (saída `dominio` do nó `destino`), se ele terminou: depois de um redirect,
+        o do destino, que a validação recusa como fonte junto com o do alvo."""
+        dominio = (ex.motor.saidas("destino") or {}).get("dominio")
+        return dominio if isinstance(dominio, str) and dominio else None
 
     def _escore(self, pasta: Path) -> dict:
         """O intervalo e a classe do eixo 1 com o que está no disco agora."""
@@ -740,7 +748,10 @@ class _Radar:
         prazo = asyncio.timeout_at(self._limite())
         try:
             async with prazo:
-                fonte = await baixar_fonte(url, ex.motor.ctx, ex.servicos, ips_do_alvo=self._ips_do_alvo(ex))
+                fonte = await baixar_fonte(
+                    url, ex.motor.ctx, ex.servicos,
+                    ips_do_alvo=self._ips_do_alvo(ex), dominio_destino=self._dominio_destino(ex),
+                )  # fmt: skip
         except TimeoutError:
             if not prazo.expired():
                 raise
@@ -781,6 +792,7 @@ class _Radar:
                 validacao = await validar(
                     modelo, pendencia, ex.motor.ctx, ex.servicos,
                     mascara=self._mascara(ex), ips_do_alvo=self._ips_do_alvo(ex),
+                    dominio_destino=self._dominio_destino(ex),
                 )  # fmt: skip
         except TimeoutError:
             if not prazo.expired():
@@ -914,7 +926,8 @@ _DESCRICOES = {
         f"{AVISO_NAO_CONFIAVEL}"
     ),
     "arquivar_fonte": (
-        "Baixa uma URL pública (nunca o site investigado), guarda na custódia e devolve ref (sha256) e a data de "
+        "Baixa uma URL pública (nunca o site investigado, nem o site para onde ele redireciona), guarda na custódia "
+        "e devolve ref (sha256) e a data de "
         "publicação detectada na página. A ref serve de fonte numa evidência."
     ),
     "responder_pendencia": (

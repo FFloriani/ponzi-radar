@@ -13,7 +13,8 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import date, datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from functools import partial
+from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -26,9 +27,11 @@ from radar.custodia import Custodia, verificar
 from radar.modelos import Contexto, ErroNo, Feito, Pulado
 from radar.motor import Servicos
 from radar.nos import captura as modulo_captura
+from radar.nos.alvo import SERVICOS_DE_ESTACIONAMENTO
 from radar.nos.captura import (
     CapturaNo,
     _bytes,
+    _destino_do_redirect,
     _e_desafio,
     _e_erro_http,
     _escolher_links,
@@ -43,26 +46,33 @@ PNG = b"\x89PNG\r\n\x1a\n"
 lento = pytest.mark.lento  # abre o Chromium de verdade: 1 a 3 s cada
 
 
-def contexto(pasta: Path, url: str, modo_contato: str = "captura") -> Contexto:
+def contexto(pasta: Path, url: str, modo_contato: str = "captura", alvo: str = "127.0.0.1") -> Contexto:
+    slug = alvo.replace(".", "-")
     return Contexto(
-        alvo="127.0.0.1",
-        slug="127-0-0-1",
+        alvo=alvo,
+        slug=slug,
         url_inicial=url,
         as_of=date(2026, 10, 7),
         data_execucao=AGORA,
         modo_contato=modo_contato,
         modo_cego=False,
-        run_id="127-0-0-1/2026-10-07_120000",
+        run_id=f"{slug}/2026-10-07_120000",
         pasta=pasta,
     )
 
 
-def entrada_alvo(url: str) -> dict[str, dict]:
-    return {"alvo": {"dominio": "127.0.0.1", "slug": "127-0-0-1", "url_inicial": url}}
+def entrada_alvo(url: str, alvo: str = "127.0.0.1") -> dict[str, dict]:
+    return {"alvo": {"dominio": alvo, "slug": alvo.replace(".", "-"), "url_inicial": url}}
 
 
 async def capturar(
-    pasta: Path, url: str, *, modo_contato: str = "captura", rede: RedeConfig | None = None, **captura
+    pasta: Path,
+    url: str,
+    *,
+    modo_contato: str = "captura",
+    rede: RedeConfig | None = None,
+    alvo: str = "127.0.0.1",
+    **captura,
 ):
     """Roda o nó e devolve `(resultado, servicos)`.
 
@@ -71,7 +81,9 @@ async def capturar(
     """
     config = Config(rede=rede or RedeConfig(), captura=CapturaConfig(**captura))
     serv = Servicos(config=config, rede=None, custodia=Custodia(pasta))
-    resultado = await CapturaNo().executar(contexto(pasta, url, modo_contato), entrada_alvo(url), {}, serv)
+    resultado = await CapturaNo().executar(
+        contexto(pasta, url, modo_contato, alvo), entrada_alvo(url, alvo), {}, serv
+    )
     return resultado, serv
 
 
@@ -101,7 +113,7 @@ def test_declaracao():
         True,
         "so_atual",
     )
-    assert set(no.saidas) == {"paginas", "terceiros", "bloqueada", "falhas"}
+    assert set(no.saidas) == {"paginas", "terceiros", "bloqueada", "falhas", "destino", "redirect_ignorado"}
 
 
 async def test_pulado_sem_contato(tmp_path, monkeypatch):
@@ -351,9 +363,10 @@ def test_terceiros_sem_entradas():
 
 # ---------------------------------------------------------------------------- escolha dos links
 
-def escolher(*hrefs, limite=10, inicial="http://exemplo.com/", final=None, alvo="exemplo.com"):
-    """`final` é a URL em que a página inicial terminou depois dos redirects (padrão: a própria inicial)."""
-    return _escolher_links(list(hrefs), inicial, final or inicial, alvo, limite)
+def escolher(*hrefs, limite=10, inicial="http://exemplo.com/", final=None, alvo="exemplo.com", destino=None):
+    """`final` é a URL em que a página inicial terminou depois dos redirects (padrão: a própria inicial); `destino`,
+    o domínio registrável dela quando o redirect trocou de domínio (a saída `destino` da captura)."""
+    return _escolher_links(list(hrefs), inicial, final or inicial, alvo, limite, destino)
 
 
 def test_links_so_do_mesmo_host_com_esquema_http():
@@ -464,6 +477,124 @@ def test_redirect_para_outro_dominio_nao_leva_os_links_junto(final):
 def test_so_a_url_inicial_define_o_host_quando_o_redirect_vai_para_fora():
     assert escolher("https://t.me/termos", final="https://t.me/golpe") == []
     assert escolher("http://exemplo.com/termos", final="https://t.me/golpe") == ["http://exemplo.com/termos"]
+
+
+# ---------------------------------------------------------------------------- destino depois do redirect
+
+
+@pytest.mark.parametrize(
+    ("final", "dominio"),
+    [
+        ("https://phinvestimentos.com/login", "phinvestimentos.com"),
+        ("https://app.phinvestimentos.com.br/entrar?x=1", "phinvestimentos.com.br"),
+        ("http://WWW.Destino.com.br:8080/", "destino.com.br"),
+        ("https://golpe.github.io/", "golpe.github.io"),  # sufixo privado da PSL: o site é o perfil, não o github.io
+    ],
+)
+def test_redirect_para_outro_dominio_registravel_vira_destino(final, dominio):
+    assert _destino_do_redirect(final, "phinv.link") == ({"url": final, "dominio": dominio}, None)
+
+
+@pytest.mark.parametrize(
+    "final",
+    [
+        "https://phinv.link/",
+        "https://www.phinv.link/login",
+        "https://app.PHINV.link/",  # subdomínio do próprio alvo
+        "http://127.0.0.1:8080/",  # IP não tem domínio registrável
+        "http://[2606:4700::1]/",
+        "http://localhost:3000/",
+        "http://intranet/",  # nome sem sufixo público
+        "about:blank",
+        "chrome-error://chromewebdata/",
+        "data:text/html,oi",
+        "ftp://destino.com.br/",  # só http(s) é página
+        "http://[::1",  # URL quebrada
+        "",
+    ],
+)
+def test_sem_troca_de_dominio_registravel_nao_ha_destino(final):
+    assert _destino_do_redirect(final, "phinv.link") == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("final", "dominio"),
+    [
+        ("https://t.me/golpe", "t.me"),
+        ("https://wa.me/5511999999999", "wa.me"),
+        ("https://www.instagram.com/golpe/", "instagram.com"),
+        ("https://linktr.ee/golpe", "linktr.ee"),
+    ],
+)
+def test_redirect_para_plataforma_nao_troca_o_alvo(final, dominio):
+    assert _destino_do_redirect(final, "phinv.link") == (
+        None, {"url": final, "dominio": dominio, "motivo": "plataforma"}
+    )  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("final", "dominio"),
+    [
+        ("https://sedoparking.com/frmpark.php?d=phinv.link", "sedoparking.com"),
+        ("http://ww1.parkingcrew.net/", "parkingcrew.net"),
+        ("https://www.bodis.com/", "bodis.com"),
+        ("https://dan.com/buy-domain/phinv.link", "dan.com"),
+        ("https://www.afternic.com/forsale/phinv.link", "afternic.com"),
+        ("https://www.hugedomains.com/domain_profile.cfm?d=phinv.link", "hugedomains.com"),
+        ("http://above.com/", "above.com"),
+        ("http://parklogic.com/", "parklogic.com"),
+        ("http://undeveloped.com/", "undeveloped.com"),
+    ],
+)
+def test_redirect_para_estacionamento_nao_troca_o_alvo(final, dominio):
+    assert _destino_do_redirect(final, "phinv.link") == (
+        None, {"url": final, "dominio": dominio, "motivo": "estacionamento"}
+    )  # fmt: skip
+
+
+def test_servicos_de_estacionamento_sao_os_da_lista():
+    assert SERVICOS_DE_ESTACIONAMENTO == {
+        "sedoparking.com", "parkingcrew.net", "bodis.com", "dan.com", "afternic.com", "hugedomains.com", "above.com",
+        "parklogic.com", "undeveloped.com",
+    }  # fmt: skip
+
+
+def test_com_destino_as_subpaginas_sao_do_host_do_destino():
+    escolhidas = escolher(
+        "https://phinvestimentos.com/termos",
+        "https://www.phinvestimentos.com/planos",  # www é o mesmo site
+        "https://app.phinvestimentos.com/regras",  # outro host do destino
+        "https://phinv.link/regulamento",  # o redirecionador
+        "https://t.me/golpe",
+        "https://phinvestimentos.com/login",  # a própria página inicial
+        inicial="https://phinv.link/",
+        final="https://phinvestimentos.com/login",
+        alvo="phinv.link",
+        destino="phinvestimentos.com",
+    )
+    assert sorted(escolhidas) == ["https://phinvestimentos.com/termos", "https://www.phinvestimentos.com/planos"]
+
+
+def test_com_destino_num_subdominio_as_subpaginas_sao_desse_host():
+    assert escolher(
+        "https://app.destino.com.br/termos",
+        "https://destino.com.br/planos",
+        "https://exemplo.com/faq",
+        final="https://app.destino.com.br/entrar",
+        destino="destino.com.br",
+    ) == ["https://app.destino.com.br/termos"]
+
+
+def test_terceiros_excluem_o_alvo_e_o_destino():
+    har = {"log": {"entries": [
+        {"request": {"url": "https://phinv.link/"}},
+        {"request": {"url": "https://phinvestimentos.com/login"}},
+        {"request": {"url": "https://cdn.phinvestimentos.com/app.js"}},
+        {"request": {"url": "https://www.googletagmanager.com/gtm.js"}},
+    ]}}  # fmt: skip
+    dados = json.dumps(har).encode()
+    assert _terceiros(dados, "phinv.link", "phinvestimentos.com") == ["googletagmanager.com"]
+    assert _terceiros(dados, "phinv.link") == ["googletagmanager.com", "phinvestimentos.com"]
 
 
 def test_links_de_regras_vem_primeiro_e_o_resto_depois():
@@ -969,6 +1100,114 @@ async def test_redirect_para_outro_dominio_nao_rastreia_o_destino(servidor_local
     assert r.saidas["falhas"] == []
     assert caminhos(pedidos_locais) == ["/saida", "/index.html"]  # nem termos.html nem planos.html
     assert r.saidas["terceiros"] == ["localhost"]
+    # localhost não tem domínio registrável: não é destino, e não há o que ignorar
+    assert (r.saidas["destino"], r.saidas["redirect_ignorado"]) == (None, None)
+
+
+# Dois nomes locais (o Chromium resolve os dois para 127.0.0.1 com `--host-resolver-rules`): o alvo só redireciona
+# para a página de entrada do destino, que é o site sintético
+ALVO_LOCAL = "alvo-sintetico.com.br"
+DESTINO_LOCAL = "destino-sintetico.com.br"
+
+
+class _DoisNomes(SimpleHTTPRequestHandler):
+    def do_GET(self) -> None:
+        host = (self.headers.get("Host") or "").rpartition(":")[0]
+        self.server.pedidos.append((host, self.path))
+        if host == ALVO_LOCAL:
+            self.send_response(302)
+            self.send_header("Location", f"http://{DESTINO_LOCAL}:{self.server.server_port}/index.html")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        super().do_GET()
+
+    def log_message(self, *a) -> None:
+        pass
+
+
+@contextmanager
+def _alvo_que_redireciona(monkeypatch):
+    regras = f"--host-resolver-rules=MAP {ALVO_LOCAL} 127.0.0.1, MAP {DESTINO_LOCAL} 127.0.0.1"
+    monkeypatch.setattr(modulo_captura, "ARGS_DO_NAVEGADOR", (*modulo_captura.ARGS_DO_NAVEGADOR, regras))
+    servidor = ThreadingHTTPServer(("127.0.0.1", 0), partial(_DoisNomes, directory=str(SITE)))
+    servidor.daemon_threads = True
+    servidor.pedidos = []
+    threading.Thread(target=servidor.serve_forever, daemon=True).start()
+    try:
+        yield servidor
+    finally:
+        servidor.shutdown()
+        servidor.server_close()
+
+
+@lento
+async def test_redirect_para_outro_dominio_captura_as_subpaginas_do_destino(tmp_path, monkeypatch):
+    with _alvo_que_redireciona(monkeypatch) as servidor:
+        porta = servidor.server_port
+        r, serv = await capturar(tmp_path, f"http://{ALVO_LOCAL}:{porta}/", alvo=ALVO_LOCAL, max_subpaginas=2)
+    destino = f"http://{DESTINO_LOCAL}:{porta}"
+    assert r.saidas["destino"] == {"url": f"{destino}/index.html", "dominio": DESTINO_LOCAL}
+    assert r.saidas["redirect_ignorado"] is None
+    assert [p["url"] for p in r.saidas["paginas"]] == [
+        f"{destino}/index.html", f"{destino}/planos.html", f"{destino}/termos.html"
+    ]  # fmt: skip
+    # o alvo recebeu só a visita inicial; as subpáginas foram pedidas ao destino
+    assert sorted(set(servidor.pedidos)) == [
+        (ALVO_LOCAL, "/"), (DESTINO_LOCAL, "/index.html"), (DESTINO_LOCAL, "/planos.html"),
+        (DESTINO_LOCAL, "/termos.html"),
+    ]  # fmt: skip
+    # o alvo e o destino são o site: nenhum dos dois é terceiro
+    assert r.saidas["terceiros"] == []
+    assert r.saidas["falhas"] == [] and r.saidas["bloqueada"] is False
+    assert verificar(tmp_path) == []
+
+
+def _visita(url: str, links: list[str] | None = None) -> modulo_captura._Visita:
+    return modulo_captura._Visita(url, 200, {}, "pagina", "<html>x</html>", "texto da pagina", PNG, links or [])
+
+
+@lento
+@pytest.mark.parametrize(
+    ("final", "dominio", "motivo"),
+    [
+        ("https://t.me/golpe_oficial", "t.me", "plataforma"),
+        ("https://www.instagram.com/golpe/", "instagram.com", "plataforma"),
+        ("https://sedoparking.com/frmpark.php?d=exemplo.com.br", "sedoparking.com", "estacionamento"),
+        ("http://ww1.parkingcrew.net/", "parkingcrew.net", "estacionamento"),
+    ],
+)
+async def test_redirect_para_plataforma_ou_estacionamento_mantem_o_alvo(tmp_path, monkeypatch, final, dominio, motivo):
+    host = final.split("/")[2]
+    visitadas = []
+
+    async def visitar(contexto, url, cfg, com_links, guarda):
+        visitadas.append(url)
+        if url == "https://exemplo.com.br/":
+            return _visita(final, [f"https://{host}/termos", "https://exemplo.com.br/planos"])
+        return _visita(url)
+
+    monkeypatch.setattr(modulo_captura, "_visitar", visitar)
+    r, _ = await capturar(tmp_path, "https://exemplo.com.br/", alvo="exemplo.com.br", max_subpaginas=5)
+    assert r.saidas["destino"] is None
+    assert r.saidas["redirect_ignorado"] == {"url": final, "dominio": dominio, "motivo": motivo}
+    # a plataforma e o estacionamento não são rastreados: só os links do alvo
+    assert visitadas == ["https://exemplo.com.br/", "https://exemplo.com.br/planos"]
+
+
+@lento
+async def test_destino_tambem_vale_quando_a_pagina_do_destino_e_um_desafio(tmp_path, monkeypatch):
+    async def visitar(contexto, url, cfg, com_links, guarda):
+        return modulo_captura._Visita(
+            "https://phinvestimentos.com/login", 403, {}, "Just a moment...", "<html>cf-chl</html>", "", PNG, []
+        )
+
+    monkeypatch.setattr(modulo_captura, "_visitar", visitar)
+    r, _ = await capturar(tmp_path, "https://phinv.link/", alvo="phinv.link")
+    assert r.saidas["bloqueada"] is True
+    # o redirect foi visto antes do desafio: o Wayback e os coletores olham o destino
+    assert r.saidas["destino"] == {"url": "https://phinvestimentos.com/login", "dominio": "phinvestimentos.com"}
+    assert r.saidas["redirect_ignorado"] is None
 
 
 # ---------------------------------------------------------------------------- opsec da captura (I5)

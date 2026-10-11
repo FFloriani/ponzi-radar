@@ -72,6 +72,46 @@ def test_dominio_do_alvo_entra_mesmo_sem_o_ct():
     assert mascara == {"exemplo.com.br": "[ALVO]"}
 
 
+def test_destino_do_redirect_tambem_vira_alvo():
+    # o modo cego esconde o redirecionador e o site para onde ele manda: os dois identificam o esquema
+    saidas = {
+        "alvo": {"dominio": "phinv.link"},
+        "destino": {
+            "dominio": "phinvestimentos.com",
+            "redirecionado_de": "phinv.link",
+            "url_destino": "https://app.phinvestimentos.com/login?ref=1",
+        },
+    }
+    mascara = montar_mascara(saidas, sem_artefatos)
+    assert mascara == {
+        "phinv.link": "[ALVO]",
+        "phinvestimentos.com": "[ALVO]",
+        "app.phinvestimentos.com": "[ALVO]",
+    }
+    texto = "Entre em https://app.phinvestimentos.com/login (antes phinv.link), ou PHINVESTIMENTOS.COM."
+    assert mascarar(texto, mascara) == "Entre em https://[ALVO]/login (antes [ALVO]), ou [ALVO]."
+
+
+def test_destino_sem_redirect_nao_muda_a_mascara():
+    saidas = {"alvo": {"dominio": "exemplo.com.br"},
+              "destino": {"dominio": "exemplo.com.br", "redirecionado_de": None, "url_destino": None}}  # fmt: skip
+    assert montar_mascara(saidas, sem_artefatos) == {"exemplo.com.br": "[ALVO]"}
+
+
+def test_destino_idn_entra_nas_duas_grafias_e_da_rotulo_ao_titulo():
+    destino = {"dominio": ALVO_PUNYCODE, "redirecionado_de": "curto.link", "url_destino": f"https://{ALVO_PUNYCODE}/"}
+    mascara = com_titulo("Investimentoseguro-Ação | Entrar", alvo={"dominio": "curto.link"}, destino=destino)
+    assert mascara[ALVO_PUNYCODE] == mascara[ALVO_IDN] == "[ALVO]"
+    # o rótulo do destino liga a marca do título à empresa, como o do alvo
+    assert "Investimentoseguro-Ação" in termos_da_empresa(mascara)
+
+
+@pytest.mark.parametrize("url", ["não é url", "http://[::1", None, 7, "https://", "mailto:x@y.z"])
+def test_url_do_destino_estranha_nao_derruba(url):
+    saidas = {"destino": {"dominio": "destino.com.br", "redirecionado_de": "a.link", "url_destino": url}}
+    assert montar_mascara(saidas, sem_artefatos) == {"destino.com.br": "[ALVO]"}
+
+
 def test_dominio_idn_entra_em_punycode_e_em_unicode():
     sans = [ALVO_PUNYCODE, "www." + ALVO_PUNYCODE, "app." + ALVO_IDN]
     saidas = {"alvo": {"dominio": ALVO_PUNYCODE}, "ct": {"sans": sans}}

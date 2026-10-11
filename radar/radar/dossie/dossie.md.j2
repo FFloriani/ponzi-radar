@@ -4,6 +4,12 @@
 ## 1. Identificação
 
 - **Alvo:** {{ cab.alvo|md }} ({{ cab.url_inicial|cod }})
+{% if cab.redirecionamento %}
+- **Redirecionamento:** {{ cab.redirecionamento.de|md }} → {{ cab.redirecionamento.url|cod }}; os coletores analisaram {{ cab.redirecionamento.dominio|md }}
+{% endif %}
+{% if cab.redirect_ignorado %}
+- **Redireciona para** {{ cab.redirect_ignorado.url|cod }} ({{ cab.redirect_ignorado.motivo|md }}): análise mantida em {{ cab.alvo|md }}
+{% endif %}
 {% if cab.parametros_removidos %}
 - **Parâmetros de indicação removidos da URL:** {{ cab.parametros_removidos|join(", ")|md }}
 {% endif %}

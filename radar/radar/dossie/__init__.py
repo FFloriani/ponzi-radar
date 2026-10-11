@@ -172,7 +172,27 @@ def _cabecalho(ex: ExecucaoSalva, matriz: Matriz, pasta: Path) -> dict:
         "hash_custodia": hash_custodia,
         "custodia_ilegivel": custodia_ilegivel,
         "parametros_removidos": _parametros_removidos(ex),
+        "redirecionamento": _redirecionamento(ex),
+        "redirect_ignorado": _redirect_ignorado(ex),
     }
+
+
+def _redirecionamento(ex: ExecucaoSalva) -> dict | None:
+    """O redirect que os coletores seguiram (saída do nó `destino`): `{"de", "url", "dominio"}`, ou `None` sem ele."""
+    destino = saida(ex, "destino") or {}
+    de, url, dominio = destino.get("redirecionado_de"), destino.get("url_destino"), destino.get("dominio")
+    if not all(isinstance(valor, str) and valor for valor in (de, url, dominio)):
+        return None
+    return {"de": de, "url": url, "dominio": dominio}
+
+
+def _redirect_ignorado(ex: ExecucaoSalva) -> dict | None:
+    """O redirect da página inicial para plataforma ou estacionamento, que a captura não seguiu (`redirect_ignorado`):
+    `{"url", "motivo"}`, ou `None` sem ele."""
+    ignorado = (saida(ex, "captura") or {}).get("redirect_ignorado")
+    if not isinstance(ignorado, dict) or not isinstance(ignorado.get("url"), str) or not ignorado["url"]:
+        return None
+    return {"url": ignorado["url"], "motivo": str(ignorado.get("motivo") or _NA)}
 
 
 def _parametros_removidos(ex: ExecucaoSalva) -> list[str]:

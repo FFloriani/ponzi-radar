@@ -975,6 +975,54 @@ async def test_arquivar_fonte_recusa_o_alvo_e_o_ip_dele(abrir):
     assert r == {"erro": "fonte recusada: IP não público (loopback): 127.0.0.1"}
 
 
+DESTINO = "phinvestimentos.com"
+
+
+class Destino(NoBase):
+    """O `destino` depois de um redirect do alvo para `DESTINO` (o nó real lê a captura)."""
+
+    nome = "destino"
+    entradas = ("alvo",)
+
+    async def executar(self, ctx, entradas, respostas, s):
+        return Feito({"dominio": DESTINO, "redirecionado_de": ctx.alvo, "url_destino": f"https://app.{DESTINO}/login"})
+
+
+async def test_arquivar_fonte_recusa_o_destino_do_redirect(abrir, monkeypatch):
+    chamadas = espiar_validar(monkeypatch)
+    srv = await abrir([AlvoNo(), Coleta(), Destino(), Dns(), Pend("pend_a1", "P-A1")])
+    run_id = await iniciar(srv)
+    for url in (f"https://{DESTINO}/login", f"https://app.{DESTINO}/termos", f"https://{ALVO}/planos"):
+        r = await chamar(srv, "arquivar_fonte", run_id=run_id, url=url)
+        assert r["erro"].startswith("fonte recusada: o alvo só é acessado pela captura"), (url, r)
+    # a validação recebe o domínio do destino e recusa a evidência que cita uma página dele
+    r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-A1",
+                     resposta=resposta_a1(f"https://{DESTINO}/planos"))  # fmt: skip
+    assert r["aceita"] is False and r["motivo"].startswith("fonte recusada: o alvo só é acessado pela captura"), r
+    assert [c["dominio_destino"] for c in chamadas] == [DESTINO]
+
+
+async def test_sem_no_destino_a_validacao_so_conhece_o_alvo(abrir, monkeypatch):
+    chamadas = espiar_validar(monkeypatch)
+    srv = await abrir()
+    run_id = await iniciar(srv)
+    await chamar(srv, "responder_pendencia", run_id=run_id, id="P-A1", resposta=NAO_ENCONTRADO)
+    assert chamadas[0]["dominio_destino"] is None
+
+
+async def test_modo_cego_mascara_o_destino_do_redirect(abrir, tmp_path):
+    texto = f"Entre pela https://app.{DESTINO}/login ou por {DESTINO}."
+    srv = await abrir([AlvoNo(), Coleta(texto=texto), Destino(), Dns(), Pend("pend_a1", "P-A1")])
+    run_id = await iniciar(srv, modo_cego=True)
+    lido = (await chamar(srv, "ver_artefato", run_id=run_id, sha256=artefatos(tmp_path, run_id)["txt"]))["texto"]
+    assert lido.endswith("Entre pela https://[ALVO]/login ou por [ALVO].") and "phinvest" not in lido
+    mascara = ler_json(pasta(tmp_path, run_id) / "mascara.json")
+    assert mascara[DESTINO] == mascara[f"app.{DESTINO}"] == "[ALVO]"
+    # a recusa não diz que o endereço é o do alvo
+    r = await chamar(srv, "arquivar_fonte", run_id=run_id, url=f"https://{DESTINO}/termos")
+    assert r == {"erro": "fonte recusada: domínio não permitido"}
+
+
 async def test_arquivar_fonte_que_nao_baixa(abrir, respx_mock, dns_publico):
     srv = await abrir()
     run_id = await iniciar(srv)

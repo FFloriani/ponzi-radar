@@ -43,6 +43,7 @@ from radar.nos.captura import CapturaNo
 from radar.nos.cnpj import CnpjNo
 from radar.nos.ct import CtNo
 from radar.nos.cvm import CvmAlertasNo, CvmSancionadorNo, RegistrosNo
+from radar.nos.destino import DestinoNo
 from radar.nos.dns import DnsNo
 from radar.nos.extracao import ExtracaoNo
 from radar.nos.pendencias import PendNo
@@ -85,14 +86,9 @@ def contexto(pasta: Path, as_of: date, alvo: str = "petrobras.com.br") -> Contex
     )
 
 
-def entrada_alvo(dominio: str = "petrobras.com.br") -> dict[str, dict]:
-    return {
-        "alvo": {
-            "dominio": dominio,
-            "slug": dominio.replace(".", "-"),
-            "url_inicial": f"https://{dominio}/",
-        }
-    }
+def entrada_destino(dominio: str = "petrobras.com.br") -> dict[str, dict]:
+    """A entrada dos coletores de domínio: o nó `destino` sem redirect (o domínio do alvo)."""
+    return {"destino": {"dominio": dominio, "redirecionado_de": None, "url_destino": None}}
 
 
 @pytest.fixture
@@ -295,7 +291,7 @@ async def test_no_alvo_repassa_dominio_slug_e_url(ctx_hoje, serv):
 
 async def test_rdap_br_extrai_cnpj(respx_mock, ctx_hoje, serv):
     rota = respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(200, json=fixture("rdap_registrobr_petrobras")))
-    resultado = await RdapNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+    resultado = await RdapNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert resultado == Feito(
         {
             "registro": "1996-06-14",  # o evento do domínio, não o da entidade titular (1998-01-12)
@@ -314,7 +310,7 @@ async def test_rdap_br_extrai_cnpj(respx_mock, ctx_hoje, serv):
 
 async def test_rdap_retroativo_sem_titular(respx_mock, ctx_2019, serv):
     respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(200, json=fixture("rdap_registrobr_petrobras")))
-    resultado = await RdapNo().executar(ctx_2019, entrada_alvo(), {}, serv)
+    resultado = await RdapNo().executar(ctx_2019, entrada_destino(), {}, serv)
     saidas = resultado.saidas
     assert saidas["cnpj_titular"] is None
     assert saidas["vazamento_temporal"] == ["cnpj_titular"]
@@ -328,7 +324,7 @@ async def test_rdap_com_via_rdap_org(respx_mock, tmp_path, serv):
         return_value=httpx.Response(302, headers={"location": destino})
     )
     respx_mock.get(destino).mock(return_value=httpx.Response(200, json=fixture("rdap_org_example")))
-    resultado = await RdapNo().executar(ctx, entrada_alvo("example.com"), {}, serv)
+    resultado = await RdapNo().executar(ctx, entrada_destino("example.com"), {}, serv)
     assert resultado.saidas == {
         "registro": "1995-08-14",
         "expiracao": "2027-08-13",
@@ -343,7 +339,7 @@ async def test_rdap_registrador_cai_no_handle_sem_vcard(respx_mock, tmp_path, se
     dados = copy.deepcopy(fixture("rdap_org_example"))
     dados["entities"][0].pop("vcardArray")
     respx_mock.get("https://rdap.org/domain/example.com").mock(return_value=httpx.Response(200, json=dados))
-    resultado = await RdapNo().executar(ctx, entrada_alvo("example.com"), {}, serv)
+    resultado = await RdapNo().executar(ctx, entrada_destino("example.com"), {}, serv)
     assert resultado.saidas["registrador"] == "376"
 
 
@@ -351,7 +347,7 @@ async def test_rdap_titular_pessoa_fisica_nao_vira_cnpj_nas_saidas(respx_mock, c
     dados = copy.deepcopy(fixture("rdap_registrobr_petrobras"))
     dados["entities"][0]["publicIds"] = [{"type": "cpf", "identifier": "123.456.789-09"}]
     respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(200, json=dados))
-    resultado = await RdapNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+    resultado = await RdapNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert resultado.saidas["cnpj_titular"] is None
     assert "12345678909" not in json.dumps(resultado.saidas)
 
@@ -376,14 +372,14 @@ async def test_rdap_cnpj_do_titular_numerico_ou_alfanumerico(respx_mock, ctx_hoj
     dados = copy.deepcopy(fixture("rdap_registrobr_petrobras"))
     dados["entities"][0]["publicIds"] = [{"type": "cnpj", "identifier": identificador}]
     respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(200, json=dados))
-    resultado = await RdapNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+    resultado = await RdapNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert resultado.saidas["cnpj_titular"] == esperado
     assert "12345678909" not in json.dumps(resultado.saidas)
 
 
 async def test_rdap_sem_eventos_devolve_none(respx_mock, ctx_hoje, serv):
     respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(200, json={"objectClassName": "domain"}))
-    resultado = await RdapNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+    resultado = await RdapNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert resultado.saidas == {
         "registro": None,
         "expiracao": None,
@@ -396,7 +392,7 @@ async def test_rdap_sem_eventos_devolve_none(respx_mock, ctx_hoje, serv):
 async def test_rdap_404_vira_erro_permanente_com_mensagem(respx_mock, ctx_hoje, serv):
     respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(404))
     with pytest.raises(ErroNo) as e:
-        await RdapNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+        await RdapNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert e.value.permanente is True
     assert "rdap" in e.value.mensagem.lower() and "404" in e.value.mensagem
 
@@ -404,7 +400,7 @@ async def test_rdap_404_vira_erro_permanente_com_mensagem(respx_mock, ctx_hoje, 
 async def test_rdap_503_esgotado_vira_erro_nao_permanente(respx_mock, ctx_hoje, serv):
     rota = respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(503))
     with pytest.raises(ErroNo) as e:
-        await RdapNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+        await RdapNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert e.value.permanente is False
     assert rota.call_count == 4
 
@@ -413,14 +409,14 @@ async def test_rdap_503_esgotado_vira_erro_nao_permanente(respx_mock, ctx_hoje, 
 async def test_rdap_formato_inesperado_e_erro_permanente(respx_mock, ctx_hoje, serv, corpo):
     respx_mock.get(URL_RDAP_BR).mock(return_value=httpx.Response(200, content=corpo))
     with pytest.raises(ErroNo) as e:
-        await RdapNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+        await RdapNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert e.value.permanente is True and e.value.mensagem
     assert len(log_custodia(ctx_hoje.pasta)) == 1  # o bruto fica guardado mesmo assim
 
 
 def test_rdap_declaracao():
     no = RdapNo()
-    assert (no.nome, no.entradas, no.toca_alvo) == ("rdap", ("alvo",), False)
+    assert (no.nome, no.entradas, no.toca_alvo) == ("rdap", ("destino",), False)
     assert set(no.saidas) == {"registro", "expiracao", "registrador", "cnpj_titular", "vazamento_temporal"}
 
 
@@ -455,7 +451,7 @@ async def test_dns_mx_e_nxdomain(respx_mock, ctx_hoje, serv):
             "TXT": _doh(0, 16, (16, '"v=spf1 include:spf.protection.outlook.com -all"')),
         },
     )
-    resultado = await DnsNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+    resultado = await DnsNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert resultado.saidas == {
         "A": ["203.0.113.10", "203.0.113.11"],
         "AAAA": [],
@@ -481,7 +477,7 @@ async def test_dns_status_3_na_consulta_a_e_nxdomain(respx_mock, ctx_hoje, serv)
     nx = fixture("doh_nxdomain")
     assert nx["Status"] == 3
     _rota_doh(respx_mock, dict.fromkeys(("A", "AAAA", "MX", "NS", "TXT"), nx))
-    resultado = await DnsNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+    resultado = await DnsNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert resultado.saidas == {
         "A": [],
         "AAAA": [],
@@ -500,7 +496,7 @@ async def test_dns_um_tipo_com_erro_derruba_o_no(respx_mock, ctx_hoje, serv):
 
     respx_mock.get(URL_DOH).mock(side_effect=responder)
     with pytest.raises(ErroNo) as e:
-        await DnsNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+        await DnsNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert e.value.permanente is True
     assert "TXT" in e.value.mensagem
 
@@ -515,7 +511,7 @@ async def test_dns_status_de_falha_de_resolucao_vira_erro(respx_mock, ctx_hoje, 
 
     respx_mock.get(URL_DOH).mock(side_effect=responder)
     with pytest.raises(ErroNo) as e:
-        await DnsNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+        await DnsNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert e.value.permanente is False
     assert f"DNS {tipo}: Status {status}" in e.value.mensagem
     assert "petrobras.com.br" in e.value.mensagem
@@ -532,7 +528,7 @@ async def test_dns_status_ausente_ou_estranho_tambem_e_erro(respx_mock, ctx_hoje
         corpo["Status"] = status
     respx_mock.get(URL_DOH).mock(return_value=httpx.Response(200, json=corpo))
     with pytest.raises(ErroNo) as e:
-        await DnsNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+        await DnsNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert e.value.permanente is False
     assert "DNS A: Status" in e.value.mensagem
 
@@ -540,13 +536,13 @@ async def test_dns_status_ausente_ou_estranho_tambem_e_erro(respx_mock, ctx_hoje
 async def test_dns_corpo_que_nao_e_json_e_erro_permanente(respx_mock, ctx_hoje, serv):
     respx_mock.get(URL_DOH).mock(return_value=httpx.Response(200, content=b"<html>"))
     with pytest.raises(ErroNo) as e:
-        await DnsNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+        await DnsNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert e.value.permanente is True and e.value.mensagem
 
 
 def test_dns_declaracao():
     no = DnsNo()
-    assert (no.nome, no.entradas, no.as_of, no.toca_alvo) == ("dns", ("alvo",), "so_atual", False)
+    assert (no.nome, no.entradas, no.as_of, no.toca_alvo) == ("dns", ("destino",), "so_atual", False)
     assert set(no.saidas) == {"A", "AAAA", "MX", "NS", "TXT", "nxdomain"}
 
 
@@ -561,7 +557,7 @@ def _rota_crtsh(respx_mock, corpo):
 
 async def test_ct_filtra_por_as_of(respx_mock, ctx_2019, serv):
     rota = _rota_crtsh(respx_mock, fixture("crtsh"))
-    resultado = await CtNo().executar(ctx_2019, entrada_alvo(), {}, serv)
+    resultado = await CtNo().executar(ctx_2019, entrada_destino(), {}, serv)
     # as_of 2019-06-06 é o not_before de um dos certificados: o limite entra (<=)
     assert resultado.saidas == {
         "primeiro_certificado": "2004-02-17",
@@ -586,14 +582,14 @@ async def test_ct_filtra_por_as_of(respx_mock, ctx_2019, serv):
 async def test_ct_no_dia_anterior_ao_limite_exclui_o_certificado_do_dia(respx_mock, tmp_path, serv):
     _rota_crtsh(respx_mock, fixture("crtsh"))
     ctx = contexto(tmp_path, date(2019, 6, 5))
-    saidas = (await CtNo().executar(ctx, entrada_alvo(), {}, serv)).saidas
+    saidas = (await CtNo().executar(ctx, entrada_destino(), {}, serv)).saidas
     assert saidas["total"] == 5
     assert "panm.petrobras.com.br" not in saidas["sans"]
 
 
 async def test_ct_hoje_conta_tudo_e_tira_o_curinga(respx_mock, ctx_hoje, serv):
     _rota_crtsh(respx_mock, fixture("crtsh"))
-    saidas = (await CtNo().executar(ctx_hoje, entrada_alvo(), {}, serv)).saidas
+    saidas = (await CtNo().executar(ctx_hoje, entrada_destino(), {}, serv)).saidas
     assert saidas["total"] == 10
     assert saidas["primeiro_certificado"] == "2004-02-17"
     assert "petrobras.com.br" in saidas["sans"]  # veio de "*.petrobras.com.br" e do apex
@@ -605,7 +601,7 @@ async def test_ct_hoje_conta_tudo_e_tira_o_curinga(respx_mock, ctx_hoje, serv):
 async def test_ct_antes_do_primeiro_certificado(respx_mock, tmp_path, serv):
     _rota_crtsh(respx_mock, fixture("crtsh"))
     ctx = contexto(tmp_path, date(2000, 1, 1))
-    resultado = await CtNo().executar(ctx, entrada_alvo(), {}, serv)
+    resultado = await CtNo().executar(ctx, entrada_destino(), {}, serv)
     assert resultado.saidas == {"primeiro_certificado": None, "total": 0, "sans": []}
 
 
@@ -620,7 +616,7 @@ async def test_ct_normaliza_sans_e_ignora_certificado_sem_data(respx_mock, ctx_h
             {"name_value": "sem-campo.petrobras.com.br"},
         ],
     )
-    resultado = await CtNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+    resultado = await CtNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert resultado.saidas == {
         "primeiro_certificado": "2023-01-02",
         "total": 2,
@@ -630,7 +626,7 @@ async def test_ct_normaliza_sans_e_ignora_certificado_sem_data(respx_mock, ctx_h
 
 async def test_ct_lista_vazia(respx_mock, ctx_hoje, serv):
     _rota_crtsh(respx_mock, [])
-    resultado = await CtNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+    resultado = await CtNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert resultado.saidas == {"primeiro_certificado": None, "total": 0, "sans": []}
 
 
@@ -638,20 +634,20 @@ async def test_ct_lista_vazia(respx_mock, ctx_hoje, serv):
 async def test_ct_formato_inesperado_e_erro_permanente(respx_mock, ctx_hoje, serv, corpo):
     respx_mock.get(URL_CRTSH).mock(return_value=httpx.Response(200, content=corpo))
     with pytest.raises(ErroNo) as e:
-        await CtNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+        await CtNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert e.value.permanente is True and e.value.mensagem
 
 
 async def test_ct_503_esgotado_vira_erro_nao_permanente(respx_mock, ctx_hoje, serv):
     respx_mock.get(URL_CRTSH).mock(return_value=httpx.Response(503))
     with pytest.raises(ErroNo) as e:
-        await CtNo().executar(ctx_hoje, entrada_alvo(), {}, serv)
+        await CtNo().executar(ctx_hoje, entrada_destino(), {}, serv)
     assert e.value.permanente is False and "crt.sh" in e.value.mensagem
 
 
 def test_ct_declaracao():
     no = CtNo()
-    assert (no.nome, no.entradas, no.as_of, no.toca_alvo) == ("ct", ("alvo",), "exato", False)
+    assert (no.nome, no.entradas, no.as_of, no.toca_alvo) == ("ct", ("destino",), "exato", False)
     assert set(no.saidas) == {"primeiro_certificado", "total", "sans"}
 
 
@@ -942,11 +938,11 @@ async def test_carregar_execucao_aponta_para_a_pasta_atual(tmp_path):
 def test_nos_do_nucleo():
     nos = nos_do_nucleo()
     assert [type(n) for n in nos] == [
-        AlvoNo, RdapNo, DnsNo, CtNo, WaybackIndiceNo, CapturaNo, WaybackSnapshotNo, ExtracaoNo, CnpjNo,
+        AlvoNo, CapturaNo, DestinoNo, RdapNo, DnsNo, CtNo, WaybackIndiceNo, WaybackSnapshotNo, ExtracaoNo, CnpjNo,
         RegistrosNo, CvmSancionadorNo, CvmAlertasNo, *[PendNo] * 9,
     ]
     assert [n.nome for n in nos] == [
-        "alvo", "rdap", "dns", "ct", "wayback_indice", "captura", "wayback_snapshot", "extracao", "cnpj",
+        "alvo", "captura", "destino", "rdap", "dns", "ct", "wayback_indice", "wayback_snapshot", "extracao", "cnpj",
         "registros", "cvm_sancionador", "cvm_alertas",
         "pend_a1", "pend_a2", "pend_a3", "pend_b", "pend_c", "pend_c4", "pend_d1", "pend_d4", "pend_e",
     ]
@@ -1031,7 +1027,7 @@ async def test_nucleo_ponta_a_ponta_em_modo_atual(respx_mock, tmp_path):
     mocar_deliberacoes(respx_mock)
     ctx, motor = await _rodar_nucleo(tmp_path, None, com_indices=True)
     assert motor.status() == {
-        "alvo": "feito", "rdap": "feito", "dns": "feito", "ct": "feito", "wayback_indice": "feito",
+        "alvo": "feito", "destino": "feito", "rdap": "feito", "dns": "feito", "ct": "feito", "wayback_indice": "feito",
         "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito", "cnpj": "feito",
         "registros": "feito", "cvm_sancionador": "feito", "cvm_alertas": "feito", **PEND_COM_CNPJ,
     }
@@ -1043,6 +1039,8 @@ async def test_nucleo_ponta_a_ponta_em_modo_atual(respx_mock, tmp_path):
     # sem captura ao vivo, a página vem do Wayback (a home do CDX mockado)
     assert [p["url"] for p in ex.saidas["wayback_snapshot"]["paginas"]] == ["http://www.example.com/"]
     assert ex.saidas["alvo"]["dominio"] == "petrobras.com.br"
+    # sem captura não há redirect a seguir: os coletores analisam o alvo
+    assert ex.saidas["destino"] == {"dominio": "petrobras.com.br", "redirecionado_de": None, "url_destino": None}
     assert ex.saidas["rdap"]["cnpj_titular"] == "33000167000101"
     assert ex.saidas["dns"]["MX"] == ["20 petrobras-com-br.mail.protection.outlook.com."]
     assert ex.saidas["ct"]["total"] == 10
@@ -1134,7 +1132,7 @@ async def test_nucleo_retroativo_pula_dns_e_esconde_o_titular(respx_mock, tmp_pa
     ctx, motor = await _rodar_nucleo(tmp_path, date(2019, 6, 6))
     # sem titular (o RDAP não o entrega no modo retroativo) e sem CNPJ na página: abre a P-CNPJ
     assert motor.status() == {
-        "alvo": "feito", "rdap": "feito", "dns": "pulado", "ct": "feito", "wayback_indice": "feito",
+        "alvo": "feito", "destino": "feito", "rdap": "feito", "dns": "pulado", "ct": "feito", "wayback_indice": "feito",
         "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito", "cnpj": "aguardando",
         "registros": "pendente", "cvm_sancionador": "pendente", "cvm_alertas": "pendente",  # esperam a P-CNPJ
         **PEND_SEM_CNPJ,
@@ -1164,7 +1162,7 @@ async def test_nucleo_dns_servfail_deixa_o_no_em_erro_e_sem_saidas(respx_mock, t
     _rota_doh(respx_mock, dict.fromkeys(("A", "AAAA", "MX", "NS", "TXT"), _doh(2, 1)))
     ctx, motor = await _rodar_nucleo(tmp_path, None)
     assert motor.status() == {
-        "alvo": "feito", "rdap": "feito", "dns": "erro", "ct": "feito", "wayback_indice": "feito",
+        "alvo": "feito", "destino": "feito", "rdap": "feito", "dns": "erro", "ct": "feito", "wayback_indice": "feito",
         "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito", "cnpj": "feito",
         "registros": "erro", "cvm_sancionador": "erro", "cvm_alertas": "erro",
         **PEND_COM_CNPJ,  # I6: a P-C4 abre mesmo com a `cvm_alertas` em erro, com o aviso nos critérios
@@ -1188,7 +1186,7 @@ async def test_nucleo_rdap_em_erro_nao_derruba_dns_e_ct(respx_mock, tmp_path):
     ctx, motor = await _rodar_nucleo(tmp_path, None)
     # o `rdap` é opcional do `cnpj`: sem ele e sem CNPJ na página, o nó abre a P-CNPJ em vez de cair em erro
     assert motor.status() == {
-        "alvo": "feito", "rdap": "erro", "dns": "feito", "ct": "feito", "wayback_indice": "feito",
+        "alvo": "feito", "destino": "feito", "rdap": "erro", "dns": "feito", "ct": "feito", "wayback_indice": "feito",
         "captura": "pulado", "wayback_snapshot": "feito", "extracao": "feito", "cnpj": "aguardando",
         "registros": "pendente", "cvm_sancionador": "pendente", "cvm_alertas": "pendente",
         **PEND_SEM_CNPJ,

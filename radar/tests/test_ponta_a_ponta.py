@@ -58,7 +58,7 @@ URL_DOCUMENTO_905 = "https://conteudo.cvm.gov.br/legislacao/deliberacoes/anexos/
 
 # status final de cada nó: tudo feito, menos o snapshot (a captura deu certo) e a P-A2 (sem histórico na página)
 STATUS_FINAL = {
-    "alvo": "feito", "rdap": "feito", "dns": "feito", "ct": "feito", "wayback_indice": "feito", "captura": "feito",
+    "alvo": "feito", "destino": "feito", "rdap": "feito", "dns": "feito", "ct": "feito", "wayback_indice": "feito", "captura": "feito",
     "wayback_snapshot": "pulado", "extracao": "feito", "cnpj": "feito", "registros": "feito",
     "cvm_sancionador": "feito", "cvm_alertas": "feito", "pend_a1": "feito", "pend_a2": "pulado", "pend_a3": "feito",
     "pend_b": "feito", "pend_c": "feito", "pend_c4": "feito", "pend_d1": "feito", "pend_d4": "feito",
@@ -303,6 +303,9 @@ async def test_piramide_sintetica_ponta_a_ponta(respx_mock, servidor_local, pedi
     assert motor.status() == STATUS_FINAL
     assert motor.saidas("cnpj")["cnpj"] == CNPJ
     assert motor.saidas("extracao")["fonte"] == "captura"
+    # a página do site sintético não redireciona para outro domínio: os coletores analisaram o próprio alvo
+    assert motor.saidas("destino") == {"dominio": ALVO, "redirecionado_de": None, "url_destino": None}
+    assert (captura["destino"], captura["redirect_ignorado"]) == (None, None)
     # o navegador só pediu as páginas do site sintético: a inicial e as três subpáginas que ela liga
     assert sorted({p.caminho for p in pedidos_locais}) == ["/", "/contato.html", "/planos.html", "/termos.html"]
 

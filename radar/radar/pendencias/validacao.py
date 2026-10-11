@@ -18,7 +18,8 @@ para o dossiê pôr a marca só no item que cita aquela evidência.
 
 `arquivar_fonte` é o único lugar por onde uma URL dada pelo Claude chega à rede. Ele recusa o que não é fonte
 pública: esquema que não é http(s), `localhost`, nome malformado, IP ou nome que resolve para IP não global, o
-alvo e o IP dele (só o nó `captura` o visita) e serviços que fazem um terceiro visitar o alvo. Cada salto de
+alvo, o destino para onde ele redireciona (saída do nó `destino`) e os IPs do domínio analisado (só o nó `captura`
+visita o site) e serviços que fazem um terceiro visitar o alvo. Cada salto de
 redirect passa pelas mesmas regras: sem isso, um endereço público que redireciona para `http://127.0.0.1/`
 passaria. Com proxy configurado o nome não é resolvido aqui (quem resolve é o proxy). A resolução e a conexão são
 consultas separadas: um nome que muda de IP entre elas (DNS rebinding) não é detectado.
@@ -316,16 +317,31 @@ def _canonicos(ips: set[str] | None) -> frozenset[str]:
     return frozenset(canonicos)
 
 
+def _dominios_do_alvo(ctx: Contexto, dominio_destino: str | None) -> frozenset[str]:
+    """Os domínios registráveis que só a captura visita: o do alvo e o do destino do redirect (saída `dominio` do nó
+    `destino`), em minúsculas e em punycode, como `dominio_registravel` os devolve."""
+    dominios = {ctx.alvo.lower()}
+    if isinstance(dominio_destino, str) and (destino := dominio_destino.strip().rstrip(".").lower()):
+        try:
+            dominios.add(destino.encode("idna").decode("ascii"))
+        except UnicodeError:  # rótulo que o codec não aceita: vale como veio
+            dominios.add(destino)
+    return frozenset(dominios)
+
+
 def _recusa_do_alvo(ctx: Contexto) -> ErroNo:
     if ctx.modo_cego:
         return _recusa(_MOTIVO_ALVO_CEGO)
     return _recusa(_MOTIVO_ALVO_NENHUM if ctx.modo_contato == "nenhum" else _MOTIVO_ALVO)
 
 
-async def _checar_destino(url: str, ctx: Contexto, s: Servicos, ips_do_alvo: frozenset[str]) -> None:
+async def _checar_destino(
+    url: str, ctx: Contexto, s: Servicos, ips_do_alvo: frozenset[str], dominios_do_alvo: frozenset[str]
+) -> None:
     """`ErroNo` permanente se `url` não é uma fonte pública que se possa visitar: "fonte recusada: ..." ou, para
     um nome que não existe, "fonte não encontrada (domínio inexistente)...". `ips_do_alvo` são os IPs do alvo
-    (na forma canônica): um IP literal deles é o próprio alvo."""
+    (na forma canônica): um IP literal deles é o próprio alvo. `dominios_do_alvo` (`_dominios_do_alvo`): o domínio
+    registrável do alvo e o do destino do redirect; uma página deles é o próprio alvo."""
     try:
         destino = httpx.URL(url)
         # o host de rede (IDNA/punycode), não o `.host`, que vem em Unicode e não bateria com `ctx.alvo`
@@ -351,7 +367,7 @@ async def _checar_destino(url: str, ctx: Contexto, s: Servicos, ips_do_alvo: fro
         raise _recusa(f"IP não público ({classe}): {host}")
     if ip is None and not _rotulos_validos(host):
         raise _recusa("host inválido")
-    if (ip is not None and _forma_canonica(ip) in ips_do_alvo) or dominio_registravel(host) == ctx.alvo:
+    if (ip is not None and _forma_canonica(ip) in ips_do_alvo) or dominio_registravel(host) in dominios_do_alvo:
         raise _recusa_do_alvo(ctx)
     if ip is None and not s.config.rede.proxy:
         for endereco in await _enderecos_do_nome(host, s.config.rede.timeout_s):
@@ -378,10 +394,12 @@ class _Arquivo:
     data_forte: date | None
 
 
-async def _arquivar(url: str, ctx: Contexto, s: Servicos, ips_do_alvo: frozenset[str]) -> _Arquivo:
+async def _arquivar(
+    url: str, ctx: Contexto, s: Servicos, ips_do_alvo: frozenset[str], dominios_do_alvo: frozenset[str]
+) -> _Arquivo:
     atual = url
     for _ in range(_MAX_REDIRECTS + 1):
-        await _checar_destino(atual, ctx, s, ips_do_alvo)
+        await _checar_destino(atual, ctx, s, ips_do_alvo, dominios_do_alvo)
         # sem cache: a fonte arquivada tem de ser a página de agora. O teto vale durante a leitura: um corpo enorme
         # ou infinito, induzido por conteúdo hostil, não chega à memória
         resposta = await s.rede.get(
@@ -410,15 +428,22 @@ async def _arquivar(url: str, ctx: Contexto, s: Servicos, ips_do_alvo: frozenset
 
 
 async def arquivar_fonte(
-    url: str, ctx: Contexto, s: Servicos, ips_do_alvo: set[str] | None = None
+    url: str,
+    ctx: Contexto,
+    s: Servicos,
+    ips_do_alvo: set[str] | None = None,
+    dominio_destino: str | None = None,
 ) -> FonteArquivada:
     """Baixa `url` pela `Rede` e guarda na custódia (`tipo="fonte"`, `origem=url`).
 
     `ErroNo` permanente "fonte recusada: ..." se o destino (da URL ou de qualquer redirect) não é permitido, ou
     "fonte não encontrada (domínio inexistente)..."; `ErroRede` se a página não pôde ser baixada ou o corpo passa
-    de 10 MB. `ips_do_alvo`: os endereços A/AAAA do alvo (saída do nó `dns`); um IP literal deles é recusado.
+    de 10 MB. `ips_do_alvo`: os endereços A/AAAA do domínio analisado (saída do nó `dns`, que resolve o destino do
+    redirect quando há); um IP literal deles é recusado. `dominio_destino`: o domínio para onde o alvo redireciona
+    (saída `dominio` do nó `destino`), recusado como o do alvo.
     """
-    return (await _arquivar(url, ctx, s, _canonicos(ips_do_alvo))).fonte
+    dominios = _dominios_do_alvo(ctx, dominio_destino)
+    return (await _arquivar(url, ctx, s, _canonicos(ips_do_alvo), dominios)).fonte
 
 
 # --- validar ----------------------------------------------------------------------------------------------
@@ -525,9 +550,11 @@ async def _fonte_da_custodia(ref: str, s: Servicos) -> _Fonte:
     return _Fonte(texto_de_html(texto) if ext == "html" else texto)
 
 
-async def _fonte_da_url(url: str, ctx: Contexto, s: Servicos, ips_do_alvo: frozenset[str]) -> _Fonte:
+async def _fonte_da_url(
+    url: str, ctx: Contexto, s: Servicos, ips_do_alvo: frozenset[str], dominios_do_alvo: frozenset[str]
+) -> _Fonte:
     try:
-        arquivo = await _arquivar(url, ctx, s, ips_do_alvo)
+        arquivo = await _arquivar(url, ctx, s, ips_do_alvo, dominios_do_alvo)
     except ErroRede as erro:
         if erro.status in (404, 410):
             raise ErroNo(
@@ -541,12 +568,14 @@ async def _fonte_da_url(url: str, ctx: Contexto, s: Servicos, ips_do_alvo: froze
     return _Fonte(texto, arquivo.fonte.data_publicacao, arquivo.data_forte, pdf=arquivo.ext == "pdf")
 
 
-async def _carregar_fonte(fonte: str, ctx: Contexto, s: Servicos, ips_do_alvo: frozenset[str]) -> _Fonte:
+async def _carregar_fonte(
+    fonte: str, ctx: Contexto, s: Servicos, ips_do_alvo: frozenset[str], dominios_do_alvo: frozenset[str]
+) -> _Fonte:
     """`ErroNo` com o motivo exato da rejeição quando a fonte é inválida, não existe ou foi recusada."""
     if _HASH.fullmatch(fonte):
         return await _fonte_da_custodia(fonte, s)
     if fonte.lower().startswith(("http://", "https://")):
-        return await _fonte_da_url(fonte, ctx, s, ips_do_alvo)
+        return await _fonte_da_url(fonte, ctx, s, ips_do_alvo, dominios_do_alvo)
     raise ErroNo("fonte inválida: use sha256:<hex> ou URL http(s)", permanente=True)
 
 
@@ -574,12 +603,14 @@ async def validar(
     s: Servicos,
     mascara: dict[str, str] | None = None,
     ips_do_alvo: set[str] | None = None,
+    dominio_destino: str | None = None,
 ) -> Validacao:
     """Confere a resposta do Claude à `pendencia` (spec 7.4). Ver o docstring do módulo para a ordem.
 
     `nao_encontrado` e `inconclusivo` sem evidências pulam os passos 2 a 4; com evidências, elas são
     validadas como as de qualquer outra resposta. `mascara` (a de `montar_mascara`) só vale com `ctx.modo_cego`.
-    `ips_do_alvo`: os endereços A/AAAA do alvo (saída do nó `dns`), cujo IP literal não é fonte.
+    `ips_do_alvo`: os endereços A/AAAA do domínio analisado (saída do nó `dns`), cujo IP literal não é fonte.
+    `dominio_destino`: o domínio para onde o alvo redireciona (saída `dominio` do nó `destino`), que não é fonte.
     """
     if (rejeicao := _validar_valor(resposta, pendencia, s) or _itens_fora(resposta, pendencia)) is not None:
         return rejeicao
@@ -587,13 +618,14 @@ async def validar(
         return Validacao(True)
 
     ips = _canonicos(ips_do_alvo)
+    dominios = _dominios_do_alvo(ctx, dominio_destino)
     fontes: list[_Fonte] = []
     carregadas: dict[str, _Fonte] = {}
     for i, evidencia in enumerate(resposta.evidencias):
         fonte = evidencia.fonte.strip()
         try:
             if fonte not in carregadas:
-                carregadas[fonte] = await _carregar_fonte(fonte, ctx, s, ips)
+                carregadas[fonte] = await _carregar_fonte(fonte, ctx, s, ips, dominios)
         except ErroNo as erro:
             return _rejeitar(erro.mensagem, f"evidencias[{i}].fonte")
         fontes.append(carregadas[fonte])

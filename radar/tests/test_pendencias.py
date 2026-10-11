@@ -600,8 +600,9 @@ def test_pend_e_espera_todos_os_coletores():
 def test_pend_e_nao_deixa_coletor_de_fora():
     nos = nos_do_nucleo()
     nomes = [n.nome for n in nos]
-    # os coletores são os nós antes dos `pend_*` (o `alvo` só normaliza a entrada)
-    coletores = set(nomes[: nomes.index("pend_a1")]) - {"alvo"}
+    # os coletores são os nós antes dos `pend_*` (o `alvo` só normaliza a entrada e o `destino` só escolhe o domínio
+    # que os coletores analisam: a P-E já os espera através deles)
+    coletores = set(nomes[: nomes.index("pend_a1")]) - {"alvo", "destino"}
     pend_e = next(n for n in nos if n.nome == "pend_e")
     assert set(pend_e.opcionais) == coletores
 

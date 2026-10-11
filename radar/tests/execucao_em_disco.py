@@ -30,9 +30,9 @@ REF_NOTICIA = "sha256:" + hashlib.sha256(NOTICIA).hexdigest()
 ARTEFATOS = ((PAGINA, "html", "pagina", URL_SITE), (NOTICIA, "html", "fonte", URL_NOTICIA))
 
 NOS = (
-    "alvo", "rdap", "dns", "ct", "wayback_indice", "captura", "wayback_snapshot", "extracao", "cnpj", "registros",
-    "cvm_sancionador", "cvm_alertas", "pend_a1", "pend_a2", "pend_a3", "pend_b", "pend_c", "pend_c4", "pend_d1",
-    "pend_d4", "pend_e",
+    "alvo", "captura", "destino", "rdap", "dns", "ct", "wayback_indice", "wayback_snapshot", "extracao", "cnpj",
+    "registros", "cvm_sancionador", "cvm_alertas", "pend_a1", "pend_a2", "pend_a3", "pend_b", "pend_c", "pend_c4",
+    "pend_d1", "pend_d4", "pend_e",
 )  # fmt: skip
 PENDENCIA_DO_NO = {
     "pend_a1": "P-A1", "pend_a2": "P-A2", "pend_a3": "P-A3", "pend_b": "P-B", "pend_c": "P-C", "pend_c4": "P-C4",
@@ -70,6 +70,8 @@ def saidas_base() -> dict[str, dict]:
     """As saídas de todos os nós `feito`: empresa e domínio antigos, CNAE da seção K, sem registro, sem alerta."""
     return {
         "alvo": {"dominio": "exemplo.com.br", "slug": "exemplo-com-br", "url_inicial": URL_SITE},
+        # sem redirect para outro domínio: os coletores analisaram o próprio alvo
+        "destino": {"dominio": "exemplo.com.br", "redirecionado_de": None, "url_destino": None},
         "rdap": {
             "registro": "2015-03-02", "expiracao": "2027-03-02", "registrador": "Registro.br",
             "cnpj_titular": PETROBRAS, "vazamento_temporal": [],

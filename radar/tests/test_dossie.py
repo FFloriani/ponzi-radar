@@ -337,6 +337,62 @@ def test_dossie_sem_parametros_removidos_nao_mostra_a_linha(tmp_path):
     assert "Parâmetros de indicação" not in secao(dossie(gravar(tmp_path)), 1)
 
 
+REDIRECT = {
+    "dominio": "phinvestimentos.com",
+    "redirecionado_de": "exemplo.com.br",
+    "url_destino": "https://phinvestimentos.com/login",
+}
+
+
+def test_dossie_mostra_o_redirect_seguido_e_o_dominio_analisado(tmp_path):
+    captura = {**saidas_base()["captura"], "destino": {"url": REDIRECT["url_destino"], "dominio": REDIRECT["dominio"]},
+               "redirect_ignorado": None}  # fmt: skip
+    s1 = secao(dossie(gravar(tmp_path, saidas={"destino": REDIRECT, "captura": captura})), 1)
+    assert (
+        "- **Redirecionamento:** exemplo.com.br → `https://phinvestimentos.com/login`; "
+        "os coletores analisaram phinvestimentos.com\n"
+    ) in s1
+    assert "Redireciona para" not in s1
+    # a linha vem logo depois do alvo
+    linhas = s1.splitlines()
+    assert linhas[linhas.index(next(l for l in linhas if l.startswith("- **Alvo:**"))) + 1].startswith(
+        "- **Redirecionamento:**"
+    )
+
+
+@pytest.mark.parametrize("motivo", ["plataforma", "estacionamento"])
+def test_dossie_mostra_o_redirect_ignorado(tmp_path, motivo):
+    ignorado = {"url": "https://t.me/golpe", "dominio": "t.me", "motivo": motivo}
+    captura = {**saidas_base()["captura"], "destino": None, "redirect_ignorado": ignorado}
+    s1 = secao(dossie(gravar(tmp_path, saidas={"captura": captura})), 1)
+    assert f"- **Redireciona para** `https://t.me/golpe` ({motivo}): análise mantida em exemplo.com.br\n" in s1
+    assert "Redirecionamento:" not in s1
+
+
+def test_dossie_sem_redirect_nao_mostra_as_linhas(tmp_path):
+    captura = {**saidas_base()["captura"], "destino": None, "redirect_ignorado": None}
+    for saidas in ({}, {"captura": captura}):  # a captura de antes da T1 não tem as duas saídas
+        texto = dossie(gravar(tmp_path / str(len(saidas)), saidas=saidas))
+        assert "Redireciona" not in texto and "Redirecionamento" not in texto
+
+
+def test_dossie_sem_o_no_destino_nao_quebra(tmp_path):
+    # execução de antes da T1: o `destino` não existe no estado
+    texto = dossie(gravar(tmp_path, status={"destino": "pendente"}))
+    assert "Redirecionamento" not in texto
+
+
+def test_dossie_redirect_com_conteudo_hostil_fica_numa_linha_e_escapado(tmp_path):
+    hostil = {**REDIRECT, "url_destino": "https://phinvestimentos.com/a|b`c\n# titulo", "dominio": "phinv*estimentos.com"}
+    ignorado = {"url": "https://t.me/x|y", "dominio": "t.me", "motivo": "<b>plataforma</b>\n## x"}
+    captura = {**saidas_base()["captura"], "redirect_ignorado": ignorado}
+    s1 = secao(dossie(gravar(tmp_path, saidas={"destino": hostil, "captura": captura})), 1)
+    assert "`https://phinvestimentos.com/a%7Cb%60c # titulo`" in s1
+    assert f"os coletores analisaram phinv{BS}*estimentos.com" in s1
+    assert f"({BS}<b{BS}>plataforma{BS}</b{BS}> {BS}#{BS}# x)" in s1
+    assert "\n#" not in s1.removeprefix("## 1. Identificação")
+
+
 def test_dossie_sem_processos_nao_mostra_a_lista(tmp_path):
     assert "Processos sancionadores" not in secao(dossie(gravar(tmp_path)), 5)
 

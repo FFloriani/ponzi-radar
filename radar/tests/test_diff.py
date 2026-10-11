@@ -267,6 +267,39 @@ def test_diff_captura_que_ja_falhava_nao_e_novidade(tmp_path):
     assert "site fora do ar" not in comparar(a, b, MATRIZ).infra
 
 
+REDIRECT = {
+    "dominio": "phinvestimentos.com",
+    "redirecionado_de": "exemplo.com.br",
+    "url_destino": "https://phinvestimentos.com/login",
+}
+
+
+def test_diff_destino_que_mudou(tmp_path):
+    a, b = duas(tmp_path, b={"saidas": {"destino": REDIRECT}})
+    d = comparar(a, b, MATRIZ)
+    assert d.infra == ["destino mudou: exemplo.com.br → phinvestimentos.com"]
+    assert "  - destino mudou: exemplo.com.br → phinvestimentos.com" in renderizar_diff(d)
+    # e de volta: o redirect sumiu
+    assert comparar(b, a, MATRIZ).infra == ["destino mudou: phinvestimentos.com → exemplo.com.br"]
+
+
+def test_diff_mesmo_destino_nao_mudou(tmp_path):
+    a, b = duas(tmp_path, a={"saidas": {"destino": REDIRECT}}, b={"saidas": {"destino": {**REDIRECT, "url_destino": "x"}}})
+    assert comparar(a, b, MATRIZ).infra == []
+
+
+def test_diff_destino_so_compara_quando_a_captura_o_viu(tmp_path):
+    # captura em erro (ou pulada): o `destino` volta ao alvo por falta de dado, não porque o redirect sumiu
+    sem_captura = {"status": {"captura": ("erro", "captura indisponível: Executable doesn't exist")}}
+    a, b = duas(tmp_path, a={"saidas": {"destino": REDIRECT}}, b=sem_captura)
+    assert comparar(a, b, MATRIZ).infra == []
+
+
+def test_diff_execucao_sem_o_no_destino_nao_compara(tmp_path):
+    a, b = duas(tmp_path, a={"status": {"destino": "pendente"}}, b={"saidas": {"destino": REDIRECT}})
+    assert comparar(a, b, MATRIZ).infra == []
+
+
 def test_diff_infra_na_ordem_e_renderizada(tmp_path):
     a, b = duas(
         tmp_path,

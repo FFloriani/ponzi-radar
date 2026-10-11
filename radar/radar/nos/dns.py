@@ -18,17 +18,18 @@ _NOMES_STATUS = {1: "FORMERR", 2: "SERVFAIL", 4: "NOTIMP", 5: "REFUSED"}
 
 
 class DnsNo(NoBase):
-    """Uma consulta por tipo. O DNS só responde o presente: no modo retroativo o motor pula o nó."""
+    """Uma consulta por tipo, do domínio que o nó `destino` escolheu (o do alvo, ou o do site para onde ele
+    redireciona). O DNS só responde o presente: no modo retroativo o motor pula o nó."""
 
     nome = "dns"
-    entradas = ("alvo",)
+    entradas = ("destino",)
     saidas = ("A", "AAAA", "MX", "NS", "TXT", "nxdomain")
     as_of = "so_atual"
 
     async def executar(
         self, ctx: Contexto, entradas: dict[str, dict], respostas: dict, s: Servicos
     ) -> Feito:
-        dominio = quote(entradas["alvo"]["dominio"], safe="")
+        dominio = quote(entradas["destino"]["dominio"], safe="")
         saidas: dict = {}
         nxdomain = False
         for tipo, codigo in _TIPOS.items():
@@ -47,7 +48,7 @@ class DnsNo(NoBase):
                 nome = _NOMES_STATUS.get(status) if isinstance(status, int) else None
                 raise ErroNo(
                     f"DNS {tipo}: Status {status} ({nome or 'desconhecido'}) "
-                    f"para {entradas['alvo']['dominio']}: falha de resolução, não ausência de registros",
+                    f"para {entradas['destino']['dominio']}: falha de resolução, não ausência de registros",
                     permanente=False,
                 )
             registros = dados.get("Answer")

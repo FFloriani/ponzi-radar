@@ -50,6 +50,12 @@ def _guardar(s: Servicos, indice: str, consulta: dict, correspondencias: list[di
     return s.custodia.guardar(dados, "json", tipo="indice", origem=indice)
 
 
+def _dominio_analisado(ctx: Contexto, entradas: dict[str, dict]) -> str:
+    """O domínio que o nó `destino` escolheu (o do site para onde o alvo redireciona); sem ele, o do alvo."""
+    dominio = (entradas.get("destino") or {}).get("dominio")
+    return dominio if isinstance(dominio, str) and dominio.strip() else ctx.alvo
+
+
 def _cnpj_da_entrada(entradas: dict[str, dict]) -> str | None:
     """O CNPJ que o nó `cnpj` achou; `None` se a empresa não foi identificada (ou se o nó não está nas entradas)."""
     cnpj = (entradas.get("cnpj") or {}).get("cnpj")
@@ -110,7 +116,8 @@ class RegistrosNo(NoBase):
 
     - CVM: o CNPJ de 14 caracteres tem registro vigente no `as_of` (`dt_reg <= as_of`, cancelamento nulo ou depois).
     - BCB: a raiz de 8 caracteres do CNPJ está nas sedes de bancos, sociedades, cooperativas ou consórcios.
-    - Domínio: `ctx.alvo` é um domínio verificado de alguma instituição do BCB.
+    - Domínio: o domínio analisado (o do `destino`, opcional; sem ele, `ctx.alvo`) é um domínio verificado de alguma
+      instituição do BCB.
 
     Sem CNPJ (o nó `cnpj` não achou a empresa) só o domínio vale e `motivo` é "sem CNPJ". O Olinda só lista o que
     funciona hoje, sem datas: no modo retroativo `bcb` e `bcb_dominio` vêm em `vazamento_temporal`, e quem pontua
@@ -119,6 +126,7 @@ class RegistrosNo(NoBase):
 
     nome = "registros"
     entradas = ("alvo", "cnpj")
+    opcionais = ("destino",)
     # `indices_vencidos` só aparece quando algum índice é o anterior a uma renovação que falhou
     saidas = ("cvm", "bcb", "bcb_dominio", "registrado", "motivo", "vazamento_temporal", "indices_vencidos")
     as_of = "filtravel"
@@ -128,7 +136,8 @@ class RegistrosNo(NoBase):
     ) -> Feito:
         indices = _indices(s)
         cnpj = _cnpj_da_entrada(entradas)
-        consulta = {"cnpj": cnpj, "dominio": ctx.alvo, "as_of": ctx.as_of.isoformat()}
+        dominio = _dominio_analisado(ctx, entradas).lower()
+        consulta = {"cnpj": cnpj, "dominio": dominio, "as_of": ctx.as_of.isoformat()}
         cvm: list[dict] = []
         bcb: list[dict] = []
         consultados: dict[str, list] = {}
@@ -143,7 +152,6 @@ class RegistrosNo(NoBase):
             consultados["instituicoes_bcb"] = await indices.instituicoes_bcb()
             bcb = [i.model_dump(mode="json") for i in consultados["instituicoes_bcb"] if i.raiz_cnpj == cnpj[:8]]
             _guardar(s, "instituicoes_bcb", consulta, bcb)
-        dominio = ctx.alvo.lower()
         consultados["dominios_bcb"] = await indices.dominios_bcb()
         bcb_dominio = [d.model_dump(mode="json") for d in consultados["dominios_bcb"] if d.dominio == dominio]
         _guardar(s, "dominios_bcb", consulta, bcb_dominio)
@@ -315,7 +323,7 @@ class CvmAlertasNo(NoBase):
     """Deliberações de "Atuação Irregular" da CVM (stop orders) que citam a empresa ou o site.
 
     Casa por CNPJ e razão social/nome fantasia quando o nó `cnpj` identificou a empresa; sem ele (nó em erro ou
-    empresa não achada), só pelo domínio. A pontuação confirma o item C4 sozinha com `cnpj` ou `dominio`; o `nome`
+    empresa não achada), só pelo domínio: o do `destino` (opcional; sem ele, `ctx.alvo`). A pontuação confirma o item C4 sozinha com `cnpj` ou `dominio`; o `nome`
     vai para a pendência P-C4. O ato conta a partir da data dele (`as_of` exato).
 
     `cobertura` diz em quantas das deliberações consultadas (as de data até o `as_of`) o texto integral foi lido
@@ -326,7 +334,7 @@ class CvmAlertasNo(NoBase):
 
     nome = "cvm_alertas"
     entradas = ("alvo",)
-    opcionais = ("cnpj",)
+    opcionais = ("cnpj", "destino")
     saidas = ("correspondencias", "cobertura", "artefato", "indices_vencidos")
     as_of = "exato"
 
@@ -338,11 +346,12 @@ class CvmAlertasNo(NoBase):
         empresa = entradas.get("cnpj") or {}
         nomes = [empresa.get("razao_social"), empresa.get("nome_fantasia")] if cnpj else []
         delibs = await indices.deliberacoes()
-        correspondencias = casar_deliberacoes(delibs, cnpj, ctx.alvo, nomes, ctx.as_of)
+        dominio = _dominio_analisado(ctx, entradas)
+        correspondencias = casar_deliberacoes(delibs, cnpj, dominio, nomes, ctx.as_of)
         consultadas = [d for d in delibs if d.data is not None and d.data <= ctx.as_of]
         integrais = sum(d.integral for d in consultadas)
         cobertura = {"com_texto_integral": integrais, "so_resumo": len(consultadas) - integrais}
-        consulta = {"dominio": ctx.alvo, "cnpj": cnpj, "as_of": ctx.as_of.isoformat(), "cobertura": cobertura}
+        consulta = {"dominio": dominio, "cnpj": cnpj, "as_of": ctx.as_of.isoformat(), "cobertura": cobertura}
         artefato = _guardar(s, "deliberacoes", consulta, correspondencias)
         saidas = {"correspondencias": correspondencias, "cobertura": cobertura, "artefato": artefato}
         return Feito(_com_vencidos(saidas, deliberacoes=delibs))
