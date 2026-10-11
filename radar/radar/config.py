@@ -20,7 +20,9 @@ UA_API = "radar-piramides/0.1 (pesquisa; github.com/FFloriani/piramide-pentest)"
 
 
 def _limites_padrao() -> dict[str, float]:
-    return {"*": 1.0, "web.archive.org": 2.0, "archive.org": 2.0, "crt.sh": 3.0}
+    # o DoH da Cloudflare é feito para muitas consultas: as 7 do nó `dns` (5 do destino e o A/AAAA do redirecionador)
+    # a 1 req/s viravam o gargalo da coleta (F4 da revisão final)
+    return {"*": 1.0, "web.archive.org": 2.0, "archive.org": 2.0, "crt.sh": 3.0, "cloudflare-dns.com": 0.2}
 
 
 class _Secao(BaseModel):

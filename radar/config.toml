@@ -28,6 +28,8 @@
 # "web.archive.org" = 2.0
 # "archive.org" = 2.0
 # "crt.sh" = 3.0
+## O DoH (cloudflare-dns.com) é feito para muitas consultas: o nó dns faz 5 a 7 delas em série.
+# "cloudflare-dns.com" = 0.2
 
 ## Timeout, em segundos, por host. O host que não está aqui usa timeout_s.
 ## O Wayback é lento: a listagem do CDX de um domínio grande passa de 70 s.

@@ -16,6 +16,15 @@ def test_config_padrao(tmp_path):
     assert cfg.casos_dir.name == "casos"
 
 
+def test_doh_tem_limite_proprio(tmp_path):
+    # F4 da revisão final: o DoH é feito para muitas consultas, e as 7 do `dns` em série a 1 req/s viraram o gargalo
+    limites = carregar_config(tmp_path / "nao_existe.toml").rede.limites
+    assert limites["cloudflare-dns.com"] == 0.2
+    assert RedeConfig().limites == {
+        "*": 1.0, "web.archive.org": 2.0, "archive.org": 2.0, "crt.sh": 3.0, "cloudflare-dns.com": 0.2
+    }  # fmt: skip
+
+
 def test_config_sobrescreve_parcialmente(tmp_path):
     p = tmp_path / "c.toml"
     p.write_text('[rede]\nproxy = "socks5://127.0.0.1:9050"\n[captura]\nmax_subpaginas = 3\n', encoding="utf-8")
