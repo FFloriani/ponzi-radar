@@ -37,6 +37,12 @@ MAX_CANDIDATOS_POR_CATEGORIA = 20  # a extração entrega até 100 por página e
 # os campos da pendência que levam texto do site (ou de fontes que o citam): o `valor` de uma rede social e o `extra`
 # de um alerta da CVM, por exemplo, também vêm de fora
 _NAO_CONFIAVEIS = ["conteudo_do_alvo", "candidatos[].trecho", "candidatos[].valor", "candidatos[].extra"]
+# nos critérios das pendências que leem o comportamento da oferta: a extração também acha candidatos nos textos dos
+# scripts embutidos na página (ver `texto_interno` em nos/extracao.py)
+_SOBRE_O_TEXTO_INTERNO = (
+    "Candidatos com extra.origem=texto_interno vêm de textos internos do aplicativo embutidos na página (mensagens de "
+    "telas que o visitante não vê): mostram o que o sistema faz ou pode fazer, não que já aconteceu."
+)
 
 
 @dataclass(frozen=True)
@@ -77,6 +83,7 @@ _DEFINICOES = (
             "convertido. garantido=true só se a oferta chama o retorno de garantido, fixo ou sem risco. Sem "
             "promessa de retorno: pct_mes=null. Confira os candidatos nas outras páginas e nos termos; valem as "
             "condições do site no as_of."
+            f" {_SOBRE_O_TEXTO_INTERNO}"
         ),
         modelo_valor=ValorA1,
         categorias=("percentual", "garantido"),
@@ -109,6 +116,7 @@ _DEFINICOES = (
             "custodiante, administradora; confira o registro) guarda o dinheiro dos clientes. Carteira, conta ou "
             "'cofre' do próprio operador: false. Os candidatos mostram onde o site fala de investimento; procure "
             "a explicação do negócio nas outras páginas."
+            f" {_SOBRE_O_TEXTO_INTERNO}"
         ),
         modelo_valor=ValorA3,
         categorias=("investimento",),
@@ -129,6 +137,7 @@ _DEFINICOES = (
             "imposto, 'liberação', caução). Marque true só com um trecho que o sustente nas evidencias. Em cada "
             "evidência, informe em itens os ids que ela sustenta, entre B1, B2, B3, B4 (B1 indicação, B2 token próprio, "
             "B3 carência com multa, B4 taxa para sacar): o dossiê cita em cada item só as evidências marcadas com ele."
+            f" {_SOBRE_O_TEXTO_INTERNO}"
         ),
         modelo_valor=ValorB,
         categorias=("indicacao", "token", "carencia", "saque"),
@@ -151,6 +160,7 @@ _DEFINICOES = (
             "ilhas) para operar sem registro no Brasil. Em cada evidência, informe em itens os ids que ela sustenta, "
             "entre C2, C3 (C2 contrato atípico; C3 conta de PF ou de terceiro e sede offshore): o dossiê cita em cada "
             "item só as evidências marcadas com ele."
+            f" {_SOBRE_O_TEXTO_INTERNO}"
         ),
         modelo_valor=ValorC,
         categorias=("contrato", "pix", "carteira"),
@@ -228,6 +238,7 @@ _DEFINICOES = (
             "confissão do operador) de que rendimentos foram pagos com aportes de novos clientes; suspeita, "
             "comparação com outro esquema ou relato isolado não bastam. Sem nenhum sinal, responda nao_encontrado "
             "e diga onde procurou. Fatos e fontes posteriores ao as_of não valem."
+            f" {_SOBRE_O_TEXTO_INTERNO}"
         ),
         modelo_valor=ValorE,
         categorias=(),

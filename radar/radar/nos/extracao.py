@@ -3,7 +3,9 @@
 `extrair` roda sobre o texto visível de uma página (o texto da captura ou do Wayback) e devolve
 `Candidato`s. `extrair_atributos` faz o mesmo com os valores de `href`, `src` e `action` do HTML da página,
 onde ficam os links de contato que o texto não mostra (o texto de `<a href="https://wa.me/...">` é só
-"Fale conosco"); só as regex de contato e de carteira rodam sobre eles. Os candidatos só apontam onde
+"Fale conosco"); só as regex de contato e de carteira rodam sobre eles. `texto_interno` lê as strings de
+linguagem natural dos `<script>` embutidos no HTML (o dicionário de textos do aplicativo, o payload do Next.js), que o
+nó guarda como artefato derivado e sobre o qual as mesmas regex do texto rodam. Os candidatos só apontam onde
 olhar: o nó `claude` (T12) confirma ou corrige cada um, e a matriz (T14) só pontua o que foi confirmado.
 
 O texto e o HTML são do site investigado: as regex rodam sobre conteúdo hostil. A regra que garante o
@@ -16,7 +18,8 @@ custo linear:
 - as alternativas começam por literais diferentes ou diferem logo, então duas não casam o mesmo trecho.
 O custo é linear também para `"1" * 100_000`, `"%" * 100_000`, `"a." * 100_000` e `"1%" * 1_000_000`
 (ver tests/test_extracao.py). O HTML passa pelo `HTMLParser` da stdlib, que é linear, e só até
-`_HTML_MAXIMO` caracteres ou `_TAGS_MAXIMAS` tags.
+`_HTML_MAXIMO` caracteres ou `_TAGS_MAXIMAS` tags. Os scripts são achados por `str.find` nos mesmos `_HTML_MAXIMO`
+caracteres e lidos literal a literal, com teto de literais, de linhas e de caracteres por página.
 
 Convenções:
 - as regex ignoram a caixa: as de letras rodam numa cópia do texto em minúsculas, com os mesmos índices
@@ -35,6 +38,7 @@ Convenções:
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 from bisect import bisect_right
@@ -607,11 +611,14 @@ def _achados(texto: str) -> Iterable[_Achado]:
     yield from _contatos(texto, baixo)
 
 
-def _montar(achados: Iterable[_Achado], base: str, artefato: str) -> tuple[list[Candidato], set[str]]:
+def _montar(
+    achados: Iterable[_Achado], base: str, artefato: str, origem: str | None = None
+) -> tuple[list[Candidato], set[str]]:
     """Os `Candidato`s de `achados` (índices em `base`, o texto ou o HTML guardado em `artefato`).
 
     Fica a primeira ocorrência de cada (categoria, valor), em ordem de posição, e no máximo
-    `TETO_POR_CATEGORIA` por categoria. Devolve também as categorias que passaram do teto.
+    `TETO_POR_CATEGORIA` por categoria. Devolve também as categorias que passaram do teto. Com `origem`, o
+    `extra` de cada candidato a leva em `extra["origem"]`.
     """
     primeiros: dict[tuple[str, str], _Achado] = {}
     for achado in achados:
@@ -634,7 +641,7 @@ def _montar(achados: Iterable[_Achado], base: str, artefato: str) -> tuple[list[
                 trecho=base[max(0, a.inicio - _MARGEM) : a.fim + _MARGEM],
                 artefato=artefato,
                 posicao=a.inicio,
-                extra=a.extra,
+                extra=a.extra if origem is None else {**a.extra, "origem": origem},
             )
         )
     return candidatos, truncadas
@@ -756,6 +763,259 @@ def extrair_atributos(html: str, artefato: str) -> list[Candidato]:
     return _extrair_atributos(html, artefato)[0]
 
 
+# ---------------------------------------------------------------------------- textos internos (scripts embutidos)
+
+MAX_LINHAS_DO_TEXTO_INTERNO = 5_000  # por página
+MAX_CARACTERES_DO_TEXTO_INTERNO = 300_000  # por página, com as quebras de linha
+ORIGEM_TEXTO_INTERNO = "texto_interno"  # o `tipo` do artefato, o `extra.origem` dos candidatos e a marca do `truncado`
+_TEXTO_MINIMO = 12  # caracteres de um texto de linguagem natural, depois de colapsar os espaços
+_TEXTO_MAXIMO = 300
+_CHAVE_MAXIMA = 200  # chave maior que isto não entra na linha: fica só o texto
+# Literal maior que isto não vira um texto de até 300 caracteres (nem com um escape `\uXXXX` por letra): não é
+# decodificado para virar linha, só para ser lido por dentro, se tiver aspas.
+_BRUTO_MAXIMO = 4_000
+# o código do script e até três strings, uma dentro da outra: o JSON do RSC do Next.js vem dentro de uma string JS
+_CAMADAS = 4
+# Literais lidos por página, em todas as camadas. O HTML do aceite (168 mil caracteres, 117 mil de payload do Next.js)
+# tem ~2.900; milhões de strings vazias (`""""...`) custariam segundos só no laço.
+_LITERAIS_MAXIMOS = 500_000
+_BLOCO = 16_384  # caracteres de um literal consumidos por chamada da regex do corpo
+
+_FIM_DO_NOME_DA_TAG = frozenset(" \t\n\r\f/>")
+_SRC = re.compile(r"(?<![^\s\"'/])src\s{0,20}=")  # no texto da tag em minúsculas; `data-src` não conta
+_ABRE_NO_CODIGO = re.compile("[\"'`]")
+_ABRE_NA_STRING = re.compile('"')  # dentro de uma string só há JSON: o apóstrofo é texto
+# o corpo de um literal até a aspa que o fecha, um caractere (ou um escape) por vez; a de aspas não passa da quebra de
+# linha (no JavaScript e no JSON, a string que chega nela não fechou)
+_CORPO_DE_ASPAS = re.compile(rf'(?:[^"\\\n]|\\(?:\r\n|[\s\S])){{0,{_BLOCO}}}')
+_CORPO_DE_APOSTROFO = re.compile(rf"(?:[^'\\\n]|\\(?:\r\n|[\s\S])){{0,{_BLOCO}}}")
+_CORPO_DE_CRASE = re.compile(rf"(?:[^`\\]|\\(?:\r\n|[\s\S])){{0,{_BLOCO}}}")
+_CORPO = {'"': _CORPO_DE_ASPAS, "'": _CORPO_DE_APOSTROFO, "`": _CORPO_DE_CRASE}
+_ESPACOS_JS = re.compile(r"[ \t\r\n]{0,64}")
+_ESCAPE = re.compile(r"\\(?:u\{[0-9A-Fa-f]{1,6}\}|u[0-9A-Fa-f]{4}|x[0-9A-Fa-f]{2}|\r\n|[\s\S])")
+_ESCAPES_SIMPLES = {
+    "n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f", "v": "\v", "0": "\0",
+    "\n": "", "\r": "", "\r\n": "", "\u2028": "", "\u2029": "",  # continuação de linha
+}  # fmt: skip
+_SUBSTITUTO = re.compile("[\ud800-\udfff]")
+
+# --- o que é texto de linguagem natural
+_CONTROLE = re.compile("[\x00-\x1f\x7f-\x9f]")
+_TAG_HTML = re.compile(r"<[A-Za-z/!?]")
+_CODIGO = ("=>", "&&", "||", "${", "!=", "==", "();", "){", "};", "function(", "function (", "\\", '":', '{"', '["')
+_BORDA_DA_PALAVRA = ".,;:!?…()[]{}\"'«»“”‘’*+–—-/"
+_PALAVRA = re.compile(r"[^\W\d_]{1,64}(?:['’-][^\W\d_]{1,64}){0,4}")
+# classe utilitária de CSS (`items-center`, `md:flex`, `dark:bg-gray-900`): listas delas não são texto
+_CLASSE_CSS = re.compile(
+    r"[a-z][a-z0-9]{0,30}(?:-[a-z0-9.%#/\[\]]{1,40}){1,6}|[a-z0-9-]{1,30}:[a-z0-9\[\]-]{1,40}"
+)
+_HASH_OU_BASE64 = re.compile(r"[A-Za-z0-9+/=_-]{24,300}")
+
+
+class TextoInterno(NamedTuple):
+    """`texto`: uma string por linha, `<chave> = <texto>` quando a string é o valor de uma chave de objeto e só
+    `<texto>` nos outros casos (vazio se não há nenhuma); `truncado`: o texto foi cortado num dos tetos."""
+
+    texto: str
+    truncado: bool
+
+
+def _scripts_embutidos(html: str) -> Iterator[str]:
+    """O conteúdo dos `<script>` sem `src`, na ordem do documento, nos primeiros `_HTML_MAXIMO` caracteres do HTML.
+
+    Como no navegador, o script termina no primeiro `</script` seguido de espaço, `/` ou `>`, mesmo que ele esteja
+    dentro de uma string do JavaScript: o que vem depois é HTML e não entra. A busca é por `str.find`, linear, e não
+    passa pelo `HTMLParser`.
+    """
+    html = html[:_HTML_MAXIMO]
+    baixo = _minusculas(html)
+    i = baixo.find("<script")
+    while i != -1:
+        depois = i + len("<script")
+        if depois < len(baixo) and baixo[depois] not in _FIM_DO_NOME_DA_TAG:
+            i = baixo.find("<script", depois)  # `<scripts>`, `<script-x>`
+            continue
+        fim_da_tag = baixo.find(">", depois)
+        if fim_da_tag == -1:
+            return
+        fim = _fim_do_script(baixo, fim_da_tag + 1)
+        if not _SRC.search(baixo[depois:fim_da_tag]):
+            yield html[fim_da_tag + 1 : fim]
+        i = baixo.find("<script", fim)
+
+
+def _fim_do_script(baixo: str, inicio: int) -> int:
+    j = baixo.find("</script", inicio)
+    while j != -1:
+        k = j + len("</script")
+        if k >= len(baixo) or baixo[k] in _FIM_DO_NOME_DA_TAG:
+            return j
+        j = baixo.find("</script", k)
+    return len(baixo)
+
+
+def _fim_do_literal(codigo: str, inicio: int, aspa: str) -> tuple[int, int]:
+    """`(fim, retomada)` do literal cujo corpo começa em `inicio`: `fim` é a aspa que fecha (-1 se ele não fecha) e
+    `retomada`, onde a busca pelo próximo continua. A string de aspas que não fecha na linha descarta o resto da
+    linha; a de crase, o resto do código. Retomar logo depois da aspa que abriu seria quadrático (`"\\"\\"\\"...`)."""
+    corpo = _CORPO[aspa]
+    i = inicio
+    while True:
+        i = corpo.match(codigo, i).end()
+        if i >= len(codigo) or (codigo[i] == "\\" and i + 1 == len(codigo)):  # a barra final não escapa nada
+            return -1, len(codigo)
+        if codigo[i] == aspa:
+            return i, i + 1
+        if codigo[i] == "\n":
+            return -1, i + 1
+        # o bloco de `_BLOCO` acabou no meio do literal (antes de um caractere ou de um escape): continua dali
+
+
+def _um_escape(m: re.Match[str]) -> str:
+    corpo = m.group()[1:]
+    if len(corpo) > 1 and corpo[0] in "ux":
+        try:
+            return chr(int(corpo[1:].strip("{}"), 16))
+        except ValueError:  # acima de U+10FFFF
+            return "\ufffd"
+    return _ESCAPES_SIMPLES.get(corpo, corpo)  # `\"`, `\\`, `\/`, `\'` e o escape desconhecido valem o caractere
+
+
+def _desescapar(bruto: str) -> str:
+    """O texto que o literal escreve. Os escapes do JSON vão pelo `json` (em C); se ele recusa (escape só do JS,
+    `\\x41`, `\\u{...}`, ou quebrado), vai a regex, que nunca falha: o escape inválido vale o caractere depois da
+    barra. O substituto solto (`\\ud800`) vira U+FFFD: o texto tem de gravar em UTF-8."""
+    texto = bruto
+    if "\\" in bruto:
+        try:
+            texto = json.loads(f'"{bruto}"', strict=False)
+        except ValueError:
+            texto = _ESCAPE.sub(_um_escape, bruto)
+    if _SUBSTITUTO.search(texto):
+        texto = texto.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+    return texto
+
+
+def _e_texto_natural(texto: str) -> bool:
+    """`texto` (com os espaços já colapsados) é linguagem natural: de 12 a 300 caracteres, ao menos 2 palavras de
+    letras e metade dos pedaços palavras, sem cara de código, HTML, lista de classes CSS, hash ou base64. URL dentro
+    de uma frase vale; a URL sozinha não tem duas palavras."""
+    if not _TEXTO_MINIMO <= len(texto) <= _TEXTO_MAXIMO:
+        return False
+    if _CONTROLE.search(texto) or _TAG_HTML.search(texto) or any(marca in texto for marca in _CODIGO):
+        return False
+    pedacos = texto.split(" ")
+    palavras = classes = 0
+    for pedaco in pedacos:
+        if len(pedaco) >= 24 and _HASH_OU_BASE64.fullmatch(pedaco) and not (pedaco.isalpha() and pedaco[1:].islower()):
+            return False
+        nucleo = pedaco.strip(_BORDA_DA_PALAVRA)
+        if _CLASSE_CSS.fullmatch(nucleo):
+            classes += 1
+        elif _PALAVRA.fullmatch(nucleo):
+            palavras += 1
+    return palavras >= 2 and 2 * palavras >= len(pedacos) and 2 * classes < len(pedacos)
+
+
+class _LeitorDeScripts:
+    """Junta as linhas do texto interno de uma página, com os tetos de linhas, de caracteres e de literais.
+
+    `sem_chaves` tem as mesmas linhas com a chave e o ` = ` trocados por espaços (mesmo tamanho): as regex de
+    candidatos rodam nele, e a chave (`saque.backend.erro...`, um identificador do código) não vira achado.
+    """
+
+    def __init__(self) -> None:
+        self.linhas: list[str] = []
+        self.sem_chaves: list[str] = []
+        self.truncado = False
+        self._vistos: set[str] = set()
+        self._caracteres = 0
+        self._literais = 0
+
+    def ler(self, codigo: str, abre: re.Pattern[str], camada: int) -> None:
+        """Lê os literais de `codigo`. Um literal seguido de `:` é chave; o literal logo depois do `:` é o valor
+        dela. A chave cujo valor não é uma string vale sozinha, se for texto."""
+        pos = 0
+        chave: str | None = None
+        valor_em = -1  # onde o valor da `chave` tem de começar
+        while not self.truncado:
+            m = abre.search(codigo, pos)
+            if m is None:
+                break
+            self._literais += 1
+            if self._literais > _LITERAIS_MAXIMOS:
+                self.truncado = True
+                return
+            fim, pos = _fim_do_literal(codigo, m.end(), m.group())
+            dona = chave if m.start() == valor_em else None
+            if chave is not None and dona is None:
+                self._texto(None, chave)
+            chave = None
+            if fim < 0:
+                continue
+            bruto = codigo[m.end() : fim]
+            if dona is None and len(bruto) <= _BRUTO_MAXIMO:
+                dois_pontos = _ESPACOS_JS.match(codigo, pos).end()
+                if codigo.startswith(":", dois_pontos):
+                    chave = _desescapar(bruto)
+                    valor_em = _ESPACOS_JS.match(codigo, dois_pontos + 1).end()
+                    continue
+            self._literal(bruto, dona, camada)
+        if chave is not None:
+            self._texto(None, chave)
+
+    def _literal(self, bruto: str, chave: str | None, camada: int) -> None:
+        texto = None
+        if _TEXTO_MINIMO <= len(bruto) <= _BRUTO_MAXIMO:  # desescapar nunca alonga o texto
+            texto = _desescapar(bruto)
+            self._texto(chave, texto)
+        # o JSON dentro da string: as aspas dele vêm escapadas (`\"`, ou `"` cru numa string de apóstrofo ou crase)
+        if camada + 1 < _CAMADAS and ('"' in bruto or "\\x22" in bruto or "\\u0022" in bruto):
+            self.ler(_desescapar(bruto) if texto is None else texto, _ABRE_NA_STRING, camada + 1)
+
+    def _texto(self, chave: str | None, texto: str) -> None:
+        texto = " ".join(texto.split())  # uma linha só: quebras (inclusive U+2028) e espaços repetidos viram um espaço
+        if self.truncado or texto in self._vistos or not _e_texto_natural(texto):
+            return
+        if chave is not None:
+            chave = " ".join(chave.split())
+            if not chave or len(chave) > _CHAVE_MAXIMA or _CONTROLE.search(chave):
+                chave = None
+        linha = f"{chave} = {texto}" if chave else texto
+        tamanho = len(linha) + (1 if self.linhas else 0)  # com a quebra que a separa da anterior
+        cheio = self._caracteres + tamanho > MAX_CARACTERES_DO_TEXTO_INTERNO
+        if cheio or len(self.linhas) >= MAX_LINHAS_DO_TEXTO_INTERNO:
+            self.truncado = True
+            return
+        self._vistos.add(texto)
+        self._caracteres += tamanho
+        self.linhas.append(linha)
+        self.sem_chaves.append(" " * (len(linha) - len(texto)) + texto)
+
+
+def _ler_scripts(html: str) -> _LeitorDeScripts:
+    leitor = _LeitorDeScripts()
+    for script in _scripts_embutidos(html):
+        leitor.ler(script, _ABRE_NO_CODIGO, 0)
+        if leitor.truncado:
+            break
+    return leitor
+
+
+def texto_interno(html: str) -> TextoInterno:
+    """Os textos internos do aplicativo: as strings de linguagem natural dos `<script>` embutidos (sem `src`) do
+    `html`, inclusive JSON e o payload do Next.js (`self.__next_f.push`), com os escapes de JS e de JSON desfeitos,
+    também em camadas (o JSON dentro de uma string). Sem duplicatas, na ordem do documento, até
+    `MAX_LINHAS_DO_TEXTO_INTERNO` linhas e `MAX_CARACTERES_DO_TEXTO_INTERNO` caracteres (acima disso, corta entre
+    linhas e marca `truncado`). Ver `_e_texto_natural` para o que é texto.
+
+    São as mensagens de telas que o visitante não vê (`Saques de rendimento estão bloqueados.`): o HTML é do site
+    investigado, então o texto é dado não confiável.
+    """
+    leitor = _ler_scripts(html)
+    return TextoInterno("\n".join(leitor.linhas), leitor.truncado)
+
+
 # ---------------------------------------------------------------------------- nó
 
 
@@ -775,38 +1035,78 @@ def _escolher_fonte(entradas: dict[str, dict]) -> tuple[str, list[dict]]:
     raise ErroNo("sem texto de página", permanente=True)
 
 
-def _juntar(
-    do_texto: list[Candidato], dos_atributos: list[Candidato], truncadas: set[str]
-) -> tuple[list[Candidato], set[str]]:
-    """Os do texto e depois os dos atributos que o texto ainda não tem, com o teto da página inteira."""
-    vistos = {(c.categoria, c.valor) for c in do_texto}
-    por_categoria: Counter[str] = Counter()
-    juntos: list[Candidato] = []
-    for c in (*do_texto, *(c for c in dos_atributos if (c.categoria, c.valor) not in vistos)):
+def _acrescentar(ja: list[Candidato], novos: Iterable[Candidato], truncadas: set[str]) -> list[Candidato]:
+    """Os `novos` cuja (categoria, valor) a página ainda não tem em `ja`, enquanto a categoria cabe no teto da página
+    (contando os de `ja`). A categoria que passa do teto vai para `truncadas`."""
+    vistos = {(c.categoria, c.valor) for c in ja}
+    por_categoria = Counter(c.categoria for c in ja)
+    aceitos: list[Candidato] = []
+    for c in novos:
+        if (c.categoria, c.valor) in vistos:
+            continue
         if por_categoria[c.categoria] >= TETO_POR_CATEGORIA:
             truncadas.add(c.categoria)
             continue
         por_categoria[c.categoria] += 1
-        juntos.append(c)
-    return juntos, truncadas
+        vistos.add((c.categoria, c.valor))
+        aceitos.append(c)
+    return aceitos
+
+
+def _juntar(
+    do_texto: list[Candidato], dos_atributos: list[Candidato], truncadas: set[str]
+) -> tuple[list[Candidato], set[str]]:
+    """Os do texto e depois os dos atributos que o texto ainda não tem, com o teto da página inteira."""
+    return [*do_texto, *_acrescentar(do_texto, dos_atributos, truncadas)], truncadas
 
 
 def _ler(s: Servicos, ref: str) -> str:
     return s.custodia.ler(ref).decode("utf-8", errors="replace")
 
 
-class ExtracaoNo(NoBase):
-    """Roda `extrair` e `extrair_atributos` em cada página da fonte e junta os candidatos.
+def _candidatos_internos(
+    html: str, url: str, s: Servicos, refs_lidas: set[str], truncadas: set[str]
+) -> list[Candidato]:
+    """Guarda o texto interno do `html` na custódia (`tipo="texto_interno"`, `origem=url`, `.txt`) e devolve os
+    candidatos dele, com `extra.origem = "texto_interno"`. Sem texto interno, nada é guardado. O texto já lido em
+    outra página (`refs_lidas`) é guardado de novo, com esta origem, mas os candidatos dele já saíram."""
+    leitor = _ler_scripts(html)
+    if leitor.truncado:
+        truncadas.add(ORIGEM_TEXTO_INTERNO)
+    if not leitor.linhas:
+        return []
+    texto = "\n".join(leitor.linhas)
+    ref = s.custodia.guardar(texto.encode("utf-8"), "txt", tipo=ORIGEM_TEXTO_INTERNO, origem=url)
+    if ref in refs_lidas:
+        return []
+    refs_lidas.add(ref)
+    candidatos, truncadas_internas = _montar(
+        _achados("\n".join(leitor.sem_chaves)), texto, ref, origem=ORIGEM_TEXTO_INTERNO
+    )
+    truncadas |= truncadas_internas
+    return candidatos
 
-    A fonte é o `wayback_snapshot`, quando ele está nas entradas, ou a `captura` (se não foi bloqueada).
+
+class ExtracaoNo(NoBase):
+    """Roda `extrair`, `extrair_atributos` e as regex sobre o `texto_interno` em cada página da fonte e junta os
+    candidatos.
+
+    A fonte é o `wayback_snapshot`, quando ele está nas entradas, ou a `captura` (se não foi bloqueada). O texto
+    interno de cada página com HTML vai para a custódia como artefato derivado (`tipo="texto_interno"`, `origem` = url
+    da página, `.txt`), para ser lido no `ver_artefato` e citado pelo `sha256`.
     Saídas:
     - `candidatos`: os campos do `Candidato`, como dicionários (o motor grava e repassa as saídas em JSON).
-      Os do texto vêm primeiro, com `artefato` = ref do texto da página e `posicao` = índice nele; depois
-      os dos atributos do HTML (`href`, `src`, `action`) que o texto não tem, com `artefato` = ref do HTML
-      e `posicao` = offset do atributo. O mesmo achado em páginas diferentes sai uma vez por página;
+      Página a página, os do texto vêm primeiro, com `artefato` = ref do texto da página e `posicao` = índice
+      nele; depois os dos atributos do HTML (`href`, `src`, `action`) que o texto não tem, com `artefato` = ref
+      do HTML e `posicao` = offset do atributo. O mesmo achado em páginas diferentes sai uma vez por página.
+      Depois dos de todas as páginas vêm os do texto interno, página a página, com `artefato` = ref do texto
+      interno, `posicao` = índice nele e `extra.origem = "texto_interno"`: só os que a página ainda não tem e
+      dentro do teto dela. O dicionário do aplicativo se repete em todas as páginas, então o mesmo achado do texto
+      interno sai uma vez só, na primeira página em que aparece;
     - `fonte`: `"wayback_snapshot"` ou `"captura"`;
     - `truncado`: `{url da página: [categorias]}` das que passaram de `TETO_POR_CATEGORIA` candidatos na
-      página (ficam os primeiros); `{}` se nenhuma.
+      página (ficam os primeiros), na ordem da tabela, e por último `"texto_interno"` se o texto interno da página
+      passou de `MAX_LINHAS_DO_TEXTO_INTERNO` linhas ou `MAX_CARACTERES_DO_TEXTO_INTERNO` caracteres; `{}` se nada.
     """
 
     nome = "extracao"
@@ -818,21 +1118,34 @@ class ExtracaoNo(NoBase):
         self, ctx: Contexto, entradas: dict[str, dict], respostas: dict, s: Servicos
     ) -> Feito:
         fonte, paginas = _escolher_fonte(entradas)
-        candidatos: list[dict] = []
-        truncado: dict[str, set[str]] = {}
+        lidas: list[tuple[str, list[Candidato], list[Candidato], set[str]]] = []  # url, da página, internos, truncadas
+        refs_internas: set[str] = set()
         for pagina in paginas:
             ref = pagina["texto"]
-            do_texto, truncadas = _extrair_texto(_ler(s, ref), ref)
+            url = pagina.get("url") or ref
+            da_pagina, truncadas = _extrair_texto(_ler(s, ref), ref)
+            internos: list[Candidato] = []
             if ref_html := pagina.get("html"):
-                dos_atributos, truncadas_html = _extrair_atributos(_ler(s, ref_html), ref_html)
-                do_texto, truncadas = _juntar(do_texto, dos_atributos, truncadas | truncadas_html)
-            candidatos.extend(c.model_dump() for c in do_texto)
+                html = _ler(s, ref_html)
+                dos_atributos, truncadas_html = _extrair_atributos(html, ref_html)
+                da_pagina, truncadas = _juntar(da_pagina, dos_atributos, truncadas | truncadas_html)
+                internos = _candidatos_internos(html, url, s, refs_internas, truncadas)
+            lidas.append((url, da_pagina, internos, truncadas))
+        candidatos = [c for _, da_pagina, _, _ in lidas for c in da_pagina]
+        vistos_internos: set[tuple[str, str]] = set()
+        for _, da_pagina, internos, truncadas in lidas:
+            novos = [c for c in internos if (c.categoria, c.valor) not in vistos_internos]
+            vistos_internos.update((c.categoria, c.valor) for c in internos)
+            candidatos.extend(_acrescentar(da_pagina, novos, truncadas))
+        truncado: dict[str, set[str]] = {}
+        for url, _, _, truncadas in lidas:
             if truncadas:
-                truncado.setdefault(pagina.get("url") or ref, set()).update(truncadas)
+                truncado.setdefault(url, set()).update(truncadas)
+        ordem = (*_CATEGORIAS, ORIGEM_TEXTO_INTERNO)
         return Feito(
             {
-                "candidatos": candidatos,
+                "candidatos": [c.model_dump() for c in candidatos],
                 "fonte": fonte,
-                "truncado": {url: [c for c in _CATEGORIAS if c in cs] for url, cs in truncado.items()},
+                "truncado": {url: [c for c in ordem if c in cs] for url, cs in truncado.items()},
             }
         )

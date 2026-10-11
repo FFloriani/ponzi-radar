@@ -16,6 +16,7 @@ from radar.config import Config, RedeConfig
 from radar.custodia import Custodia
 from radar.modelos import Contexto, ErroNo, Evidencia, Pendencia, Resposta
 from radar.motor import Servicos
+from radar.nos.extracao import ExtracaoNo
 from radar.pendencias.definicoes import nova_pendencia
 from radar.pendencias.mascara import mascarar, montar_mascara
 from radar.pendencias.validacao import FonteArquivada, Validacao, arquivar_fonte, validar
@@ -171,6 +172,27 @@ async def test_html_so_vale_o_texto_visivel(ctx, serv):
     ref = guardar(serv, pagina())
     v = await validar(confirmado(ev(ref, "texto só no script")), pend(ctx), ctx, serv)
     assert (v.aceita, v.motivo) == (False, "trecho não encontrado na fonte")
+
+
+async def test_trecho_do_texto_interno_e_conferido_no_artefato_que_a_extracao_guardou(ctx, serv):
+    # o texto de um script não vale citado no HTML (o teste acima), mas vale no texto interno, o artefato derivado
+    html = '<script>window.t = {"saque.rendimento.bloqueado":"Saques de rendimento estão bloqueados."};</script>'
+    login = {
+        "url": "https://exemplo.com.br/login", "texto": guardar(serv, "Entrar", "txt"), "html": guardar(serv, html)
+    }  # fmt: skip
+    feito = await ExtracaoNo().executar(ctx, {"captura": {"paginas": [login], "bloqueada": False}}, {}, serv)
+    (candidato,) = feito.saidas["candidatos"]
+    assert candidato["extra"] == {"origem": "texto_interno"}
+    fonte = candidato["artefato"]
+    assert serv.custodia.tipos(fonte) == {"texto_interno"}
+
+    async def validar_b(fonte: str, trecho: str) -> Validacao:
+        return await validar(confirmado(ev(fonte, trecho), valor=VALOR_B), pend(ctx, "P-B"), ctx, serv)
+
+    for trecho in ("SAQUES de rendimento estao bloqueados", "saque.rendimento.bloqueado = Saques de rendimento"):
+        assert await validar_b(fonte, trecho) == Validacao(True, None, None, [])
+    assert (await validar_b(fonte, "Saques de rendimento liberados")).motivo == "trecho não encontrado na fonte"
+    assert (await validar_b(login["html"], "Saques de rendimento estão bloqueados")).aceita is False
 
 
 async def test_html_em_iso_8859_1_sem_cabecalho_de_charset(ctx, serv):

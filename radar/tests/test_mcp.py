@@ -33,6 +33,7 @@ from radar.motor import Motor, NoBase
 from radar.nos.alvo import AlvoNo
 from radar.nos.cvm import _guardar as guardar_indice
 from radar.nos.destino import DestinoNo
+from radar.nos.extracao import ExtracaoNo
 from radar.nos.pendencias import PendNo
 from radar.pendencias.definicoes import CABECALHO_NAO_CONFIAVEL, DEFINICOES, nova_pendencia
 from radar.pendencias.mascara import MARCADOR
@@ -733,6 +734,41 @@ async def test_ver_artefato_por_tipo(abrir, tmp_path):
     for invalida in ("0" * 64, "sha256:../../estado", "sha256:" + "A" * 64, "md5:abc"):
         r = await chamar(srv, "ver_artefato", run_id=run_id, sha256=invalida)
         assert r == {"erro": "ref inválida: use sha256:<64 hex>"}
+
+
+class CapturaComScript(NoBase):
+    """A `captura` de uma página cujo HTML traz o dicionário de textos do aplicativo num <script> embutido."""
+
+    nome = "captura"
+    entradas = ("alvo",)
+    HTML = (
+        '<html><body><p>Entrar</p><script>window.t = {"saque.rendimento.bloqueado":'
+        '"Saques de rendimento estão bloqueados.","bonus.indicacao":"Bônus de indicação de 10% no 1º nível"};'
+        "</script></body></html>"
+    ).encode()
+
+    async def executar(self, ctx, entradas, respostas, s):
+        guardar = s.custodia.guardar
+        pagina = {
+            "url": ctx.url_inicial,
+            "status": 200,
+            "texto": guardar(b"Entrar", "txt", tipo="texto", origem=ctx.url_inicial),
+            "html": guardar(self.HTML, "html", tipo="pagina", origem=ctx.url_inicial),
+        }
+        return Feito({"paginas": [pagina], "bloqueada": False})
+
+
+async def test_ver_artefato_mostra_o_texto_interno(abrir, tmp_path):
+    extracao = ExtracaoNo(opcionais=("captura",), exige_um_de=("captura",))
+    srv = await abrir([AlvoNo(), CapturaComScript(), extracao])
+    run_id = await iniciar(srv)
+    candidatos = ler_json(pasta(tmp_path, run_id) / "evidencias.json")["extracao"]["candidatos"]
+    refs = {c["artefato"] for c in candidatos}
+    assert len(refs) == 1 and {c["extra"]["origem"] for c in candidatos} == {"texto_interno"}
+    assert await chamar(srv, "ver_artefato", run_id=run_id, sha256=refs.pop()) == {
+        "texto": f"{CABECALHO_NAO_CONFIAVEL}\nsaque.rendimento.bloqueado = Saques de rendimento estão bloqueados.\n"
+        "bonus.indicacao = Bônus de indicação de 10% no 1º nível"
+    }
 
 
 async def test_screenshot_grande_demais(abrir, tmp_path):

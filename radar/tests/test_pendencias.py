@@ -344,6 +344,18 @@ def test_criterios_da_p_e_definem_a_prova_de_aportes_novos():
     assert "prova_aportes_novos" in c and "tipos_validos" in c and "modificadores_validos" in c
 
 
+FRASE_DO_TEXTO_INTERNO = (
+    "Candidatos com extra.origem=texto_interno vêm de textos internos do aplicativo embutidos na página (mensagens de "
+    "telas que o visitante não vê): mostram o que o sistema faz ou pode fazer, não que já aconteceu."
+)
+
+
+@pytest.mark.parametrize("pendencia_id", list(DEFINICOES))
+def test_criterios_explicam_os_candidatos_do_texto_interno(pendencia_id):
+    criterios = DEFINICOES[pendencia_id].criterios
+    assert (FRASE_DO_TEXTO_INTERNO in criterios) == (pendencia_id in {"P-A1", "P-A3", "P-B", "P-C", "P-E"})
+
+
 # ---------------------------------------------------------------------------- nova_pendencia
 
 

@@ -9,7 +9,7 @@ from datetime import date, datetime
 import pytest
 
 from radar.config import Config, RedeConfig
-from radar.custodia import Custodia
+from radar.custodia import Custodia, registros
 from radar.execucao import criar_contexto, criar_servicos
 from radar.modelos import Candidato, ErroNo, Feito, Pulado
 from radar.motor import Motor, NoBase
@@ -17,6 +17,8 @@ from radar.nos import nos_do_nucleo
 from radar.cnpj_util import normalizar_cnpj
 from radar.nos import extracao as modulo_extracao
 from radar.nos.extracao import (
+    MAX_CARACTERES_DO_TEXTO_INTERNO,
+    MAX_LINHAS_DO_TEXTO_INTERNO,
     TETO_POR_CATEGORIA,
     ExtracaoNo,
     _minusculas,
@@ -24,6 +26,7 @@ from radar.nos.extracao import (
     converter_para_mes,
     extrair,
     extrair_atributos,
+    texto_interno,
 )
 from radar.rede import Rede
 
@@ -1184,6 +1187,301 @@ def test_html_hostil_termina_rapido(nome):
     assert len(cs) <= 5 * TETO_POR_CATEGORIA  # whatsapp, telegram, rede_social, email e carteira
 
 
+# ---------------------------------------------------------------------------- textos internos (scripts embutidos)
+
+# O formato do aceite de 08/10/2026 (phinvestimentos.com/login): o dicionário de textos do aplicativo num <script>
+# embutido, com as mensagens de telas que o visitante não vê. O <script src> não é lido.
+HTML_I18N = (
+    '<!doctype html><html><head><script src="/_next/static/chunks/main.js" async=""></script>'
+    "<script>window.__TEXTOS__ = {"
+    '"saque.backend.erro.rendimento.bloqueado.mensagem":"Saques de rendimento estão bloqueados.",'
+    '"notificacao.backend.info.bonus_indicacao.titulo":"+{valor} de bônus de indicação ({nivel}º nível)",'
+    '"botao.ok":"OK",'
+    '"layout.classe":"flex items-center justify-between",'
+    '"cdn":"https://cdn.exemplo.com/static/app.js"'
+    "};</script></head><body><p>Entrar</p></body></html>"
+)
+LINHAS_I18N = [
+    "saque.backend.erro.rendimento.bloqueado.mensagem = Saques de rendimento estão bloqueados.",
+    "notificacao.backend.info.bonus_indicacao.titulo = +{valor} de bônus de indicação ({nivel}º nível)",
+]
+
+
+def linhas_internas(html: str) -> list[str]:
+    texto = texto_interno(html).texto
+    return texto.split("\n") if texto else []
+
+
+def script_com(dicionario: dict, ascii_: bool = False) -> str:
+    return f"<script>var t = {json.dumps(dicionario, ensure_ascii=ascii_)};</script>"
+
+
+def next_f(rsc: str) -> str:
+    """O <script> do payload do Next.js (App Router): as linhas do RSC numa string JS, em `self.__next_f.push`. O JSON
+    das linhas vem escapado dentro da string (`\\"chave\\":\\"texto\\"`), como no HTML do aceite."""
+    return f"<script>self.__next_f.push([1,{json.dumps(rsc, ensure_ascii=False)}])</script>"
+
+
+def test_texto_interno_le_o_dicionario_de_textos_de_um_script_embutido():
+    interno = texto_interno(HTML_I18N)
+    assert interno.texto.split("\n") == LINHAS_I18N
+    assert interno.truncado is False
+
+
+def test_texto_interno_le_o_payload_do_next_em_camadas():
+    # o JSON do RSC com \uXXXX (ensure_ascii) dentro da string JS: dois níveis de escape para desfazer
+    mensagens = {
+        "saque.backend.erro.rollover.pendente.mensagem": (
+            "Você ainda precisa apostar {0} (rollover de {1}x) para sacar o saldo de apostas."
+        ),
+        "investimento.backend.erro.investimentos.bloqueados.mensagem": (
+            "Novos investimentos estão temporariamente desativados."
+        ),
+    }
+    rsc = (
+        '1:"$Sreact.fragment"\n3:I[39756,["/_next/static/chunks/3crtxfly8a8hw.js"],"default"]\n'
+        f'5:["$","$L6",null,{{"mensagens":{json.dumps(mensagens)}}}]\n'
+    )
+    html = "<html><body><p>Entrar</p><script>(self.__next_f=self.__next_f||[]).push([0])</script>" + next_f(rsc)
+    assert "\\\\u00ea" in html  # o "ê" escapado duas vezes
+    assert linhas_internas(html + "</body></html>") == [f"{chave} = {texto}" for chave, texto in mensagens.items()]
+
+
+def test_texto_interno_string_sem_chave_aspas_simples_crase_e_json():
+    html = (
+        "<script>var avisos = ['Saque mínimo de cinquenta reais', \"Indique amigos e ganhe bônus\"];"
+        "const t = `Rendimento creditado todo dia útil`; f({titulo: 'Plano Ouro com retorno fixo'});</script>"
+        '<script type="application/json" id="__NEXT_DATA__">'
+        '{"props":{"pageProps":{"aviso":"Plano com rendimento de 1% ao dia"}}}</script>'
+    )
+    assert linhas_internas(html) == [
+        "Saque mínimo de cinquenta reais",
+        "Indique amigos e ganhe bônus",
+        "Rendimento creditado todo dia útil",
+        "Plano Ouro com retorno fixo",  # chave sem aspas não é lida como chave
+        "aviso = Plano com rendimento de 1% ao dia",
+    ]
+
+
+def test_texto_interno_chave_sem_valor_de_texto_vale_sozinha_se_for_texto():
+    html = (
+        '<script>var t = {"Saques liberados todos os dias": 1, "configuracao": {"Indique e ganhe bônus": true}};'
+        "</script>"
+    )
+    assert linhas_internas(html) == ["Saques liberados todos os dias", "Indique e ganhe bônus"]
+
+
+def test_texto_interno_so_le_o_script_sem_src():
+    html = (
+        '<script src="/app.js">var a = "Texto que o navegador nunca roda";</script>'
+        '<SCRIPT type="text/javascript">var b = "Texto do script em maiúsculas";</SCRIPT>'
+        '<scripts>var c = "Isto não é uma tag de script";</scripts>'
+        '<script data-src="x">var d = "O data-src não é o src do script";</script>'
+    )
+    assert linhas_internas(html) == ["Texto do script em maiúsculas", "O data-src não é o src do script"]
+
+
+def test_texto_interno_sem_script_ou_sem_texto_e_vazio():
+    assert texto_interno("<html><body><p>Saques liberados todos os dias</p></body></html>") == ("", False)
+    assert texto_interno('<script>var a = 1; var b = "x";</script>') == ("", False)
+    assert texto_interno("") == ("", False)
+
+
+@pytest.mark.parametrize(
+    "texto",
+    [
+        "OK",
+        "Curta demai",  # 11 caracteres
+        "Saquesbloqueadosemtodasascontas",  # uma palavra
+        " ".join(["palavra"] * 40),  # 319 caracteres
+        "https://cdn.exemplo.com/static/chunks/app.js",
+        "/_next/static/chunks/app/page-1a2b3c.js /_next/static/chunks/main.js",
+        "flex items-center justify-between",
+        "text-sm font-medium text-muted-foreground",
+        "relative flex min-h-screen flex-col",
+        "md:flex hidden dark:bg-gray-900",
+        "function(a){return a&&b}",
+        "if (a && b) return carregar",
+        "e => e.preventDefault() || nada",
+        "valor === undefined ? vazio : cheio",
+        '<div class="aviso">Saques bloqueados agora</div>',
+        "</script><p>Saques bloqueados agora</p>",
+        "Código de verificação 3f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c",
+        "dados QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo= aqui",
+        "1234 5678 9012 3456 7890",
+        "dd/MM/yyyy HH:mm:ss",
+        "Linha com controle \x07 no meio",
+        "C:\\Users\\fulano\\arquivo de texto",
+    ],
+)
+def test_texto_interno_so_fica_texto_de_linguagem_natural(texto):
+    assert linhas_internas(script_com({"k": texto})) == []
+
+
+@pytest.mark.parametrize(
+    "texto",
+    [
+        "Saques só são permitidos nos seguintes dias: {0}",
+        "Bem-vindo ao painel do investidor",
+        "E-mail ou senha inválidos.",
+        "Acesse https://exemplo.com para sacar seu saldo",
+        "{{count}} indicações ativas na sua rede",
+        "Inconstitucionalissimamente proibido por aqui",
+        "Doze letras!",  # 12 caracteres e 2 palavras
+        " ".join(["palavra"] * 37) + " pala",  # 300 caracteres
+    ],
+)
+def test_texto_interno_aceita_texto_de_linguagem_natural(texto):
+    assert len(texto) >= 12
+    assert linhas_internas(script_com({"k": texto})) == [f"k = {texto}"]
+
+
+def test_texto_interno_uma_string_por_linha_sem_duplicatas():
+    html = script_com(
+        {
+            "a": "Saques de rendimento estão bloqueados.",
+            "b": "Saques de rendimento estão bloqueados.",  # o mesmo texto com outra chave
+            "c": "Saque  de rendimento\n bloqueado\u2028agora",  # espaços e quebras viram um espaço
+            "chave\ncom quebra": "Texto da chave com quebra de linha",
+            "x" * 201: "Texto de uma chave longa demais",
+        }
+    ) + '<script>var d = "Saques de rendimento estão bloqueados.";</script>'
+    assert linhas_internas(html) == [
+        "a = Saques de rendimento estão bloqueados.",
+        "c = Saque de rendimento bloqueado agora",
+        "chave com quebra = Texto da chave com quebra de linha",
+        "Texto de uma chave longa demais",
+    ]
+
+
+def test_texto_interno_teto_de_linhas():
+    dicionario = {f"chave.{i}": f"Mensagem número {i} do aplicativo" for i in range(MAX_LINHAS_DO_TEXTO_INTERNO + 1000)}
+    interno = texto_interno(script_com(dicionario, ascii_=True))  # "número" escapado como \u00fa
+    linhas = interno.texto.split("\n")
+    assert len(linhas) == MAX_LINHAS_DO_TEXTO_INTERNO == 5_000
+    assert linhas[-1] == "chave.4999 = Mensagem número 4999 do aplicativo"
+    assert interno.truncado is True
+
+
+def test_texto_interno_no_teto_exato_nao_e_truncado():
+    dicionario = {f"chave.{i}": f"Mensagem número {i} do aplicativo" for i in range(MAX_LINHAS_DO_TEXTO_INTERNO)}
+    interno = texto_interno(script_com(dicionario))
+    assert len(interno.texto.split("\n")) == MAX_LINHAS_DO_TEXTO_INTERNO and interno.truncado is False
+
+
+def test_texto_interno_teto_de_caracteres():
+    dicionario = {f"c{i}": f"Mensagem {i:04d} " + "longa " * 47 for i in range(2_000)}
+    interno = texto_interno(script_com(dicionario))
+    linhas = interno.texto.split("\n")
+    assert MAX_CARACTERES_DO_TEXTO_INTERNO == 300_000
+    assert MAX_CARACTERES_DO_TEXTO_INTERNO - 400 < len(interno.texto) <= MAX_CARACTERES_DO_TEXTO_INTERNO
+    assert interno.truncado is True
+    # corta entre linhas, nunca no meio de uma
+    assert all(linha == f"c{i} = Mensagem {i:04d} " + " ".join(["longa"] * 47) for i, linha in enumerate(linhas))
+
+
+# --- textos internos hostis
+
+
+def test_texto_interno_string_de_1mb_nao_trava_e_o_resto_e_lido():
+    html = script_com({"grande": "a b " * 250_000, "depois": "Saques de rendimento estão bloqueados."})
+    assert len(html) > 1_000_000
+    inicio = time.perf_counter()
+    assert linhas_internas(html) == ["depois = Saques de rendimento estão bloqueados."]
+    assert time.perf_counter() - inicio < 5
+
+
+def test_texto_interno_script_fechado_escapado_dentro_da_string_nao_vaza_html():
+    html = (
+        '<script>var a = "Clique <\\/script><p>Parágrafo vazado</p> aqui"; '
+        'var b = "Texto que vem depois do escape";</script><p>Visível</p>'
+    )
+    texto = texto_interno(html).texto
+    assert texto == "Texto que vem depois do escape"
+    assert "<" not in texto and "Parágrafo" not in texto
+
+
+def test_texto_interno_script_fechado_de_verdade_dentro_da_string_termina_o_script():
+    # como no navegador: o </script> dentro da string fecha o script, e o que vem depois é HTML
+    html = (
+        '<script>var a = "Começo da string </script><p>Parágrafo visível da página</p>";</script>'
+        '<script>var b = "Texto do script seguinte ao quebrado";</script>'
+    )
+    assert linhas_internas(html) == ["Texto do script seguinte ao quebrado"]
+
+
+def test_texto_interno_escapes_invalidos_nao_derrubam():
+    html = (
+        r'<script>var t = {"a":"Escape \x4 quebrado \u12G4 e \ud800 sozinho no texto",'
+        r'"b":"Moeda \u{1F4B0} e \u{110000} fora do Unicode aqui","c":"Par \ud83d\udcb0 de substitutos certo",'
+        r'"d":"Aspas \' simples e \q desconhecido no meio","e":"Termina na barra \</script>'
+    )
+    interno = texto_interno(html)
+    assert interno.texto.split("\n") == [
+        "a = Escape x4 quebrado u12G4 e \ufffd sozinho no texto",
+        "b = Moeda \U0001f4b0 e \ufffd fora do Unicode aqui",
+        "c = Par \U0001f4b0 de substitutos certo",
+        "d = Aspas ' simples e q desconhecido no meio",
+    ]
+    interno.texto.encode("utf-8")  # sem substituto solto: o artefato grava em UTF-8
+
+
+@pytest.mark.parametrize("antes", [16_384, 16_383, 16_385, 40_000])
+def test_texto_interno_literal_longo_com_escape_em_qualquer_ponto(antes):
+    # a regex lê o corpo em blocos de 16.384 caracteres: o escape logo depois do fim de um bloco não fecha o literal
+    html = (
+        f'<script>var a = "{"a" * antes}\\nfim"; var b = "Texto depois do literal longo";'
+        f"var c = {json.dumps('x' * antes + chr(10) + 'Saques de rendimento estão bloqueados.')}</script>"
+    )
+    assert linhas_internas(html) == ["Texto depois do literal longo"]
+
+
+def test_texto_interno_payload_do_next_grande():
+    mensagens = {f"tela.{i}.mensagem": f"Mensagem número {i} da tela do aplicativo" for i in range(3_000)}
+    rsc = f'5:["$","$L6",null,{{"mensagens":{json.dumps(mensagens)}}}]\n'
+    html = next_f(rsc)
+    assert len(html) > 200_000
+    assert linhas_internas(html) == [f"{chave} = {texto}" for chave, texto in mensagens.items()]
+
+
+def test_texto_interno_le_o_codigo_e_ate_tres_strings_uma_dentro_da_outra():
+    texto = "Saques de rendimento estão bloqueados."
+    literal = json.dumps({"k": texto})
+    for camadas in range(1, 5):
+        literal = json.dumps(literal)  # o JSON dentro de `camadas` strings, a de fora no código do script
+        esperado = [f"k = {texto}"] if camadas <= 3 else []
+        assert linhas_internas(f"<script>var a = {literal};</script>") == esperado, camadas
+
+
+HOSTIS_INTERNOS = {
+    "aspas": "<script>" + '"' * 4_000_000 + "</script>",
+    "aspas_simples": "<script>" + "'" * 4_000_000,
+    "crases": "<script>" + "`" * 4_000_000,
+    "barras": '<script>"' + "\\" * 4_000_000 + '"</script>',
+    "aspas_escapadas": '<script>"' + '\\"' * 2_000_000 + '"</script>',
+    "abertas_por_linha": "<script>" + '"aberta\n' * 500_000 + "</script>",
+    "chaves_curtas": "<script>{" + '"a":"b",' * 500_000 + "}</script>",
+    "chaves_com_texto": "<script>{"
+    + "".join(f'"chave.{i}":"Mensagem número {i} do aplicativo",' for i in range(200_000))
+    + "}</script>",
+    "escapes": '<script>"' + "\\u00e9" * 650_000 + '"</script>',
+    "aninhado": "<script>" + json.dumps(json.dumps(json.dumps(json.dumps('"x":"y",' * 50_000)))) + "</script>",
+    "scripts": "<script>" * 1_000_000,
+    "scripts_vazios": "<script></script>" * 250_000,
+    "tags_sem_fim": "<script " * 600_000,
+    "fechamentos": "<script>" + "</scriptx" * 450_000,
+}
+
+
+@pytest.mark.parametrize("nome", sorted(HOSTIS_INTERNOS))
+def test_texto_interno_hostil_termina_rapido(nome):
+    inicio = time.perf_counter()
+    interno = texto_interno(HOSTIS_INTERNOS[nome])
+    assert time.perf_counter() - inicio < 5
+    assert len(interno.texto) <= MAX_CARACTERES_DO_TEXTO_INTERNO
+    assert len(interno.texto.split("\n")) <= MAX_LINHAS_DO_TEXTO_INTERNO
+
+
 # ---------------------------------------------------------------------------- nó
 
 
@@ -1431,6 +1729,139 @@ async def test_no_percentual_absurdo_nao_derruba_o_no(ctx, serv):
     p = pagina(serv, "https://alvo.com.br/", "Rende 10.000.000.000.000% ao dia e 1% ao mês. Pix")
     resultado = await ExtracaoNo().executar(ctx, {"captura": {"paginas": [p], "bloqueada": False}}, {}, serv)
     assert [c["valor"] for c in resultado.saidas["candidatos"]] == ["1|mes", "pix"]
+
+
+# --- textos internos no nó
+
+INTERNO = {"origem": "texto_interno"}
+
+
+def registros_internos(serv) -> list[dict]:
+    return [r for r in registros(serv.custodia.pasta) if r["tipo"] == "texto_interno"]
+
+
+async def _extrair_da_captura(ctx, serv, *paginas: dict):
+    return await ExtracaoNo().executar(ctx, {"captura": {"paginas": list(paginas), "bloqueada": False}}, {}, serv)
+
+
+async def test_no_le_os_textos_internos_e_guarda_o_artefato(ctx, serv):
+    p = pagina_com_html(serv, "https://alvo.com.br/login", "Entrar Esqueci a senha", HTML_I18N)
+    resultado = await _extrair_da_captura(ctx, serv, p)
+    (registro,) = registros_internos(serv)
+    ref = f"sha256:{registro['sha256']}"
+    interno = "\n".join(LINHAS_I18N)
+    assert registro["origem"] == "https://alvo.com.br/login"
+    assert serv.custodia.caminho(ref).suffix == ".txt" and serv.custodia.ler(ref) == interno.encode("utf-8")
+    cs = resultado.saidas["candidatos"]
+    assert [(c["categoria"], c["valor"], c["artefato"], c["extra"]) for c in cs] == [
+        ("saque", "saques", ref, INTERNO),
+        ("indicacao", "bônus de indicação", ref, INTERNO),
+    ]
+    # a posição e o trecho valem no texto interno, que é o que o Claude lê e cita (com a chave em volta)
+    inicio = interno.index("Saques")
+    assert cs[0]["posicao"] == inicio and cs[0]["trecho"] == interno[: inicio + len("saques") + 120]
+    assert resultado.saidas["truncado"] == {}
+    assert json.loads(json.dumps(cs)) == cs
+
+
+async def test_no_a_chave_do_texto_interno_nao_vira_candidato(ctx, serv):
+    html = script_com({"saque.investimento.pix.titulo": "Retire seu dinheiro quando quiser"})
+    resultado = await _extrair_da_captura(ctx, serv, pagina_com_html(serv, "https://alvo.com.br/", "Entrar", html))
+    assert resultado.saidas["candidatos"] == []
+    (registro,) = registros_internos(serv)
+    texto = serv.custodia.ler(f"sha256:{registro['sha256']}").decode("utf-8")
+    assert texto == "saque.investimento.pix.titulo = Retire seu dinheiro quando quiser"
+
+
+async def test_no_texto_interno_nao_repete_o_que_o_texto_visivel_ja_tem(ctx, serv):
+    p = pagina_com_html(serv, "https://alvo.com.br/login", "Saques pagos todo dia", HTML_I18N)
+    resultado = await _extrair_da_captura(ctx, serv, p)
+    ref = f"sha256:{registros_internos(serv)[0]['sha256']}"
+    assert [(c["categoria"], c["valor"], c["artefato"], c["extra"]) for c in resultado.saidas["candidatos"]] == [
+        ("saque", "saques", p["texto"], {}),
+        ("indicacao", "bônus de indicação", ref, INTERNO),
+    ]
+
+
+async def test_no_textos_internos_vem_depois_do_texto_de_todas_as_paginas(ctx, serv):
+    login = pagina_com_html(serv, "https://alvo.com.br/login", "Entrar", HTML_I18N)
+    planos = pagina(serv, "https://alvo.com.br/planos", "Pague via Pix")
+    resultado = await _extrair_da_captura(ctx, serv, login, planos)
+    ref = f"sha256:{registros_internos(serv)[0]['sha256']}"
+    assert [(c["valor"], c["artefato"]) for c in resultado.saidas["candidatos"]] == [
+        ("pix", planos["texto"]),
+        ("saques", ref),
+        ("bônus de indicação", ref),
+    ]
+
+
+async def test_no_o_mesmo_achado_do_texto_interno_sai_uma_vez(ctx, serv):
+    # o dicionário do aplicativo se repete em todas as páginas: o mesmo achado sai só na primeira
+    login = pagina_com_html(serv, "https://alvo.com.br/login", "Entrar", HTML_I18N)
+    extra = script_com({"x": "Seu plano rende 1% ao dia sem risco"})
+    cadastro = pagina_com_html(serv, "https://alvo.com.br/cadastro", "Cadastre-se", HTML_I18N + extra)
+    igual = pagina_com_html(serv, "https://alvo.com.br/entrar", "Entrar de novo", HTML_I18N)
+    resultado = await _extrair_da_captura(ctx, serv, login, cadastro, igual)
+    regs = registros_internos(serv)
+    assert [r["origem"] for r in regs] == [
+        "https://alvo.com.br/login", "https://alvo.com.br/cadastro", "https://alvo.com.br/entrar"
+    ]  # fmt: skip
+    assert regs[0]["sha256"] == regs[2]["sha256"] != regs[1]["sha256"]  # cada página registra o seu
+    do_login, do_cadastro = f"sha256:{regs[0]['sha256']}", f"sha256:{regs[1]['sha256']}"
+    assert [(c["valor"], c["artefato"]) for c in resultado.saidas["candidatos"]] == [
+        ("saques", do_login),
+        ("bônus de indicação", do_login),
+        ("1|dia", do_cadastro),
+        ("sem risco", do_cadastro),
+    ]
+
+
+async def test_no_texto_interno_respeita_o_teto_da_pagina(ctx, serv):
+    html = script_com({f"k{i}": f"Escreva para h{i}@b.co hoje mesmo" for i in range(30)})
+    p = pagina_com_html(serv, "https://alvo.com.br/", _emails(90), html)
+    resultado = await _extrair_da_captura(ctx, serv, p)
+    ref = f"sha256:{registros_internos(serv)[0]['sha256']}"
+    emails = [c for c in resultado.saidas["candidatos"] if c["categoria"] == "email"]
+    assert [c["artefato"] for c in emails] == [p["texto"]] * 90 + [ref] * 10
+    assert [c["valor"] for c in emails[90:]] == [f"h{i}@b.co" for i in range(10)]
+    assert resultado.saidas["truncado"] == {"https://alvo.com.br/": ["email"]}
+
+
+async def test_no_texto_interno_cortado_marca_o_truncado(ctx, serv):
+    dicionario = {f"chave.{i}": f"Mensagem número {i} do aplicativo" for i in range(MAX_LINHAS_DO_TEXTO_INTERNO + 1)}
+    p = pagina_com_html(serv, "https://alvo.com.br/", _emails(150), script_com(dicionario))
+    resultado = await _extrair_da_captura(ctx, serv, p)
+    # as categorias na ordem da tabela e, no fim, o texto interno cortado no teto
+    assert resultado.saidas["truncado"] == {"https://alvo.com.br/": ["email", "texto_interno"]}
+    (registro,) = registros_internos(serv)
+    texto = serv.custodia.ler(f"sha256:{registro['sha256']}").decode("utf-8")
+    assert len(texto.split("\n")) == MAX_LINHAS_DO_TEXTO_INTERNO
+
+
+@pytest.mark.parametrize("nome", ["aspas", "chaves_com_texto", "aninhado"])
+async def test_no_texto_interno_hostil_nao_trava_o_no(ctx, serv, nome):
+    p = pagina_com_html(serv, "https://alvo.com.br/", "Pix", HOSTIS_INTERNOS[nome])
+    inicio = time.perf_counter()
+    resultado = await _extrair_da_captura(ctx, serv, p)
+    assert time.perf_counter() - inicio < 10  # o HTML hostil passa pelos atributos e pelo texto interno
+    assert resultado.saidas["candidatos"][0]["valor"] == "pix"
+    assert len(json.dumps(resultado.saidas)) < 200_000
+
+
+async def test_no_sem_texto_interno_nao_guarda_artefato(ctx, serv):
+    html = '<a href="https://wa.me/5511999998888">x</a><script>var a = 1; var b = "curta";</script>'
+    resultado = await _extrair_da_captura(ctx, serv, pagina_com_html(serv, "https://alvo.com.br/", "Pix", html))
+    assert registros_internos(serv) == []
+    assert [c["valor"] for c in resultado.saidas["candidatos"]] == ["pix", "wa.me/5511999998888"]
+
+
+async def test_no_o_wayback_tambem_traz_os_textos_internos(ctx, serv):
+    p = {**pagina_com_html(serv, "http://alvo.com.br/", "Entrar", HTML_I18N), "timestamp": "20190606235936"}
+    wayback = {"paginas": [p], "falhas": [], "truncado": False}
+    resultado = await ExtracaoNo().executar(ctx, {"wayback_snapshot": wayback}, {}, serv)
+    (registro,) = registros_internos(serv)
+    assert registro["origem"] == "http://alvo.com.br/"
+    assert [c["valor"] for c in resultado.saidas["candidatos"]] == ["saques", "bônus de indicação"]
 
 
 # --- dentro do motor: as dependências, a normalização das saídas e a retomada
