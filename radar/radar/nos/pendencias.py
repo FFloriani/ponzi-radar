@@ -13,12 +13,16 @@ categorias que a definição lista) e:
 | Nó | Entradas (opcionais entre parênteses) | Gera |
 |---|---|---|
 | `pend_a1`, `pend_b`, `pend_d4` | (`extracao`) | sempre |
-| `pend_a2` | `extracao` | só com candidato `historico_rentabilidade` |
-| `pend_a3` | `pend_a1` (`extracao`) | P-A1 `confirmado`/`corrigido` com `pct_mes` > 0 ou `taxa_diaria`, ou candidato `investimento` |
+| `pend_a2` | `extracao` | só com candidato `historico_rentabilidade` visível |
+| `pend_a3` | `pend_a1` (`extracao`) | P-A1 `confirmado`/`corrigido` com `pct_mes` > 0 ou `taxa_diaria`, ou candidato `investimento` visível |
 | `pend_c` | (`extracao`, `cnpj`) | sempre; a empresa do `cnpj`, se há, é o candidato `empresa` |
 | `pend_c4` | (`cvm_alertas`, `cnpj`) | sempre; candidato `empresa` e as correspondências só por nome |
 | `pend_d1` | (`extracao`, `cnpj`, `cvm_sancionador`) | sempre; os sócios do `cnpj` e os processos da CVM são os candidatos |
 | `pend_e` | todos os coletores, opcionais | sempre |
+
+Visível é o candidato do texto da página ou dos atributos. O dos textos internos do aplicativo
+(`extra.origem = "texto_interno"`) não abre a P-A2 nem a P-A3 (ruling R-A-T3-a2), mas vai junto quando outro motivo
+as abre.
 
 O `cnpj` é opcional da P-C, da P-C4 e da P-D1 porque a pendência abre depois dele (a P-CNPJ pode estar aguardando)
 e usa o que ele achou. A `extracao` e o `cvm_alertas` são opcionais onde a pendência sai sempre (spec 7.1, I6 da
@@ -85,9 +89,16 @@ def _da_empresa(entradas: dict[str, dict]) -> list[Candidato]:
     return [Candidato(categoria="empresa", valor=cnpj, trecho=trecho, artefato="cnpj", posicao=0)]
 
 
+def _algum_visivel(candidatos: list[Candidato]) -> bool:
+    """Algum candidato veio do texto da página ou dos atributos, não dos textos internos do aplicativo. O rótulo de
+    uma tela que o visitante não vê (`Veja o histórico de rendimentos`) não abre pendência (ruling R-A-T3-a2): ele vai
+    junto quando um visível a abre."""
+    return any(not c.do_texto_interno for c in candidatos)
+
+
 def _preparar_a2(ctx: Contexto, entradas: dict[str, dict], s: Servicos) -> list[Candidato] | Pulado:
     candidatos = _da_extracao(entradas, "P-A2")
-    return candidatos if candidatos else Pulado("sem histórico de rentabilidade")
+    return candidatos if _algum_visivel(candidatos) else Pulado("sem histórico de rentabilidade")
 
 
 def _a1_promete_retorno(saida: dict | None) -> bool:
@@ -106,7 +117,7 @@ def _a1_promete_retorno(saida: dict | None) -> bool:
 
 def _preparar_a3(ctx: Contexto, entradas: dict[str, dict], s: Servicos) -> list[Candidato] | Pulado:
     candidatos = _da_extracao(entradas, "P-A3")
-    if candidatos or _a1_promete_retorno(entradas.get("pend_a1")):
+    if _algum_visivel(candidatos) or _a1_promete_retorno(entradas.get("pend_a1")):
         return candidatos
     return Pulado("sem oferta de investimento")
 

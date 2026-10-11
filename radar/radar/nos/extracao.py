@@ -49,7 +49,7 @@ from html.parser import HTMLParser
 from typing import Any, NamedTuple
 
 from radar.cnpj_util import cnpj_valido
-from radar.modelos import Candidato, Contexto, ErroNo, Feito
+from radar.modelos import ORIGEM_TEXTO_INTERNO, Candidato, Contexto, ErroNo, Feito
 from radar.motor import NoBase, Servicos
 
 TETO_POR_CATEGORIA = 100  # candidatos por (página, categoria); um site hostil não pode inflar o dossiê
@@ -767,7 +767,8 @@ def extrair_atributos(html: str, artefato: str) -> list[Candidato]:
 
 MAX_LINHAS_DO_TEXTO_INTERNO = 5_000  # por página
 MAX_CARACTERES_DO_TEXTO_INTERNO = 300_000  # por página, com as quebras de linha
-ORIGEM_TEXTO_INTERNO = "texto_interno"  # o `tipo` do artefato, o `extra.origem` dos candidatos e a marca do `truncado`
+# `ORIGEM_TEXTO_INTERNO` (de `radar.modelos`) é o `tipo` do artefato, o `extra.origem` dos candidatos e a marca do
+# `truncado`
 _TEXTO_MINIMO = 12  # caracteres de um texto de linguagem natural, depois de colapsar os espaços
 _TEXTO_MAXIMO = 300
 _CHAVE_MAXIMA = 200  # chave maior que isto não entra na linha: fica só o texto

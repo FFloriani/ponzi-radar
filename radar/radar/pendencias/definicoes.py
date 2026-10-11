@@ -37,8 +37,9 @@ MAX_CANDIDATOS_POR_CATEGORIA = 20  # a extração entrega até 100 por página e
 # os campos da pendência que levam texto do site (ou de fontes que o citam): o `valor` de uma rede social e o `extra`
 # de um alerta da CVM, por exemplo, também vêm de fora
 _NAO_CONFIAVEIS = ["conteudo_do_alvo", "candidatos[].trecho", "candidatos[].valor", "candidatos[].extra"]
-# nos critérios das pendências que leem o comportamento da oferta: a extração também acha candidatos nos textos dos
-# scripts embutidos na página (ver `texto_interno` em nos/extracao.py)
+# nos critérios de toda pendência que recebe candidatos da extração (as de `categorias` da página) e da P-E: a extração
+# também acha candidatos nos textos dos scripts embutidos na página (ver `texto_interno` em nos/extracao.py; ruling
+# R-A-T3-a2)
 _SOBRE_O_TEXTO_INTERNO = (
     "Candidatos com extra.origem=texto_interno vêm de textos internos do aplicativo embutidos na página (mensagens de "
     "telas que o visitante não vê): mostram o que o sistema faz ou pode fazer, não que já aconteceu."
@@ -67,6 +68,7 @@ _DEFINICOES = (
             "Escolha um candidato ou informe outro CNPJ que uma fonte (rodapé, termos, contrato, registro oficial) "
             "ligue ao operador do site. Gateway de pagamento, contabilidade e parceiros não valem. "
             "Sem fonte, responda nao_encontrado e diga onde procurou."
+            f" {_SOBRE_O_TEXTO_INTERNO}"
         ),
         modelo_valor=ValorCNPJ,
         categorias=("cnpj",),
@@ -100,6 +102,7 @@ _DEFINICOES = (
             "constantes, sem nenhum mês de perda, num ativo ou estratégia que oscilaria (cripto, câmbio, trading). "
             "Série com meses negativos e variação plausível: false. Sem série divulgada, responda nao_encontrado "
             "e diga onde procurou. Valem os resultados publicados até o as_of."
+            f" {_SOBRE_O_TEXTO_INTERNO}"
         ),
         modelo_valor=ValorA2,
         categorias=("historico_rentabilidade",),
@@ -219,6 +222,7 @@ _DEFINICOES = (
             "oferta. Liste em tipos as figuras presentes. Depoimento de cliente anônimo ou sem identificação não "
             "conta. Procure nas páginas do site e nas redes sociais do operador (os candidatos são os links dessas "
             "redes) e considere só o que existia no as_of."
+            f" {_SOBRE_O_TEXTO_INTERNO}"
         ),
         modelo_valor=ValorD4,
         categorias=("rede_social",),
@@ -304,7 +308,8 @@ def validos_da_matriz(matriz: Any) -> dict[str, str]:
 
 def _conteudo_do_alvo(candidatos: list[Candidato], categorias: tuple[str, ...]) -> str:
     """O cabeçalho de dado não confiável e, abaixo, uma linha `[categoria] trecho` por candidato das `categorias`,
-    até `LIMITE_CONTEUDO_DO_ALVO` caracteres.
+    até `LIMITE_CONTEUDO_DO_ALVO` caracteres. O candidato dos textos internos do aplicativo sai como
+    `[categoria, texto interno] trecho`.
 
     O trecho vira uma linha só (um trecho do site não simula outra linha nem outro cabeçalho). As linhas entram
     uma de cada categoria por vez, na ordem das categorias: um site que enche uma categoria não esvazia as
@@ -314,7 +319,8 @@ def _conteudo_do_alvo(candidatos: list[Candidato], categorias: tuple[str, ...]) 
     for candidato in candidatos:
         if candidato.categoria in linhas:
             trecho = " ".join(candidato.trecho.split())
-            linhas[candidato.categoria].append(f"[{candidato.categoria}] {trecho}")
+            rotulo = f"{candidato.categoria}, texto interno" if candidato.do_texto_interno else candidato.categoria
+            linhas[candidato.categoria].append(f"[{rotulo}] {trecho}")
     texto = CABECALHO_NAO_CONFIAVEL
     for rodada in zip_longest(*linhas.values()):
         for linha in rodada:

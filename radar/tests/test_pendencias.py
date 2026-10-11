@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 from types import SimpleNamespace
 
@@ -44,6 +45,7 @@ from tests.matriz_spec import MATRIZ_SPEC
 AGORA = datetime(2026, 10, 7, 12, 0, 0)
 PETROBRAS = "33000167000101"
 ALFANUMERICO = "12ABC34501DE35"
+INTERNO = {"origem": "texto_interno"}
 
 
 def contexto(pasta, as_of: date = date(2026, 10, 7), modo_cego: bool = False) -> Contexto:
@@ -80,6 +82,11 @@ def candidato(categoria: str, valor: str = "x", trecho: str | None = None, posic
         artefato="sha256:abc",
         posicao=posicao,
     ).model_dump()
+
+
+def interno(categoria: str, valor: str = "x", trecho: str | None = None) -> dict:
+    """Um candidato que a extração achou nos textos internos do aplicativo (`extra.origem = "texto_interno"`)."""
+    return {**candidato(categoria, valor, trecho), "extra": {"origem": "texto_interno"}}
 
 
 def entradas_da_extracao(*candidatos: dict) -> dict:
@@ -350,10 +357,32 @@ FRASE_DO_TEXTO_INTERNO = (
 )
 
 
+# as que recebem candidatos da extração (os de categorias da página) e a P-E, que lê tudo (ruling R-A-T3-a2)
+COM_CANDIDATOS_DO_TEXTO_INTERNO = {"P-CNPJ", "P-A1", "P-A2", "P-A3", "P-B", "P-C", "P-D4", "P-E"}
+
+
+def test_toda_pendencia_com_candidatos_da_extracao_esta_na_lista_da_frase():
+    assert {pid for pid, d in DEFINICOES.items() if d.categorias} | {"P-E"} == COM_CANDIDATOS_DO_TEXTO_INTERNO
+
+
 @pytest.mark.parametrize("pendencia_id", list(DEFINICOES))
 def test_criterios_explicam_os_candidatos_do_texto_interno(pendencia_id):
     criterios = DEFINICOES[pendencia_id].criterios
-    assert (FRASE_DO_TEXTO_INTERNO in criterios) == (pendencia_id in {"P-A1", "P-A3", "P-B", "P-C", "P-E"})
+    assert (FRASE_DO_TEXTO_INTERNO in criterios) == (pendencia_id in COM_CANDIDATOS_DO_TEXTO_INTERNO)
+
+
+def test_conteudo_do_alvo_marca_o_candidato_do_texto_interno(ctx):
+    candidatos = [
+        candidato("saque", "saques", "Saques pagos todo dia"),
+        interno("saque", "saque", "saque.erro.bloqueado = Saque bloqueado até nova ordem"),
+        interno("indicacao", "bônus de indicação", "bonus.titulo = +{valor} de bônus de indicação"),
+    ]
+    p = nova_pendencia("P-B", ctx, candidatos, "pend_b")
+    assert p.conteudo_do_alvo.split("\n")[1:] == [
+        "[indicacao, texto interno] bonus.titulo = +{valor} de bônus de indicação",
+        "[saque] Saques pagos todo dia",
+        "[saque, texto interno] saque.erro.bloqueado = Saque bloqueado até nova ordem",
+    ]
 
 
 # ---------------------------------------------------------------------------- nova_pendencia
@@ -719,6 +748,62 @@ async def test_pend_a2_gera_com_historico(ctx, serv):
     p = r.pendencias[0]
     assert (p.id, [c.valor for c in p.candidatos]) == ("P-A2", ["mês a mês"])
     assert "rentabilidade mês a mês" in p.conteudo_do_alvo
+
+
+async def _extracao_do_script(ctx, serv, dicionario: dict) -> dict:
+    """A saída da extração real de uma página que só tem `dicionario` num <script> embutido."""
+    custodia = serv.custodia
+    pagina = {
+        "url": "https://exemplo.com.br/",
+        "texto": custodia.guardar(b"Entrar", "txt", tipo="texto", origem="https://exemplo.com.br/"),
+        "html": custodia.guardar(
+            f"<script>window.t = {json.dumps(dicionario, ensure_ascii=False)};</script>".encode(), "html",
+            tipo="pagina", origem="https://exemplo.com.br/",
+        ),
+    }  # fmt: skip
+    feito = await ExtracaoNo().executar(ctx, {"captura": {"paginas": [pagina], "bloqueada": False}}, {}, serv)
+    return {"extracao": feito.saidas}
+
+
+async def test_pend_a2_nao_abre_so_com_historico_do_texto_interno(ctx, serv):
+    # ruling R-A-T3-a2: o rótulo de uma tela de extrato não é série de retornos divulgada
+    entradas = await _extracao_do_script(ctx, serv, {"extrato.titulo": "Veja o histórico de rendimentos da sua conta"})
+    candidatos = entradas["extracao"]["candidatos"]
+    assert [(c["categoria"], c["extra"]) for c in candidatos] == [("historico_rentabilidade", INTERNO)]
+    assert await PendNo("pend_a2").executar(ctx, entradas, {}, serv) == Pulado("sem histórico de rentabilidade")
+
+
+async def test_pend_a2_aberta_por_um_visivel_leva_tambem_o_do_texto_interno(ctx, serv):
+    visivel = candidato("historico_rentabilidade", "mês a mês", "rentabilidade mês a mês: 3%, 3%, 3%")
+    escondido = interno("historico_rentabilidade", "histórico de rendimento", "extrato.titulo = Veja o histórico")
+    r = await PendNo("pend_a2").executar(ctx, entradas_da_extracao(visivel, escondido), {}, serv)
+    assert isinstance(r, Aguardando)
+    p = r.pendencias[0]
+    assert [(c.valor, c.extra) for c in p.candidatos] == [("mês a mês", {}), ("histórico de rendimento", INTERNO)]
+    assert "[historico_rentabilidade, texto interno] extrato.titulo = Veja o histórico" in p.conteudo_do_alvo
+    assert FRASE_DO_TEXTO_INTERNO in p.criterios
+
+
+async def test_pend_a3_nao_abre_so_com_investimento_do_texto_interno(ctx, serv):
+    # a ruling vale também para a P-A3 (M1): a mensagem de uma tela não é oferta de investimento
+    entradas = await _extracao_do_script(ctx, serv, {"inv.ok": "Seu investimento foi confirmado com sucesso"})
+    assert [c["categoria"] for c in entradas["extracao"]["candidatos"]] == ["investimento"]
+    sem_promessa = {**entradas, "pend_a1": saida_da_pend_a1("confirmado")}
+    assert await PendNo("pend_a3").executar(ctx, sem_promessa, {}, serv) == Pulado("sem oferta de investimento")
+    # com a P-A1 prometendo retorno, a P-A3 abre e leva o candidato interno
+    com_promessa = {**entradas, "pend_a1": saida_da_pend_a1("confirmado", pct_mes=5.0)}
+    r = await PendNo("pend_a3").executar(ctx, com_promessa, {}, serv)
+    assert isinstance(r, Aguardando) and [c.extra for c in r.pendencias[0].candidatos] == [INTERNO]
+
+
+async def test_pend_a3_aberta_por_um_investimento_visivel_leva_tambem_o_interno(ctx, serv):
+    entradas = {
+        **entradas_da_extracao(interno("investimento", "investimento"), candidato("investimento", "investir")),
+        "pend_a1": saida_da_pend_a1("confirmado"),
+    }
+    r = await PendNo("pend_a3").executar(ctx, entradas, {}, serv)
+    assert isinstance(r, Aguardando)
+    assert [(c.valor, c.extra) for c in r.pendencias[0].candidatos] == [("investimento", INTERNO), ("investir", {})]
 
 
 @pytest.mark.parametrize(

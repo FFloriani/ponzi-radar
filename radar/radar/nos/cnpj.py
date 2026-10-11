@@ -14,6 +14,10 @@ ou, sem ela, pelo primeiro achado (o titular vem antes dos CNPJs da página). De
 - com CNPJ na página e sem titular: uma raiz só, usa a dela; várias (o gateway de pagamento e a contabilidade
   também aparecem no rodapé), abre a P-CNPJ com um candidato por raiz. O nó nunca escolhe sozinho na dúvida.
 
+O CNPJ que a extração achou só nos textos internos do aplicativo (`extra.origem = "texto_interno"`, mensagens de telas
+que o visitante não vê) conta para a dúvida, mas nunca é escolhido sozinho: a raiz única que só está neles abre a
+P-CNPJ com ela como candidato (ruling R-A-T3-cnpj). O CNPJ que está também no texto visível vale como visível.
+
 A consulta é à BrasilAPI e, se ela falhar de qualquer jeito (inclusive resposta sem `razao_social` ou de outro
 CNPJ), ao minhareceita.org, que devolve o mesmo esquema (por isso um parser só serve às duas). O JSON bruto
 vai para a custódia. Das saídas ficam só os campos usados; o quadro de sócios sai com nome, qualificação e
@@ -166,13 +170,16 @@ def _titular(entradas: dict[str, dict]) -> str | None:
 
 
 def _da_extracao(entradas: dict[str, dict]) -> list[Candidato]:
-    """Os candidatos `cnpj` da extração, sem repetir o valor (fica o primeiro). Sem a `extracao` (a página não pôde
-    ser lida), nenhum: vale só o titular do RDAP."""
+    """Os candidatos `cnpj` da extração, sem repetir o valor (fica o primeiro; o CNPJ que está no texto visível e
+    também nos textos internos do aplicativo fica como visível, em qualquer ordem). Sem a `extracao` (a página não
+    pôde ser lida), nenhum: vale só o titular do RDAP."""
     vistos: dict[str, Candidato] = {}
     for bruto in (entradas.get("extracao") or {}).get("candidatos") or []:
         candidato = Candidato.model_validate(bruto)
         if candidato.categoria == "cnpj" and cnpj_valido(candidato.valor):
-            vistos.setdefault(candidato.valor, candidato)
+            anterior = vistos.get(candidato.valor)
+            if anterior is None or (anterior.do_texto_interno and not candidato.do_texto_interno):
+                vistos[candidato.valor] = candidato
     return list(vistos.values())
 
 
@@ -193,14 +200,21 @@ def _escolher(titular: str | None, candidatos: list[Candidato]) -> str | list[Ca
 
     Dúvida é: sem titular, nenhum CNPJ na página ou mais de uma raiz nela; com titular, a página citar CNPJ
     de raízes que não incluem a dele. Sem CNPJ na página, o titular basta.
+
+    Sozinho, o nó só escolhe o titular ou uma raiz do texto visível. A raiz que só aparece nos textos internos do
+    aplicativo (`extra.origem = "texto_interno"`: o exemplo de um campo de cadastro, o gateway de uma tela de
+    pagamento) nunca é escolhida sem o Claude (ruling R-A-T3-cnpj): sem titular, abre a P-CNPJ com ela como
+    candidato. Ela conta, como as outras, para a dúvida que abre a P-CNPJ.
     """
     da_pagina = _grupos_por_raiz([c.valor for c in candidatos])
+    por_valor = {c.valor: c for c in candidatos}
     if titular is not None and (not da_pagina or titular[:8] in da_pagina):
         grupos = _grupos_por_raiz([titular, *(c.valor for c in candidatos)])
         return _representante(grupos[titular[:8]])
     if titular is None and len(da_pagina) == 1:
-        return _representante(next(iter(da_pagina.values())))
-    por_valor = {c.valor: c for c in candidatos}
+        (grupo,) = da_pagina.values()
+        if not all(por_valor[cnpj].do_texto_interno for cnpj in grupo):
+            return _representante(grupo)
     escolhidos = [por_valor[_representante(grupo)] for grupo in da_pagina.values()]
     return [_candidato_do_titular(titular), *escolhidos] if titular is not None else escolhidos
 

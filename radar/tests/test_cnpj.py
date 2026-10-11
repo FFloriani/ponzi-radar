@@ -474,6 +474,91 @@ async def test_titular_e_extracao_com_o_mesmo_cnpj_contam_uma_vez(respx_mock, ct
     assert isinstance(r, Feito) and r.saidas["cnpj"] == PETROBRAS
 
 
+# --- CNPJ dos textos internos do aplicativo (ruling R-A-T3-cnpj): nunca escolhido sozinho
+
+INTERNO = {"origem": "texto_interno"}
+EXEMPLO_DE_CAMPO = "11222333000181"
+assert cnpj_valido(EXEMPLO_DE_CAMPO)
+
+
+def candidato_interno(cnpj: str, posicao: int = 0) -> dict:
+    """Um candidato `cnpj` que a extração achou nos textos internos do aplicativo (scripts embutidos)."""
+    return {**candidato(cnpj, posicao), "extra": dict(INTERNO)}
+
+
+async def _extracao_com_script(ctx, serv, texto: str, dicionario: dict) -> dict:
+    """A saída da extração real de uma página com `texto` visível e `dicionario` num <script> embutido."""
+    url = "https://exemplo.com.br/cadastro"
+    html = f"<html><body><p>{texto}</p><script>window.t = {json.dumps(dicionario, ensure_ascii=False)};</script>"
+    pagina = {
+        "url": url,
+        "texto": serv.custodia.guardar(texto.encode(), "txt", tipo="texto", origem=url),
+        "html": serv.custodia.guardar(html.encode(), "html", tipo="pagina", origem=url),
+    }
+    feito = await ExtracaoNo().executar(ctx, {"captura": {"paginas": [pagina], "bloqueada": False}}, {}, serv)
+    return feito.saidas
+
+
+async def test_cnpj_so_do_texto_interno_vai_para_a_p_cnpj(respx_mock, ctx_hoje, serv):
+    # o exemplo de um campo de cadastro, numa tela que o visitante não vê, não é o CNPJ do operador
+    rota = mocar_brasilapi(respx_mock, EXEMPLO_DE_CAMPO)
+    placeholder = "Digite o CNPJ da empresa (ex.: 11.222.333/0001-81)"
+    script = {"cadastro.cnpj.placeholder": placeholder}
+    extracao = await _extracao_com_script(ctx_hoje, serv, "Cadastro de empresa", script)
+    assert [(c["valor"], c["extra"]) for c in extracao["candidatos"]] == [(EXEMPLO_DE_CAMPO, INTERNO)]
+    sem_titular = {"extracao": extracao, "rdap": {"cnpj_titular": None, "vazamento_temporal": []}}
+    r = await CnpjNo().executar(ctx_hoje, sem_titular, {}, serv)
+    assert isinstance(r, Aguardando)
+    (p,) = r.pendencias
+    assert [(c.valor, c.extra) for c in p.candidatos] == [(EXEMPLO_DE_CAMPO, INTERNO)]
+    assert f"[cnpj, texto interno] cadastro.cnpj.placeholder = {placeholder}" in p.conteudo_do_alvo
+    assert "Candidatos com extra.origem=texto_interno" in p.criterios
+    assert rota.call_count == 0  # nenhuma consulta: quem decide é o Claude
+
+
+async def test_cnpj_visivel_que_tambem_e_interno_vale_como_visivel(respx_mock, ctx_hoje, serv):
+    rota = mocar_brasilapi(respx_mock, PETROBRAS)
+    # o interno vem antes na lista: a escolha não depende da ordem
+    interno_antes = entradas(extras=[candidato_interno(PETROBRAS), candidato(PETROBRAS)])
+    r = await CnpjNo().executar(ctx_hoje, interno_antes, {}, serv)
+    assert isinstance(r, Feito) and r.saidas["cnpj"] == PETROBRAS
+    assert rota.call_count == 1
+
+
+async def test_cnpj_da_pagina_e_do_texto_interno_de_outra_raiz_abrem_a_p_cnpj(respx_mock, ctx_hoje, serv):
+    # o interno de outra raiz não é escolhido, mas continua sendo a dúvida que abre a pendência
+    rota = mocar_brasilapi(respx_mock, PETROBRAS)
+    r = await CnpjNo().executar(ctx_hoje, entradas(PETROBRAS, extras=[candidato_interno(CAIXA, 10)]), {}, serv)
+    assert isinstance(r, Aguardando)
+    assert [(c.valor, c.extra) for c in r.pendencias[0].candidatos] == [(PETROBRAS, {}), (CAIXA, INTERNO)]
+    assert rota.call_count == 0
+
+
+async def test_titular_e_cnpj_interno_de_outra_raiz_abrem_a_p_cnpj(respx_mock, ctx_hoje, serv):
+    rota = mocar_brasilapi(respx_mock, PETROBRAS)
+    r = await CnpjNo().executar(ctx_hoje, entradas(extras=[candidato_interno(CAIXA)], titular=PETROBRAS), {}, serv)
+    assert isinstance(r, Aguardando)
+    assert [(c.valor, c.extra) for c in r.pendencias[0].candidatos] == [
+        (PETROBRAS, {"origem": "rdap"}),
+        (CAIXA, INTERNO),
+    ]
+    assert rota.call_count == 0
+
+
+async def test_titular_com_o_mesmo_cnpj_no_texto_interno_vale_o_titular(respx_mock, ctx_hoje, serv):
+    mocar_brasilapi(respx_mock, PETROBRAS)
+    r = await CnpjNo().executar(ctx_hoje, entradas(extras=[candidato_interno(PETROBRAS)], titular=PETROBRAS), {}, serv)
+    assert isinstance(r, Feito) and r.saidas["cnpj"] == PETROBRAS
+
+
+async def test_raiz_visivel_com_a_matriz_so_no_texto_interno_usa_a_matriz(respx_mock, ctx_hoje, serv):
+    # a raiz (a empresa) está no texto visível: a matriz dela representa a raiz, como nos outros casos
+    rota = mocar_brasilapi(respx_mock, PETROBRAS)
+    r = await CnpjNo().executar(ctx_hoje, entradas(PETROBRAS_FILIAL, extras=[candidato_interno(PETROBRAS)]), {}, serv)
+    assert isinstance(r, Feito) and r.saidas["cnpj"] == PETROBRAS
+    assert rota.call_count == 1
+
+
 async def test_nenhum_candidato_abre_pendencia_sem_candidatos(ctx_hoje, serv):
     r = await CnpjNo().executar(ctx_hoje, entradas(), {}, serv)
     assert isinstance(r, Aguardando)

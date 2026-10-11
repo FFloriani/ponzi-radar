@@ -34,6 +34,10 @@ class Contexto(BaseModel):
         return self.as_of < self.data_execucao.date()
 
 
+# o `extra["origem"]` do candidato que a extração achou nos textos internos do aplicativo (scripts embutidos na página)
+ORIGEM_TEXTO_INTERNO = "texto_interno"
+
+
 class Candidato(BaseModel):
     categoria: str
     valor: str
@@ -41,6 +45,13 @@ class Candidato(BaseModel):
     artefato: str
     posicao: int
     extra: dict = Field(default_factory=dict)
+
+    @property
+    def do_texto_interno(self) -> bool:
+        """Achado nos textos internos do aplicativo (mensagens de telas que o visitante não vê): mostra o que o sistema
+        faz ou pode fazer, não que já aconteceu. Não abre pendência nem escolhe o CNPJ sozinho (rulings R-A-T3-a2 e
+        R-A-T3-cnpj)."""
+        return self.extra.get("origem") == ORIGEM_TEXTO_INTERNO
 
 
 class Pendencia(BaseModel):
