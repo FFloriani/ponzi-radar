@@ -621,11 +621,11 @@ def test_dossie_dominio_reaproveitado_marca_a_linha_do_tempo(tmp_path):
     # os de depois, e o que não é histórico do domínio (CNPJ aberto em 2014), não
     assert "| 2026-09-30 | Último snapshot no Wayback | Wayback CDX |" in linhas
     assert "| 2014-01-10 | CNPJ aberto | Receita Federal (brasilapi) |" in linhas
-    # o registro de novo entra ao lado do registro, na data dele
-    registro = "| 2026-09-29 | Domínio registrado | RDAP |"
+    # o registro de novo toma o lugar do registro, na data dele: uma linha só, sem "Domínio registrado" ao lado
     de_novo = "| 2026-09-29 | Domínio registrado de novo; o histórico anterior pode ser de outro dono | RDAP e Wayback |"
-    assert registro in linhas and de_novo in linhas
-    assert linhas.index(registro) < linhas.index(de_novo)
+    assert de_novo in linhas
+    assert "| 2026-09-29 | Domínio registrado | RDAP |" not in linhas
+    assert sum("2026-09-29" in linha for linha in linhas) == 1
     datas = ["2014-01-10", "2014-09-27", "2020-11-11", "2026-09-29", "2026-09-30"]
     posicoes = [s4.index(f"| {d} |") for d in datas]
     assert posicoes == sorted(posicoes)
@@ -655,6 +655,8 @@ def test_dossie_dominio_reaproveitado_a_nota_do_d3_e_os_pontos_nao_mudam(tmp_pat
         "que pode ser de outro dono"
     ) in d3
     assert "confirmado" in d3 and "1/1" in d3
+    # a frase troca o "domínio registrado em X": a data do registro aparece uma vez na nota
+    assert "domínio registrado em" not in d3 and d3.count("2026-09-29") == 1
     # o mesmo caso sem histórico anterior: a única diferença do veredito e da tabela é a nota do D3
     depois = {"primeiro_certificado": "2026-10-01", "total": 1, "sans": []}
     wayback = {**_reaproveitado()["wayback_indice"], "primeiro": "2026-10-01"}
@@ -673,6 +675,10 @@ def test_dossie_sem_dominio_reaproveitado_nao_avisa(tmp_path):
     texto = dossie(gravar(tmp_path))
     for frase in SEM_AVISO:
         assert frase not in texto, frase
+    # sem o aviso, a linha do tempo e a nota do D3 são as de sempre
+    assert "| 2015-03-02 | Domínio registrado | RDAP |" in secao(texto, 4).splitlines()
+    d3 = next(linha for linha in secao(texto, 3).splitlines() if linha.startswith("| D3"))
+    assert "domínio registrado em 2015-03-02" in d3
 
 
 @pytest.mark.parametrize(

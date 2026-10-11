@@ -335,7 +335,8 @@ def _linha_do_tempo(ex: ExecucaoSalva, sinais: list[Sinal], alertas: list[Alerta
     por data (o que não tem data vai para o fim).
 
     Com o domínio reaproveitado, os eventos de histórico do domínio (certificado e snapshots) anteriores ao registro
-    levam o sufixo `SUFIXO_REGISTRO_ANTERIOR` e entra o evento do registro de novo."""
+    levam o sufixo `SUFIXO_REGISTRO_ANTERIOR` e o evento "Domínio registrado de novo" toma o lugar do "Domínio
+    registrado"."""
     reaproveitado = dominio_reaproveitado(ex)
     registro = reaproveitado["registro"] if reaproveitado is not None else None
 
@@ -344,9 +345,7 @@ def _linha_do_tempo(ex: ExecucaoSalva, sinais: list[Sinal], alertas: list[Alerta
         return _evento(data, rotulo + SUFIXO_REGISTRO_ANTERIOR if anterior else rotulo, fonte)
 
     eventos = []
-    if (rdap := saida(ex, "rdap")) and data_iso(rdap.get("registro")):
-        eventos.append(_evento(rdap["registro"][:10], "Domínio registrado", "RDAP"))
-    if reaproveitado is not None:
+    if reaproveitado is not None:  # toma o lugar do "Domínio registrado": a data é a mesma
         eventos.append(
             _evento(
                 reaproveitado["registro"],
@@ -354,6 +353,8 @@ def _linha_do_tempo(ex: ExecucaoSalva, sinais: list[Sinal], alertas: list[Alerta
                 f"RDAP e {reaproveitado['fonte_historico']}",
             )
         )
+    elif (rdap := saida(ex, "rdap")) and data_iso(rdap.get("registro")):
+        eventos.append(_evento(rdap["registro"][:10], "Domínio registrado", "RDAP"))
     if (cnpj := saida(ex, "cnpj")) and cnpj.get("cnpj") and data_iso(cnpj.get("abertura")):
         eventos.append(_evento(cnpj["abertura"][:10], "CNPJ aberto", f"Receita Federal ({cnpj.get('fonte') or '?'})"))
     if (ct := saida(ex, "ct")) and data_iso(ct.get("primeiro_certificado")):

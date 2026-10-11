@@ -49,6 +49,7 @@ TIPO_E0 = "registro_recente"
 TIPO_FORA_DO_AR = "site_fora_do_ar"
 _ESTAGIO_E0 = "E0"
 _DIAS_E0 = 90
+_ROTULO_DOMINIO = "domínio registrado"
 _DIAS_REAPROVEITADO = 30  # o histórico do domínio tem de ser mais de 30 dias anterior ao registro
 _FONTE_COLETOR = "coletor"
 # Os motivos de erro da captura (radar/nos/captura.py grava, o E6 lê; I2 da revisão final):
@@ -587,6 +588,18 @@ def _item_c4(ex: ExecucaoSalva, matriz: Matriz) -> Item:
     return _item_da_pendencia(ex, "C4", matriz)
 
 
+_AAAA_MM_DD = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _data_iso_no_as_of(saida: dict, campo: str, as_of: date) -> date | None:
+    """Como `_data_no_as_of`, mas só lê `AAAA-MM-DD` (com hora depois, se vier): o `date.fromisoformat` do Python 3.11+
+    também lê `20260929` e `2026-W39-2`, formatos que os coletores nunca gravam e que aqui contariam como data."""
+    valor = saida.get(campo)
+    if not isinstance(valor, str) or _AAAA_MM_DD.fullmatch(valor[:10]) is None:
+        return None
+    return _data_no_as_of(saida, campo, as_of)
+
+
 def dominio_reaproveitado(ex: ExecucaoSalva) -> dict[str, str] | None:
     """Domínio expirado e registrado de novo: o histórico mais antigo do `ct` (`primeiro_certificado`) ou do
     `wayback_indice` (`primeiro`) é mais de 30 dias anterior ao `registro` do `rdap`. O histórico pode ser de outro
@@ -598,12 +611,12 @@ def dominio_reaproveitado(ex: ExecucaoSalva) -> dict[str, str] | None:
     mexe em pontos nem em estado de item."""
     as_of = ex.ctx.as_of
     rdap = _feito(ex, "rdap")
-    if rdap is None or (registro := _data_no_as_of(rdap, "registro", as_of)) is None:
+    if rdap is None or (registro := _data_iso_no_as_of(rdap, "registro", as_of)) is None:
         return None
     historicos = []
     for no, campo, fonte in (("ct", "primeiro_certificado", "crt.sh"), ("wayback_indice", "primeiro", "Wayback")):
         saida = _feito(ex, no)
-        if saida is not None and (data := _data_no_as_of(saida, campo, as_of)) is not None:
+        if saida is not None and (data := _data_iso_no_as_of(saida, campo, as_of)) is not None:
             historicos.append((data, fonte))
     if not historicos:
         return None
@@ -615,13 +628,14 @@ def dominio_reaproveitado(ex: ExecucaoSalva) -> dict[str, str] | None:
 
 def _item_d3(ex: ExecucaoSalva, matriz: Matriz) -> Item:
     """Domínio registrado ou CNPJ aberto menos de `meses_limite` meses antes do `as_of`. Sem empresa identificada, só
-    o domínio conta; uma data que não se sabe impede o `nao_se_aplica`. Com o domínio reaproveitado, a nota avisa; os
-    pontos e o estado são os mesmos."""
+    o domínio conta; uma data que não se sabe impede o `nao_se_aplica`. Com o domínio reaproveitado, a frase do aviso
+    toma o lugar de "domínio registrado em X" na nota (a data não se repete) ou, se o domínio não aparece na nota,
+    vai no fim dela; os pontos e o estado são os mesmos."""
     info = matriz.itens["D3"]
     as_of = ex.ctx.as_of
     conhecidas: list[tuple[str, date]] = []
     desconhecidas: list[str] = []
-    for rotulo, no, campo in (("domínio registrado", "rdap", "registro"), ("CNPJ aberto", "cnpj", "abertura")):
+    for rotulo, no, campo in ((_ROTULO_DOMINIO, "rdap", "registro"), ("CNPJ aberto", "cnpj", "abertura")):
         saida = _feito(ex, no)
         if saida is None:
             desconhecidas.append(_sem_resultado(ex, no))
@@ -639,16 +653,24 @@ def _item_d3(ex: ExecucaoSalva, matriz: Matriz) -> Item:
             f"{reaproveitado['historico_desde']} ({reaproveitado['fonte_historico']}), que pode ser de outro dono"
         )
 
-    def item(estado: EstadoItem, nota: str, pontos: int = 0, origem: str = "coletor") -> Item:
-        nota = f"{nota}; {aviso}" if aviso else nota
-        return Item(id="D3", estado=estado, pontos=pontos, maximo=info.max, origem=origem, nota=nota)
+    def fragmento(rotulo: str, data: date) -> str:
+        """"domínio registrado em X", ou a frase do aviso no lugar dele: a data do registro não se repete."""
+        return aviso if aviso and rotulo == _ROTULO_DOMINIO else f"{rotulo} em {data.isoformat()}"
+
+    def item(estado: EstadoItem, partes: list[str], sufixo: str = "", pontos: int = 0, origem: str = "coletor") -> Item:
+        if aviso and aviso not in partes:  # o domínio não está na nota (D3 só pelo CNPJ, ou data desconhecida)
+            partes = [*partes, aviso]
+        return Item(
+            id="D3", estado=estado, pontos=pontos, maximo=info.max, origem=origem, nota="; ".join(partes) + sufixo
+        )
 
     if novas := [(r, d) for r, d in conhecidas if as_of < _somar_meses(d, info.meses_limite)]:
-        return item("confirmado", "; ".join(f"{r} em {d.isoformat()}" for r, d in novas), pontos=info.max)
+        return item("confirmado", [fragmento(r, d) for r, d in novas], pontos=info.max)
     if desconhecidas or not conhecidas:
-        return item("nao_verificado", "; ".join(desconhecidas) or "sem datas", origem="nenhuma")
-    nota = "; ".join(f"{r} em {d.isoformat()}" for r, d in conhecidas) + f": {info.meses_limite} meses ou mais"
-    return item("nao_se_aplica", nota)
+        return item("nao_verificado", desconhecidas or ["sem datas"], origem="nenhuma")
+    return item(
+        "nao_se_aplica", [fragmento(r, d) for r, d in conhecidas], sufixo=f": {info.meses_limite} meses ou mais"
+    )
 
 
 def itens_da_execucao(ex: ExecucaoSalva, matriz: Matriz) -> dict[str, Item]:

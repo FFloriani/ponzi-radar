@@ -791,6 +791,27 @@ def test_dominio_reaproveitado_data_de_historico_ilegivel_nao_acusa(lixo):
     assert dominio_reaproveitado(com_historico(ct=lixo, wayback=lixo)) is None
 
 
+@pytest.mark.parametrize("formato", ["20260929", "2026-W39-2", "2026-09", "26-09-29", "29/09/2026", " 2026-09-29"])
+def test_dominio_reaproveitado_so_aceita_data_aaaa_mm_dd_no_registro(formato):
+    # o `date.fromisoformat` do Python 3.11+ lê 20260929 e 2026-W39-2; os coletores só gravam AAAA-MM-DD
+    assert dominio_reaproveitado(com_historico(registro=formato)) is None
+
+
+@pytest.mark.parametrize("formato", ["20140927", "2014-W39-6", "2014-09", "27/09/2014"])
+def test_dominio_reaproveitado_so_aceita_data_aaaa_mm_dd_no_historico(formato):
+    assert dominio_reaproveitado(com_historico(ct=formato, wayback=formato)) is None
+    # um dos dois ilegível: vale o outro
+    so_wayback = dominio_reaproveitado(com_historico(ct=formato))
+    assert so_wayback == {"registro": "2026-09-29", "historico_desde": "2014-09-27", "fonte_historico": "Wayback"}
+
+
+def test_dominio_reaproveitado_aceita_data_com_hora_depois():
+    ex = com_historico(registro="2026-09-29T12:30:00Z", ct="2020-11-11T00:00:00", wayback=None)
+    assert dominio_reaproveitado(ex) == {
+        "registro": "2026-09-29", "historico_desde": "2020-11-11", "fonte_historico": "crt.sh",
+    }  # fmt: skip
+
+
 def test_dominio_reaproveitado_saida_que_nao_e_objeto_nao_quebra():
     ex = com_historico()
     ex.saidas["ct"] = ["2020-11-11"]
@@ -824,7 +845,9 @@ def test_d3_ganha_a_nota_do_dominio_reaproveitado_sem_mudar_pontos_nem_estado(ma
     d3 = item(ex, "D3")
     # registro de 8 dias antes do as_of: o D3 continua confirmado com 1 ponto
     assert (d3.estado, d3.pontos, d3.origem) == ("confirmado", 1, "coletor")
-    assert d3.nota == f"domínio registrado em 2026-09-29; {NOTA_REAPROVEITADO}"
+    # a frase do reaproveitamento troca o "domínio registrado em X": a data do registro aparece uma vez só
+    assert d3.nota == NOTA_REAPROVEITADO
+    assert "domínio registrado em" not in d3.nota and d3.nota.count("2026-09-29") == 1
     # o resto da execução pontua igual com ou sem o histórico: só a nota muda
     controle = com_historico(ct="2026-10-01", wayback="2026-10-01")
     assert dominio_reaproveitado(controle) is None
@@ -836,29 +859,60 @@ def test_d3_ganha_a_nota_do_dominio_reaproveitado_sem_mudar_pontos_nem_estado(ma
     assert sem["D3"].nota == "domínio registrado em 2026-09-29"
 
 
-@pytest.mark.parametrize(
-    "extra,estado",
-    [
-        ({"cnpj": {**base()["cnpj"], "abertura": "2014-01-10"}}, "nao_se_aplica"),
-        ({"cnpj": {**base()["cnpj"], "abertura": None}}, "nao_verificado"),
-    ],
-)
-def test_d3_nota_do_reaproveitado_tambem_nos_outros_estados(extra, estado, matriz):
-    # domínio de 2015 com histórico desde 2010: não é recente (nao_se_aplica) ou o CNPJ é desconhecido
-    rdap = {**base()["rdap"], "registro": "2015-03-02"}
-    ex = execucao(
+FRASE_2015 = "domínio registrado de novo em 2015-03-02; há histórico desde 2010-02-03 (Wayback), que pode ser de outro dono"
+FRASE_2025 = "domínio registrado de novo em 2025-01-10; há histórico desde 2010-02-03 (Wayback), que pode ser de outro dono"
+
+
+def _com_historico_de_2010(registro: str, cnpj: dict | None = None, **kw) -> ExecucaoSalva:
+    """Domínio registrado em `registro` com certificado de 2012 e Wayback de 2010 (o as_of é 2026-10-07)."""
+    return execucao(
         {
-            **extra, "rdap": rdap,
+            "rdap": {**base()["rdap"], "registro": registro},
             "ct": {"primeiro_certificado": "2012-06-01", "total": 2, "sans": []},
             "wayback_indice": {"primeiro": "2010-02-03", "ultimo": "2026-09-30", "total": 9, "por_mes": {}, "truncado": False},
-        }
+            **({"cnpj": {**base()["cnpj"], **cnpj}} if cnpj is not None else {}),
+        },
+        **kw,
     )  # fmt: skip
-    d3 = item(ex, "D3")
-    assert (d3.estado, d3.pontos) == (estado, 0)
-    assert d3.nota.endswith(
-        "domínio registrado de novo em 2015-03-02; há histórico desde 2010-02-03 (Wayback), que pode ser de outro dono"
-    )
+
+
+@pytest.mark.parametrize(
+    "registro,cnpj,estado,pontos,nota",
+    [
+        # nao_se_aplica: nada é recente; a frase troca o "domínio registrado em", sem repetir a data
+        ("2015-03-02", {"abertura": "2014-01-10"}, "nao_se_aplica", 0, f"{FRASE_2015}; CNPJ aberto em 2014-01-10: 12 meses ou mais"),
+        # empresa não identificada: só o domínio conta
+        ("2015-03-02", {"cnpj": None, "motivo": "não encontrado"}, "nao_se_aplica", 0, f"{FRASE_2015}: 12 meses ou mais"),
+        # nao_verificado: o CNPJ é desconhecido e o domínio não aparece na nota; a frase vai no fim
+        ("2015-03-02", {"abertura": None}, "nao_verificado", 0, f"CNPJ aberto: data indisponível no as_of; {FRASE_2015}"),
+        # confirmado só pelo CNPJ recente: o domínio (antigo) não aparece, então a frase é anexada
+        ("2025-01-10", {"abertura": "2026-09-01"}, "confirmado", 1, f"CNPJ aberto em 2026-09-01; {FRASE_2025}"),
+        # confirmado pelos dois: a frase ocupa o lugar do domínio
+        (
+            "2026-09-29", {"abertura": "2026-09-01"}, "confirmado", 1,
+            "domínio registrado de novo em 2026-09-29; há histórico desde 2010-02-03 (Wayback), que pode ser de outro dono"
+            "; CNPJ aberto em 2026-09-01",
+        ),
+    ],
+    ids=["nao_se_aplica", "sem_cnpj", "nao_verificado", "confirmado_so_pelo_cnpj", "confirmado_pelos_dois"],
+)  # fmt: skip
+def test_d3_nota_do_reaproveitado_nos_outros_estados(registro, cnpj, estado, pontos, nota, matriz):
+    d3 = item(_com_historico_de_2010(registro, cnpj), "D3")
+    assert (d3.estado, d3.pontos) == (estado, pontos)
+    assert d3.nota == nota
+    # a data do registro só aparece uma vez e nunca na forma antiga
+    assert d3.nota.count(registro) == 1 and "domínio registrado em" not in d3.nota
     assert d3.nota.count("domínio registrado de novo") == 1
+
+
+def test_d3_confirmado_so_pelo_cnpj_recente_com_dominio_antigo_reaproveitado_nao_muda_pontos(matriz):
+    ex = _com_historico_de_2010("2025-01-10", {"abertura": "2026-09-01"})
+    controle = execucao({"rdap": {**base()["rdap"], "registro": "2025-01-10"}, "cnpj": {**base()["cnpj"], "abertura": "2026-09-01"}})
+    assert dominio_reaproveitado(controle) is None
+    d3, d3_controle = item(ex, "D3"), item(controle, "D3")
+    assert (d3.estado, d3.pontos, d3.origem) == (d3_controle.estado, d3_controle.pontos, d3_controle.origem)
+    assert (d3.estado, d3.pontos) == ("confirmado", 1)
+    assert d3_controle.nota == "CNPJ aberto em 2026-09-01"
 
 
 def test_d3_sem_dominio_reaproveitado_nao_muda_a_nota(matriz):
