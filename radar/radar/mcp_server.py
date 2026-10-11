@@ -92,6 +92,8 @@ _NAO_GRAVADA = (
     "mostrar em_andamento false"
 )
 _DEMOROU = "a fonte demorou para responder; tente de novo"
+# antes de o nó `destino` terminar, o domínio para onde o alvo redireciona não é conhecido: nenhuma URL sai pela Rede
+COLETA_EM_ANDAMENTO = "coleta em andamento; tente quando status mostrar em_andamento false"
 _MUDOU = "a pendência mudou durante a validação; consulte ver_pendencia de novo"
 
 _REF = re.compile(r"sha256:[0-9a-f]{64}")
@@ -601,11 +603,23 @@ class _Radar:
     @staticmethod
     def _ips_do_alvo(ex: _Execucao) -> set[str] | None:
         """Os registros A e AAAA da saída do nó `dns`, se ele terminou. O `dns` resolve o domínio que o nó `destino`
-        escolheu: depois de um redirect, os IPs são os do destino."""
+        escolheu e, depois de um redirect, também o A e o AAAA do redirecionador (`redirecionador`): os dois entram."""
         dns = ex.motor.saidas("dns")
         if dns is None:
             return None
-        return {ip for tipo in ("A", "AAAA") for ip in dns.get(tipo) or [] if isinstance(ip, str)}
+        redirecionador = dns.get("redirecionador")
+        fontes = [dns, redirecionador] if isinstance(redirecionador, dict) else [dns]
+        return {
+            ip for fonte in fontes for tipo in ("A", "AAAA") for ip in fonte.get(tipo) or [] if isinstance(ip, str)
+        }  # fmt: skip
+
+    @staticmethod
+    def _destino_em_aberto(ex: _Execucao) -> bool:
+        """O nó `destino` está no DAG e ainda não terminou: o domínio para onde o alvo redireciona não é conhecido, e uma
+        URL baixada agora pode ser o site investigado fora da captura (I2 da revisão da T1). No modo `nenhum` e no
+        retroativo a captura é pulada e o `destino` termina logo."""
+        status = ex.motor.status().get("destino")
+        return status is not None and status not in _TERMINAIS
 
     @staticmethod
     def _dominio_destino(ex: _Execucao) -> str | None:
@@ -745,6 +759,8 @@ class _Radar:
         return await self._na_execucao(run_id, partial(self._arquivar_fonte, url=url))
 
     async def _arquivar_fonte(self, ex: _Execucao, url: str) -> dict:
+        if self._destino_em_aberto(ex):
+            return {"erro": COLETA_EM_ANDAMENTO}
         prazo = asyncio.timeout_at(self._limite())
         try:
             async with prazo:
@@ -786,6 +802,10 @@ class _Radar:
         if achada is None or (not achada[1] and modelo.substitui is None):
             return _recusa("pendência desconhecida ou já fechada")
         pendencia = achada[0]
+        if self._destino_em_aberto(ex):
+            for i, evidencia in enumerate(modelo.evidencias):
+                if evidencia.fonte.strip().lower().startswith(("http://", "https://")):
+                    return _recusa(COLETA_EM_ANDAMENTO, f"evidencias[{i}].fonte")
         prazo = asyncio.timeout_at(limite)
         try:
             async with prazo:

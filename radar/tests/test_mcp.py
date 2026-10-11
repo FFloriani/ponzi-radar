@@ -32,6 +32,7 @@ from radar.modelos import Aguardando, Candidato, ErroNo, Feito
 from radar.motor import Motor, NoBase
 from radar.nos.alvo import AlvoNo
 from radar.nos.cvm import _guardar as guardar_indice
+from radar.nos.destino import DestinoNo
 from radar.nos.pendencias import PendNo
 from radar.pendencias.definicoes import CABECALHO_NAO_CONFIAVEL, DEFINICOES, nova_pendencia
 from radar.pendencias.mascara import MARCADOR
@@ -1021,6 +1022,119 @@ async def test_modo_cego_mascara_o_destino_do_redirect(abrir, tmp_path):
     # a recusa não diz que o endereço é o do alvo
     r = await chamar(srv, "arquivar_fonte", run_id=run_id, url=f"https://{DESTINO}/termos")
     assert r == {"erro": "fonte recusada: domínio não permitido"}
+
+
+COLETA_EM_ANDAMENTO = "coleta em andamento; tente quando status mostrar em_andamento false"
+
+
+class CapturaDoRedirect(NoBase):
+    """A captura que viu o redirect do alvo para `DESTINO`; com `liberar`, só termina quando o teste libera."""
+
+    nome = "captura"
+    entradas = ("alvo",)
+    toca_alvo = True
+    as_of = "so_atual"
+
+    def __init__(self, liberar: asyncio.Event | None = None) -> None:
+        super().__init__()
+        self.liberar = liberar
+
+    async def executar(self, ctx, entradas, respostas, s):
+        if self.liberar is not None:
+            await self.liberar.wait()
+        destino = {"url": f"https://{DESTINO}/login", "dominio": DESTINO}
+        return Feito({"paginas": [], "terceiros": [], "bloqueada": False, "falhas": [], "destino": destino,
+                      "redirect_ignorado": None})  # fmt: skip
+
+
+@pytest.mark.respx(assert_all_called=False)
+async def test_arquivar_fonte_espera_o_destino_antes_de_baixar_qualquer_url(abrir, monkeypatch, respx_mock, dns_publico):
+    # o caso do revisor: enquanto a captura roda, o domínio do destino ainda não é conhecido; um GET pela Rede ao
+    # destino seria o site investigado fora da captura
+    liberar = asyncio.Event()
+    srv = await abrir([AlvoNo(), CapturaDoRedirect(liberar), DestinoNo()])
+    monkeypatch.setattr(mcp_server, "ESPERA_S", 0.2)
+    r = await chamar(srv, "iniciar_analise", alvo="phinv.link")
+    assert r == {"run_id": r["run_id"], **COLETA}
+    run_id = r["run_id"]
+    pagina = httpx.Response(200, html="<html><body>termos do destino</body></html>")
+    destino = respx_mock.get(f"https://{DESTINO}/termos").mock(return_value=pagina)
+    noticia = respx_mock.get("https://noticia.example/materia").mock(return_value=pagina)
+    for url in (f"https://{DESTINO}/termos", "https://noticia.example/materia"):  # qualquer URL
+        assert await chamar(srv, "arquivar_fonte", run_id=run_id, url=url) == {"erro": COLETA_EM_ANDAMENTO}
+    assert (destino.call_count, noticia.call_count) == (0, 0)
+
+    liberar.set()
+    monkeypatch.setattr(mcp_server, "ESPERA_S", 10)
+    assert (await chamar(srv, "status", run_id=run_id))["nos"]["destino"] == "feito"
+    r = await chamar(srv, "arquivar_fonte", run_id=run_id, url=f"https://{DESTINO}/termos")
+    assert r["erro"].startswith("fonte recusada: o alvo só é acessado pela captura")
+    assert "ref" in await chamar(srv, "arquivar_fonte", run_id=run_id, url="https://noticia.example/materia")
+    assert (destino.call_count, noticia.call_count) == (0, 1)
+
+
+async def test_validacao_espera_o_destino_antes_de_baixar_fonte_url(abrir, tmp_path, respx_mock, dns_publico):
+    # outro servidor acha a execução com a captura e o `destino` interrompidos (`executando`): até a coleta ser drenada,
+    # o destino não é conhecido e nenhuma fonte URL é baixada; a fonte da custódia continua valendo
+    nos = [AlvoNo(), Coleta(), CapturaDoRedirect(), DestinoNo(), Pend("pend_a1", "P-A1")]
+    srv = await abrir(nos)
+    run_id = await iniciar(srv)
+    estado_json = pasta(tmp_path, run_id) / "estado.json"
+    estado = ler_json(estado_json)
+    for no in ("captura", "destino"):
+        estado["nos"][no] = {"status": "executando", "motivo": None}
+    estado_json.write_bytes(json.dumps(estado, ensure_ascii=False).encode())
+
+    outro = await abrir(nos)
+    pagina = httpx.Response(200, html="<html><body>A Exemplo paga 5% ao mês garantido, diz a reportagem</body></html>")
+    noticia = respx_mock.get("https://noticia.example/materia").mock(return_value=pagina)
+    r = await chamar(outro, "responder_pendencia", run_id=run_id, id="P-A1",
+                     resposta=resposta_a1("https://noticia.example/materia"))  # fmt: skip
+    assert (r["aceita"], r["motivo"], r["campo"]) == (False, COLETA_EM_ANDAMENTO, "evidencias[0].fonte")
+    assert await chamar(outro, "arquivar_fonte", run_id=run_id, url="https://noticia.example/materia") == {
+        "erro": COLETA_EM_ANDAMENTO
+    }
+    assert noticia.call_count == 0
+
+    st = await chamar(outro, "status", run_id=run_id)  # drena: a captura e o `destino` rodam de novo
+    assert (st["nos"]["destino"], st["em_andamento"]) == ("feito", False)
+    r = await chamar(outro, "responder_pendencia", run_id=run_id, id="P-A1",
+                     resposta=resposta_a1("https://noticia.example/materia"))  # fmt: skip
+    assert r["aceita"] is True, r
+    assert noticia.call_count == 1
+
+
+async def test_sem_o_no_destino_no_dag_a_fonte_url_nao_espera(abrir, respx_mock, dns_publico):
+    # os DAGs de teste sem `destino` (e as ferramentas de antes da T1) seguem como eram
+    srv = await abrir()
+    run_id = await iniciar(srv)
+    respx_mock.get("https://noticia.example/x").mock(return_value=httpx.Response(200, html="<p>noticia</p>"))
+    assert "ref" in await chamar(srv, "arquivar_fonte", run_id=run_id, url="https://noticia.example/x")
+
+
+IP_DO_REDIRECIONADOR = "104.16.132.229"
+
+
+class DnsComRedirecionador(NoBase):
+    """O `dns` depois de um redirect: os registros do destino e, à parte, o A e o AAAA do redirecionador."""
+
+    nome = "dns"
+    entradas = ("alvo",)
+
+    async def executar(self, ctx, entradas, respostas, s):
+        return Feito({"A": [IP_DO_ALVO], "AAAA": [], "MX": [], "NS": [], "TXT": [], "nxdomain": False,
+                      "redirecionador": {"A": [IP_DO_REDIRECIONADOR], "AAAA": [IPV6_DO_ALVO]}})  # fmt: skip
+
+
+async def test_ips_do_alvo_unem_o_destino_e_o_redirecionador(abrir, monkeypatch):
+    chamadas = espiar_validar(monkeypatch)
+    srv = await abrir([AlvoNo(), Coleta(), DnsComRedirecionador(), Pend("pend_a1", "P-A1")])
+    run_id = await iniciar(srv)
+    await chamar(srv, "responder_pendencia", run_id=run_id, id="P-A1", resposta=NAO_ENCONTRADO)
+    assert chamadas[0]["ips_do_alvo"] == {IP_DO_ALVO, IP_DO_REDIRECIONADOR, IPV6_DO_ALVO}
+    for url in (f"http://{IP_DO_REDIRECIONADOR}/x", f"http://{IP_DO_ALVO}/x"):
+        r = await chamar(srv, "arquivar_fonte", run_id=run_id, url=url)
+        assert r["erro"].startswith("fonte recusada: o alvo só é acessado pela captura"), (url, r)
 
 
 async def test_arquivar_fonte_que_nao_baixa(abrir, respx_mock, dns_publico):

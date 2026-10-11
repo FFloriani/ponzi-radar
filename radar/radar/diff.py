@@ -195,12 +195,14 @@ class Diff:
     - `itens_mudados`: `(id, estado_a, pontos_a, estado_b, pontos_b)` dos itens cujo estado ou pontos mudaram, na
       ordem da matriz;
     - `sinais_novos`: sinais do eixo 2 (tipo, estágio, data) e alertas que `b` tem e `a` não tem;
-    - `infra`: `hospedagem mudou` (A/AAAA), `NS mudou`, `MX mudou`, `domínio expira em menos de 60 dias` (em `b`, a
-      partir do `as_of` dela) e `site fora do ar` (NXDOMAIN em `b`, ou o site não respondeu à captura em `b` e
-      respondeu em `a`, pelo critério da pontuação: `pontuacao.site_nao_respondeu`) e `destino mudou: <a> → <b>` (o
-      domínio que os coletores analisaram, saída do nó `destino`, mudou entre as duas, com a captura feita nas duas);
+    - `infra`: `domínio analisado mudou: <a> → <b>` (o domínio que os coletores de domínio analisaram, ver
+      `_dominio_analisado`, mudou: um redirect que apareceu, sumiu ou mudou, com "(sem captura em b)" quando a captura
+      não terminou numa delas), `hospedagem mudou` (A/AAAA), `NS mudou` e `MX mudou` (só quando o domínio analisado é
+      o mesmo: o DNS de domínios diferentes não se compara), `domínio expira em menos de 60 dias` (em `b`, a partir do
+      `as_of` dela) e `site fora do ar` (NXDOMAIN em `b`, ou o site não respondeu à captura em `b` e respondeu em
+      `a`, pelo critério da pontuação: `pontuacao.site_nao_respondeu`);
     - `socios_entraram` e `socios_sairam`: nomes do quadro de sócios (nunca CPF);
-    - `wayback_novas`: capturas do Wayback que `b` tem a mais;
+    - `wayback_novas`: capturas do Wayback que `b` tem a mais (0 quando o domínio analisado mudou);
     - `matriz_diferente`: a `a` foi pontuada antes com outra matriz. `eixo1_a_matriz_original` é a conta de então
       (`None` se o `pontuacao.json` dela não a traz) e `matriz_versoes`, `(versão original, versão atual)` (com os
       8 primeiros hex do hash de cada uma quando as versões coincidem);
@@ -265,21 +267,30 @@ def _registros_dns(dns: dict, *tipos: str) -> frozenset[str]:
     )
 
 
-def _dominio_analisado(ex: ExecucaoSalva) -> str | None:
-    """O domínio que os coletores analisaram (saída `dominio` do nó `destino`), quando a captura o observou. Sem a
-    captura feita (pulada, em erro) o `destino` volta ao alvo por falta de dado, não porque o redirect sumiu; a
-    execução de antes do nó `destino` não o tem."""
-    destino = saida(ex, "destino")
-    if destino is None or saida(ex, "captura") is None:
+def _dominio_analisado(ex: ExecucaoSalva) -> str:
+    """O domínio que os coletores de domínio (`rdap`, `dns`, `ct`, `wayback_*`) analisaram: o `dominio` do nó
+    `destino` quando ele terminou, com captura ou sem; sem ele (a execução de antes da T1, que não tem o nó), o do alvo,
+    que era o que os coletores recebiam."""
+    dominio = (saida(ex, "destino") or {}).get("dominio")
+    return dominio.strip().lower() if isinstance(dominio, str) and dominio.strip() else ex.ctx.alvo.lower()
+
+
+def _mudanca_de_dominio(a: ExecucaoSalva, b: ExecucaoSalva) -> str | None:
+    """"domínio analisado mudou: <a> → <b>", ou `None` se é o mesmo. Sem captura numa delas, o `destino` dela voltou ao
+    alvo por falta de dado (o redirect não foi visto), e a linha diz qual."""
+    dominio_a, dominio_b = _dominio_analisado(a), _dominio_analisado(b)
+    if dominio_a == dominio_b:
         return None
-    dominio = destino.get("dominio")
-    return dominio.strip().lower() if isinstance(dominio, str) and dominio.strip() else None
+    sem_captura = [nome for nome, ex in (("a", a), ("b", b)) if saida(ex, "captura") is None]
+    motivo = f" (sem captura em {' e '.join(sem_captura)})" if sem_captura else ""
+    return f"domínio analisado mudou: {dominio_a} → {dominio_b}{motivo}"
 
 
-def _infra(a: ExecucaoSalva, b: ExecucaoSalva) -> list[str]:
-    infra: list[str] = []
+def _infra(a: ExecucaoSalva, b: ExecucaoSalva, mudanca_de_dominio: str | None) -> list[str]:
+    infra: list[str] = [mudanca_de_dominio] if mudanca_de_dominio else []
     dns_a, dns_b = saida(a, "dns"), saida(b, "dns")
-    if dns_a is not None and dns_b is not None:
+    # hospedagem, NS e MX de domínios diferentes não são mudança de infraestrutura (I3 da revisão da T1)
+    if dns_a is not None and dns_b is not None and mudanca_de_dominio is None:
         for tipos, mensagem in ((("A", "AAAA"), "hospedagem mudou"), (("NS",), "NS mudou"), (("MX",), "MX mudou")):
             if _registros_dns(dns_a, *tipos) != _registros_dns(dns_b, *tipos):
                 infra.append(mensagem)
@@ -292,9 +303,6 @@ def _infra(a: ExecucaoSalva, b: ExecucaoSalva) -> list[str]:
     captura_caiu = site_nao_respondeu(b) and not site_nao_respondeu(a)
     if nxdomain or captura_caiu:
         infra.append("site fora do ar")
-    destino_a, destino_b = _dominio_analisado(a), _dominio_analisado(b)
-    if destino_a is not None and destino_b is not None and destino_a != destino_b:
-        infra.append(f"destino mudou: {destino_a} → {destino_b}")
     return infra
 
 
@@ -338,6 +346,7 @@ def comparar(a: ExecucaoSalva, b: ExecucaoSalva, matriz: Matriz) -> Diff:
         entraram = [nome for chave, nome in socios_b.items() if chave not in socios_a]
         sairam = [nome for chave, nome in socios_a.items() if chave not in socios_b]
 
+    mudanca_de_dominio = _mudanca_de_dominio(a, b)
     original = _conta_original(a, matriz)
     versoes = None
     if original is not None:
@@ -351,10 +360,11 @@ def comparar(a: ExecucaoSalva, b: ExecucaoSalva, matriz: Matriz) -> Diff:
         estagio_b=pb.eixo2.estagio,
         itens_mudados=mudados,
         sinais_novos=sinais_novos,
-        infra=_infra(a, b),
+        infra=_infra(a, b, mudanca_de_dominio),
         socios_entraram=entraram,
         socios_sairam=sairam,
-        wayback_novas=_capturas_novas(a, b),
+        # as capturas de outro domínio não são novas: o Wayback do domínio de antes não se compara com o de agora
+        wayback_novas=0 if mudanca_de_dominio else _capturas_novas(a, b),
         matriz_diferente=original is not None,
         eixo1_a_matriz_original=original[2] if original is not None else None,
         total_pontos=total_de_pontos(matriz),

@@ -459,6 +459,7 @@ async def test_dns_mx_e_nxdomain(respx_mock, ctx_hoje, serv):
         "NS": ["ns-187.awsdns-23.com.", "ns-828.awsdns-39.net."],
         "TXT": ['"v=spf1 include:spf.protection.outlook.com -all"'],
         "nxdomain": False,
+        "redirecionador": None,  # sem redirect, nada a resolver à parte
     }
     assert rota.call_count == 5
     consultas = [c.request for c in rota.calls]
@@ -485,7 +486,58 @@ async def test_dns_status_3_na_consulta_a_e_nxdomain(respx_mock, ctx_hoje, serv)
         "NS": [],
         "TXT": [],
         "nxdomain": True,
+        "redirecionador": None,
     }
+
+
+def entrada_redirect(dominio: str = "petrobras.com.br", redirecionado_de: str = "petro.link") -> dict[str, dict]:
+    """O nó `destino` depois de um redirect de `redirecionado_de` para `dominio`."""
+    url = f"https://{dominio}/"
+    return {"destino": {"dominio": dominio, "redirecionado_de": redirecionado_de, "url_destino": url}}
+
+
+def _doh_com_redirecionador(falha_do_redirecionador: int | None = None):
+    """DoH falso: o destino tem um A; o redirecionador (`petro.link`) tem um A e um AAAA, ou responde com o status
+    `falha_do_redirecionador`."""
+
+    def responder(req: httpx.Request) -> httpx.Response:
+        nome, tipo = req.url.params["name"], req.url.params["type"]
+        if nome == "petro.link":
+            if falha_do_redirecionador is not None:
+                return httpx.Response(200, json=_doh(falha_do_redirecionador, 1))
+            dado = {"A": (1, "104.16.132.229"), "AAAA": (28, "2606:4700::6810:84e5")}[tipo]
+            return httpx.Response(200, json=_doh(0, dado[0], dado))
+        return httpx.Response(200, json=_doh(0, 1, (1, "203.0.113.10")) if tipo == "A" else _doh(0, 1))
+
+    return responder
+
+
+async def test_dns_com_redirect_resolve_tambem_o_a_e_o_aaaa_do_redirecionador(respx_mock, ctx_hoje, serv):
+    # o DoH não toca o site: os IPs do redirecionador entram nos `ips_do_alvo` da validação (M2 da revisão)
+    rota = respx_mock.get(URL_DOH).mock(side_effect=_doh_com_redirecionador())
+    resultado = await DnsNo().executar(ctx_hoje, entrada_redirect(), {}, serv)
+    assert resultado.saidas["A"] == ["203.0.113.10"]  # os registros do destino ficam onde estavam
+    assert resultado.saidas["redirecionador"] == {"A": ["104.16.132.229"], "AAAA": ["2606:4700::6810:84e5"]}
+    consultas = sorted((c.request.url.params["name"], c.request.url.params["type"]) for c in rota.calls)
+    assert [c for c in consultas if c[0] == "petro.link"] == [("petro.link", "A"), ("petro.link", "AAAA")]
+    assert len(consultas) == 7
+    assert len(log_custodia(ctx_hoje.pasta)) == 7  # as respostas brutas do redirecionador também ficam na custódia
+
+
+@pytest.mark.parametrize("status", [2, 5])
+async def test_dns_falha_do_redirecionador_nao_derruba_o_no(respx_mock, ctx_hoje, serv, status):
+    respx_mock.get(URL_DOH).mock(side_effect=_doh_com_redirecionador(status))
+    resultado = await DnsNo().executar(ctx_hoje, entrada_redirect(), {}, serv)
+    assert resultado.saidas["A"] == ["203.0.113.10"]
+    redirecionador = resultado.saidas["redirecionador"]
+    assert (redirecionador["A"], redirecionador["AAAA"]) == ([], [])
+    assert redirecionador["erro"].startswith(f"DNS A: Status {status}") and "petro.link" in redirecionador["erro"]
+
+
+async def test_dns_redirecionador_inexistente_e_lista_vazia(respx_mock, ctx_hoje, serv):
+    respx_mock.get(URL_DOH).mock(side_effect=_doh_com_redirecionador(3))  # NXDOMAIN é resposta, não falha
+    resultado = await DnsNo().executar(ctx_hoje, entrada_redirect(), {}, serv)
+    assert resultado.saidas["redirecionador"] == {"A": [], "AAAA": []}
 
 
 async def test_dns_um_tipo_com_erro_derruba_o_no(respx_mock, ctx_hoje, serv):
@@ -543,7 +595,7 @@ async def test_dns_corpo_que_nao_e_json_e_erro_permanente(respx_mock, ctx_hoje, 
 def test_dns_declaracao():
     no = DnsNo()
     assert (no.nome, no.entradas, no.as_of, no.toca_alvo) == ("dns", ("destino",), "so_atual", False)
-    assert set(no.saidas) == {"A", "AAAA", "MX", "NS", "TXT", "nxdomain"}
+    assert set(no.saidas) == {"A", "AAAA", "MX", "NS", "TXT", "nxdomain", "redirecionador"}
 
 
 # ---------------------------------------------------------------------------- ct

@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+from collections.abc import Iterable
 from datetime import date
 
 from radar.cnpj_util import cnpj_valido, normalizar_cnpj
@@ -50,10 +51,14 @@ def _guardar(s: Servicos, indice: str, consulta: dict, correspondencias: list[di
     return s.custodia.guardar(dados, "json", tipo="indice", origem=indice)
 
 
-def _dominio_analisado(ctx: Contexto, entradas: dict[str, dict]) -> str:
-    """O domínio que o nó `destino` escolheu (o do site para onde o alvo redireciona); sem ele, o do alvo."""
-    dominio = (entradas.get("destino") or {}).get("dominio")
-    return dominio if isinstance(dominio, str) and dominio.strip() else ctx.alvo
+def _dominios_do_site(ctx: Contexto, entradas: dict[str, dict]) -> list[str]:
+    """Os domínios em que a empresa é procurada: o do alvo e, depois de um redirect, o do destino (saída `dominio` do
+    nó `destino`), nessa ordem e sem repetição (R-A-T1-cvm: a deliberação que cita só o redirecionador também vale)."""
+    dominios = [ctx.alvo.strip().lower()]
+    destino = (entradas.get("destino") or {}).get("dominio")
+    if isinstance(destino, str) and (destino := destino.strip().lower()) and destino not in dominios:
+        dominios.append(destino)
+    return dominios
 
 
 def _cnpj_da_entrada(entradas: dict[str, dict]) -> str | None:
@@ -116,8 +121,8 @@ class RegistrosNo(NoBase):
 
     - CVM: o CNPJ de 14 caracteres tem registro vigente no `as_of` (`dt_reg <= as_of`, cancelamento nulo ou depois).
     - BCB: a raiz de 8 caracteres do CNPJ está nas sedes de bancos, sociedades, cooperativas ou consórcios.
-    - Domínio: o domínio analisado (o do `destino`, opcional; sem ele, `ctx.alvo`) é um domínio verificado de alguma
-      instituição do BCB.
+    - Domínio: o do alvo ou, depois de um redirect, o do destino (nó `destino`, opcional) é um domínio verificado de
+      alguma instituição do BCB.
 
     Sem CNPJ (o nó `cnpj` não achou a empresa) só o domínio vale e `motivo` é "sem CNPJ". O Olinda só lista o que
     funciona hoje, sem datas: no modo retroativo `bcb` e `bcb_dominio` vêm em `vazamento_temporal`, e quem pontua
@@ -136,8 +141,8 @@ class RegistrosNo(NoBase):
     ) -> Feito:
         indices = _indices(s)
         cnpj = _cnpj_da_entrada(entradas)
-        dominio = _dominio_analisado(ctx, entradas).lower()
-        consulta = {"cnpj": cnpj, "dominio": dominio, "as_of": ctx.as_of.isoformat()}
+        dominios = _dominios_do_site(ctx, entradas)
+        consulta = {"cnpj": cnpj, "dominios": dominios, "as_of": ctx.as_of.isoformat()}
         cvm: list[dict] = []
         bcb: list[dict] = []
         consultados: dict[str, list] = {}
@@ -153,7 +158,7 @@ class RegistrosNo(NoBase):
             bcb = [i.model_dump(mode="json") for i in consultados["instituicoes_bcb"] if i.raiz_cnpj == cnpj[:8]]
             _guardar(s, "instituicoes_bcb", consulta, bcb)
         consultados["dominios_bcb"] = await indices.dominios_bcb()
-        bcb_dominio = [d.model_dump(mode="json") for d in consultados["dominios_bcb"] if d.dominio == dominio]
+        bcb_dominio = [d.model_dump(mode="json") for d in consultados["dominios_bcb"] if d.dominio in dominios]
         _guardar(s, "dominios_bcb", consulta, bcb_dominio)
         saidas = {
             "cvm": cvm,
@@ -273,28 +278,30 @@ def _correspondencia(tipo: str, valor: str, d: Deliberacao, inicio: int, fim: in
 def casar_deliberacoes(
     delibs: list[Deliberacao],
     cnpj: str | None,
-    dominio: str | None,
+    dominios: str | Iterable[str | None] | None,
     nomes: list[str | None],
     as_of: date,
 ) -> list[dict]:
-    """As deliberações de atuação irregular que citam o CNPJ, o domínio ou um dos nomes.
+    """As deliberações de atuação irregular que citam o CNPJ, um dos domínios ou um dos nomes.
 
-    Devolve, da mais nova para a mais antiga e dentro de cada deliberação na ordem cnpj, domínio, nomes, uma
-    correspondência por (deliberação, tipo, valor): `{"tipo", "valor", "numero", "data", "url", "trecho"}`.
+    Devolve, da mais nova para a mais antiga e dentro de cada deliberação na ordem cnpj, domínios (na ordem dada),
+    nomes, uma correspondência por (deliberação, tipo, valor): `{"tipo", "valor", "numero", "data", "url", "trecho"}`.
 
     - `cnpj`: formatado ou só os caracteres (com espaço ou quebra de linha depois dos separadores, como o PDF deixa),
       sem colar em outro número;
-    - `dominio`: sem diferenciar maiúsculas, como domínio inteiro (subdomínio vale). O de uma plataforma de conteúdo
-      (`alvo.PLATAFORMAS`) não casa: a deliberação que cita instagram.com fala de um perfil, não do alvo;
+    - `dominios`: um domínio ou vários (o do alvo e o do destino de um redirect), sem diferenciar maiúsculas, cada um
+      como domínio inteiro (subdomínio vale). O de uma plataforma de conteúdo (`alvo.PLATAFORMAS`) não casa: a
+      deliberação que cita instagram.com fala de um perfil, não do alvo;
     - `nome`: o nome sem acento, caixa nem pontuação, de 8 ou mais caracteres, como palavras inteiras;
     - só entram deliberações com `data <= as_of` (sem data não dá para saber se já existia).
     """
     cnpj = normalizar_cnpj(cnpj) if cnpj else None
     padrao_cnpj = _padrao_cnpj(cnpj) if cnpj else None
-    dominio = dominio.strip().lower() if dominio else None
-    if dominio and e_plataforma(dominio):
-        dominio = None
-    padrao_dominio = _padrao_dominio(dominio) if dominio else None
+    padroes_dominios: dict[str, re.Pattern[str]] = {}
+    for dominio in [dominios] if isinstance(dominios, str) else dominios or []:
+        dominio = dominio.strip().lower() if isinstance(dominio, str) else ""
+        if dominio and not e_plataforma(dominio) and dominio not in padroes_dominios:
+            padroes_dominios[dominio] = _padrao_dominio(dominio)
     padroes_nomes: dict[str, re.Pattern[str]] = {}
     for nome in nomes:
         chave = _chave_do_nome(nome) if nome else ""
@@ -308,8 +315,9 @@ def casar_deliberacoes(
 
         if padrao_cnpj and (m := padrao_cnpj.search(d.texto)):
             correspondencias.append(_correspondencia("cnpj", cnpj, d, m.start(), m.end()))
-        if padrao_dominio and (m := padrao_dominio.search(d.texto)):
-            correspondencias.append(_correspondencia("dominio", dominio, d, m.start(), m.end()))
+        for dominio, padrao_dominio in padroes_dominios.items():
+            if m := padrao_dominio.search(d.texto):
+                correspondencias.append(_correspondencia("dominio", dominio, d, m.start(), m.end()))
         if padroes_nomes:
             texto_normalizado, posicoes = _normalizado_com_posicoes(d.texto)
             for chave, padrao in padroes_nomes.items():
@@ -323,7 +331,7 @@ class CvmAlertasNo(NoBase):
     """Deliberações de "Atuação Irregular" da CVM (stop orders) que citam a empresa ou o site.
 
     Casa por CNPJ e razão social/nome fantasia quando o nó `cnpj` identificou a empresa; sem ele (nó em erro ou
-    empresa não achada), só pelo domínio: o do `destino` (opcional; sem ele, `ctx.alvo`). A pontuação confirma o item C4 sozinha com `cnpj` ou `dominio`; o `nome`
+    empresa não achada), só pelo domínio: o do alvo e, depois de um redirect, o do `destino` (opcional). A pontuação confirma o item C4 sozinha com `cnpj` ou `dominio`; o `nome`
     vai para a pendência P-C4. O ato conta a partir da data dele (`as_of` exato).
 
     `cobertura` diz em quantas das deliberações consultadas (as de data até o `as_of`) o texto integral foi lido
@@ -346,12 +354,12 @@ class CvmAlertasNo(NoBase):
         empresa = entradas.get("cnpj") or {}
         nomes = [empresa.get("razao_social"), empresa.get("nome_fantasia")] if cnpj else []
         delibs = await indices.deliberacoes()
-        dominio = _dominio_analisado(ctx, entradas)
-        correspondencias = casar_deliberacoes(delibs, cnpj, dominio, nomes, ctx.as_of)
+        dominios = _dominios_do_site(ctx, entradas)
+        correspondencias = casar_deliberacoes(delibs, cnpj, dominios, nomes, ctx.as_of)
         consultadas = [d for d in delibs if d.data is not None and d.data <= ctx.as_of]
         integrais = sum(d.integral for d in consultadas)
         cobertura = {"com_texto_integral": integrais, "so_resumo": len(consultadas) - integrais}
-        consulta = {"dominio": dominio, "cnpj": cnpj, "as_of": ctx.as_of.isoformat(), "cobertura": cobertura}
+        consulta = {"dominios": dominios, "cnpj": cnpj, "as_of": ctx.as_of.isoformat(), "cobertura": cobertura}
         artefato = _guardar(s, "deliberacoes", consulta, correspondencias)
         saidas = {"correspondencias": correspondencias, "cobertura": cobertura, "artefato": artefato}
         return Feito(_com_vencidos(saidas, deliberacoes=delibs))

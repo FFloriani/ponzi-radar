@@ -360,7 +360,7 @@ def test_dossie_mostra_o_redirect_seguido_e_o_dominio_analisado(tmp_path):
     )
 
 
-@pytest.mark.parametrize("motivo", ["plataforma", "estacionamento"])
+@pytest.mark.parametrize("motivo", ["plataforma", "estacionamento", "servico_de_terceiro"])
 def test_dossie_mostra_o_redirect_ignorado(tmp_path, motivo):
     ignorado = {"url": "https://t.me/golpe", "dominio": "t.me", "motivo": motivo}
     captura = {**saidas_base()["captura"], "destino": None, "redirect_ignorado": ignorado}

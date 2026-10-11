@@ -2,7 +2,7 @@
 
 O aceite de 08/10/2026 mostrou o radar analisando `phinv.link`, que só redirecionava para `phinvestimentos.com/login`.
 O `destino` lê a saída `destino` da captura e entrega aos coletores de domínio (`rdap`, `dns`, `ct`, `wayback_*`) o
-domínio final; sem captura (modo `nenhum`, retroativo, erro), o do alvo.
+domínio final; sem captura feita (modo `nenhum`, retroativo, erro), o do alvo.
 """
 
 from __future__ import annotations
@@ -117,6 +117,7 @@ async def test_redirect_ignorado_pela_captura_mantem_o_alvo(tmp_path):
         {"url": f"https://{ALVO}/", "dominio": ALVO},  # o próprio alvo
         {"url": "https://t.me/golpe", "dominio": "t.me"},  # plataforma: nunca vira alvo
         {"url": "https://sedoparking.com/x", "dominio": "sedoparking.com"},  # estacionamento
+        {"url": "https://pay.hotmart.com/x", "dominio": "hotmart.com"},  # serviço de terceiro
     ],
 )
 async def test_destino_malformado_ou_proibido_nunca_falha_e_vale_o_alvo(tmp_path, destino):
@@ -126,8 +127,6 @@ async def test_destino_malformado_ou_proibido_nunca_falha_e_vale_o_alvo(tmp_path
 async def test_captura_estranha_nao_derruba_o_no(tmp_path):
     for saida in ({}, {"destino": None}, {"destino": []}):
         assert await rodar_destino(tmp_path, {**entrada_alvo(), "captura": saida}) == Feito(SEM_REDIRECT)
-
-
 
 
 # ---------------------------------------------------------------------------- no DAG: os coletores recebem o destino
@@ -196,13 +195,19 @@ REDIRECT = {"url": URL_DESTINO, "dominio": DESTINO}
 @pytest.mark.respx(assert_all_mocked=True, assert_all_called=True)
 async def test_rdap_dns_ct_e_wayback_recebem_o_dominio_do_destino(respx_mock, tmp_path):
     mocar_coletores(respx_mock, DESTINO)
+    redirecionador = respx_mock.get("https://cloudflare-dns.com/dns-query", params={"name": ALVO}).mock(
+        side_effect=_doh
+    )
     motor = await rodar_dag(tmp_path, REDIRECT)
     assert set(motor.status().values()) == {"feito"}, motor.status()
     assert motor.saidas("destino") == {"dominio": DESTINO, "redirecionado_de": ALVO, "url_destino": URL_DESTINO}
     assert motor.saidas("rdap")["registro"] == "2026-09-29"
     assert motor.saidas("dns")["A"] == ["203.0.113.9"]
-    # nenhum coletor consultou o redirecionador
-    assert not [c for c in respx_mock.calls if ALVO in str(c.request.url)]
+    # do redirecionador, só o A e o AAAA por DoH (para a validação recusar os IPs dele); nenhum outro coletor o consulta
+    assert motor.saidas("dns")["redirecionador"] == {"A": ["203.0.113.9"], "AAAA": []}
+    assert sorted(c.request.url.params["type"] for c in redirecionador.calls) == ["A", "AAAA"]
+    ao_redirecionador = [c.request.url for c in respx_mock.calls if ALVO in str(c.request.url)]
+    assert len(ao_redirecionador) == 2 and {url.host for url in ao_redirecionador} == {"cloudflare-dns.com"}
 
 
 @pytest.mark.respx(assert_all_mocked=True, assert_all_called=True)

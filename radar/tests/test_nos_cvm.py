@@ -188,7 +188,12 @@ async def test_dominio_verificado_bcb(respx_mock, tmp_path, serv):
     r3 = await RegistrosNo().executar(redirecionador, entradas, {}, serv)
     assert len(r3.saidas["bcb_dominio"]) == 5 and r3.saidas["registrado"] is True
     consulta = [e for e in entradas_custodia(serv) if e["origem"] == "dominios_bcb"][-1]
-    assert corpo_da_custodia(serv, consulta)["consulta"]["dominio"] == "bb.com.br"
+    assert corpo_da_custodia(serv, consulta)["consulta"]["dominios"] == ["redirecionador.link", "bb.com.br"]
+    # e o redirecionador também vale (R-A-T1-cvm): o domínio verificado é o do alvo, o destino é outro
+    pelo_alvo = contexto(tmp_path, alvo="bb.com.br")
+    entradas = {**entrada_alvo("bb.com.br"), **entrada_destino("outro-destino.com.br", "bb.com.br"), **entrada_cnpj(None)}
+    r4 = await RegistrosNo().executar(pelo_alvo, entradas, {}, serv)
+    assert len(r4.saidas["bcb_dominio"]) == 5 and {d["dominio"] for d in r4.saidas["bcb_dominio"]} == {"bb.com.br"}
     # igualdade exata: o domínio parecido não casa
     outro = contexto(tmp_path, alvo="bb.com.br.golpe.com")
     r2 = await RegistrosNo().executar(outro, {**entrada_alvo("bb.com.br.golpe.com"), **entrada_cnpj(PIPELINE)}, {}, serv)
@@ -458,6 +463,23 @@ def test_ordem_das_correspondencias_e_trecho_de_120_caracteres():
     assert achados[1]["trecho"] == "x" * 119 + " 33.000.167/0001-01 " + "y" * 119
 
 
+def test_casar_o_alvo_e_o_destino_do_redirect():
+    # R-A-T1-cvm: depois de um redirect, a deliberação que cita só o redirecionador também é do esquema
+    so_redirecionador = delib(14, "a oferta circula pelo link https://phinv.link/entrar")
+    os_dois = delib(15, "anúncios em phinv.link levam a https://www.phinvestimentos.com/login")
+    dominios = ["phinv.link", "phinvestimentos.com"]
+    achados = casar_deliberacoes([so_redirecionador, os_dois], None, dominios, [], HOJE)
+    assert [(c["tipo"], c["numero"], c["valor"]) for c in achados] == [
+        ("dominio", 15, "phinv.link"), ("dominio", 15, "phinvestimentos.com"), ("dominio", 14, "phinv.link"),
+    ]  # fmt: skip
+    # repetido, vazio, None e plataforma ficam de fora; um texto só continua valendo
+    assert achados == casar_deliberacoes(
+        [so_redirecionador, os_dois], None, ["PHINV.link", None, "", "phinv.link", "t.me", "phinvestimentos.com"], [], HOJE
+    )  # fmt: skip
+    assert tipos(casar_deliberacoes([so_redirecionador], None, "phinv.link", [], HOJE)) == [("dominio", 14)]
+    assert casar_deliberacoes([so_redirecionador], None, [], [], HOJE) == []
+
+
 def test_sem_nada_para_procurar():
     assert casar_deliberacoes([delib(12, "qualquer texto")], None, None, [], HOJE) == []
     assert casar_deliberacoes([], "33000167000101", "golpe.com", ["Golpe Brasil"], HOJE) == []
@@ -500,14 +522,23 @@ async def test_alertas_sem_cnpj_casa_so_por_dominio(respx_mock, tmp_path, serv):
     assert tipos(sem_entrada.saidas["correspondencias"]) == [("dominio", 905)]
     nao_achou = await CvmAlertasNo().executar(ctx, {**entrada_alvo("santotrader.com"), **entrada_cnpj(None)}, {}, serv)
     assert tipos(nao_achou.saidas["correspondencias"]) == [("dominio", 905)]
-    # depois de um redirect, a deliberação que cita o destino é a do site analisado; a chave da consulta também muda
+    # depois de um redirect, casam o alvo e o destino (R-A-T1-cvm): a deliberação que cita o destino vale
     redirecionador = contexto(tmp_path, alvo="redirecionador.link")
     entradas = {**entrada_alvo("redirecionador.link"), **entrada_destino("santotrader.com")}
     pelo_destino = await CvmAlertasNo().executar(redirecionador, entradas, {}, serv)
     assert tipos(pelo_destino.saidas["correspondencias"]) == [("dominio", 905)]
     assert pelo_destino.saidas["correspondencias"][0]["valor"] == "santotrader.com"
     consulta = json.loads(serv.custodia.ler(pelo_destino.saidas["artefato"]))["consulta"]
-    assert consulta["dominio"] == "santotrader.com"
+    assert consulta["dominios"] == ["redirecionador.link", "santotrader.com"]
+    # e a que cita só o redirecionador também
+    pelo_alvo = contexto(tmp_path, alvo="santotrader.com")
+    entradas = {**entrada_alvo("santotrader.com"), **entrada_destino("outro-destino.com", "santotrader.com")}
+    pelo_redirecionador = await CvmAlertasNo().executar(pelo_alvo, entradas, {}, serv)
+    assert [(c["tipo"], c["valor"]) for c in pelo_redirecionador.saidas["correspondencias"]] == [
+        ("dominio", "santotrader.com")
+    ]
+    consulta = json.loads(serv.custodia.ler(sem_entrada.saidas["artefato"]))["consulta"]
+    assert consulta["dominios"] == ["santotrader.com"]  # sem redirect, só o alvo
     outro = await CvmAlertasNo().executar(contexto(tmp_path, alvo="limpo.com.br"), entrada_alvo("limpo.com.br"), {}, serv)
     assert sem_artefato(outro.saidas) == {"correspondencias": [], "cobertura": {"com_texto_integral": 7, "so_resumo": 0}}
 
@@ -581,7 +612,7 @@ async def test_alertas_guarda_na_custodia(respx_mock, tmp_path, serv):
     assert r.saidas["artefato"] == f"sha256:{entrada['sha256']}"
     corpo = corpo_da_custodia(serv, entrada)
     assert corpo["consulta"] == {
-        "dominio": "santotrader.com",
+        "dominios": ["santotrader.com"],  # o alvo e, depois de um redirect, o destino
         "cnpj": None,
         "as_of": "2026-10-07",
         "cobertura": {"com_texto_integral": 7, "so_resumo": 0},

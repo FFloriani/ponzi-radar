@@ -31,6 +31,15 @@ SERVICOS_DE_ESTACIONAMENTO = frozenset(
         "parklogic.com", "undeveloped.com",
     }
 )  # fmt: skip
+# Serviços de terceiros para onde um golpe manda o visitante (loja de app, comunidade, checkout, hospedagem de arquivo):
+# o domínio é do serviço, antigo e legítimo, não do esquema. Num redirect, valem como plataforma: não trocam o domínio
+# analisado (M4 da revisão da T1).
+SERVICOS_DE_TERCEIROS = frozenset(
+    {
+        "apple.com", "discord.com", "discord.gg", "hotmart.com", "kiwify.com.br", "eduzz.com", "monetizze.com.br",
+        "mediafire.com", "mega.nz", "dropbox.com",
+    }
+)  # fmt: skip
 _ESQUEMA = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://")
 # o slug vira nome de pasta: só letras, dígitos, "_" e "-" (nada de "\" ou ".." vindo da entrada),
 # com hífen apenas no meio de cada rótulo
@@ -84,6 +93,11 @@ def e_plataforma(dominio: str) -> bool:
 def e_estacionamento(dominio: str) -> bool:
     """`dominio` (registrável) é de um serviço de estacionamento de `SERVICOS_DE_ESTACIONAMENTO`."""
     return dominio.strip().lower().rstrip(".") in SERVICOS_DE_ESTACIONAMENTO
+
+
+def e_servico_de_terceiro(dominio: str) -> bool:
+    """`dominio` (registrável) é de um serviço de terceiro de `SERVICOS_DE_TERCEIROS`."""
+    return dominio.strip().lower().rstrip(".") in SERVICOS_DE_TERCEIROS
 
 
 def _invalido(entrada: str, motivo: str) -> ErroNo:

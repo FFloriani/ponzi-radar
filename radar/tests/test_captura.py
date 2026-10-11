@@ -27,7 +27,7 @@ from radar.custodia import Custodia, verificar
 from radar.modelos import Contexto, ErroNo, Feito, Pulado
 from radar.motor import Servicos
 from radar.nos import captura as modulo_captura
-from radar.nos.alvo import SERVICOS_DE_ESTACIONAMENTO
+from radar.nos.alvo import SERVICOS_DE_ESTACIONAMENTO, SERVICOS_DE_TERCEIROS
 from radar.nos.captura import (
     CapturaNo,
     _bytes,
@@ -550,6 +550,35 @@ def test_redirect_para_estacionamento_nao_troca_o_alvo(final, dominio):
     assert _destino_do_redirect(final, "phinv.link") == (
         None, {"url": final, "dominio": dominio, "motivo": "estacionamento"}
     )  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("final", "dominio"),
+    [
+        ("https://apps.apple.com/br/app/golpe/id123", "apple.com"),
+        ("https://discord.com/invite/golpe", "discord.com"),
+        ("https://discord.gg/golpe", "discord.gg"),
+        ("https://pay.hotmart.com/X123", "hotmart.com"),
+        ("https://pay.kiwify.com.br/abc", "kiwify.com.br"),
+        ("https://sun.eduzz.com/123", "eduzz.com"),
+        ("https://app.monetizze.com.br/checkout/X", "monetizze.com.br"),
+        ("https://www.mediafire.com/file/x/app.apk", "mediafire.com"),
+        ("https://mega.nz/file/abc", "mega.nz"),
+        ("https://www.dropbox.com/s/x/contrato.pdf", "dropbox.com"),
+    ],
+)
+def test_redirect_para_servico_de_terceiro_nao_troca_o_alvo(final, dominio):
+    # loja de app, comunidade, checkout e hospedagem de arquivo: o domínio é do serviço, não do esquema
+    assert _destino_do_redirect(final, "phinv.link") == (
+        None, {"url": final, "dominio": dominio, "motivo": "servico_de_terceiro"}
+    )  # fmt: skip
+
+
+def test_servicos_de_terceiros_sao_os_da_lista():
+    assert SERVICOS_DE_TERCEIROS == {
+        "apple.com", "discord.com", "discord.gg", "hotmart.com", "kiwify.com.br", "eduzz.com", "monetizze.com.br",
+        "mediafire.com", "mega.nz", "dropbox.com",
+    }  # fmt: skip
 
 
 def test_servicos_de_estacionamento_sao_os_da_lista():
@@ -1175,6 +1204,7 @@ def _visita(url: str, links: list[str] | None = None) -> modulo_captura._Visita:
         ("https://www.instagram.com/golpe/", "instagram.com", "plataforma"),
         ("https://sedoparking.com/frmpark.php?d=exemplo.com.br", "sedoparking.com", "estacionamento"),
         ("http://ww1.parkingcrew.net/", "parkingcrew.net", "estacionamento"),
+        ("https://pay.hotmart.com/X123", "hotmart.com", "servico_de_terceiro"),
     ],
 )
 async def test_redirect_para_plataforma_ou_estacionamento_mantem_o_alvo(tmp_path, monkeypatch, final, dominio, motivo):

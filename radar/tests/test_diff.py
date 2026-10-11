@@ -274,30 +274,61 @@ REDIRECT = {
 }
 
 
-def test_diff_destino_que_mudou(tmp_path):
-    a, b = duas(tmp_path, b={"saidas": {"destino": REDIRECT}})
+CAPTURA_COM_REDIRECT = {
+    **saidas_base()["captura"],
+    "destino": {"url": REDIRECT["url_destino"], "dominio": REDIRECT["dominio"]},
+    "redirect_ignorado": None,
+}
+# o DNS do destino: outra hospedagem, outro NS e sem MX, comparado com o do alvo da saída base
+DNS_DO_DESTINO = {**saidas_base()["dns"], "A": ["76.76.21.21"], "NS": ["ns1.vercel-dns.com."], "MX": []}
+COM_REDIRECT = {"saidas": {"destino": REDIRECT, "captura": CAPTURA_COM_REDIRECT, "dns": DNS_DO_DESTINO}}
+
+
+def sem_o_no_destino(ex):
+    """A execução como era antes da T1: sem o nó `destino` no estado nem nas evidências."""
+    ex.status.pop("destino", None)
+    ex.saidas.pop("destino", None)
+    return ex
+
+
+def test_diff_dominio_analisado_que_mudou_nao_compara_o_dns(tmp_path):
+    a, b = duas(tmp_path, b=COM_REDIRECT)
     d = comparar(a, b, MATRIZ)
-    assert d.infra == ["destino mudou: exemplo.com.br → phinvestimentos.com"]
-    assert "  - destino mudou: exemplo.com.br → phinvestimentos.com" in renderizar_diff(d)
+    # o DNS de b é de outro domínio: hospedagem, NS e MX diferentes não são mudança de infraestrutura
+    assert d.infra == ["domínio analisado mudou: exemplo.com.br → phinvestimentos.com"]
+    assert "  - domínio analisado mudou: exemplo.com.br → phinvestimentos.com" in renderizar_diff(d)
     # e de volta: o redirect sumiu
-    assert comparar(b, a, MATRIZ).infra == ["destino mudou: phinvestimentos.com → exemplo.com.br"]
+    assert comparar(b, a, MATRIZ).infra == ["domínio analisado mudou: phinvestimentos.com → exemplo.com.br"]
 
 
-def test_diff_mesmo_destino_nao_mudou(tmp_path):
-    a, b = duas(tmp_path, a={"saidas": {"destino": REDIRECT}}, b={"saidas": {"destino": {**REDIRECT, "url_destino": "x"}}})
-    assert comparar(a, b, MATRIZ).infra == []
+def test_diff_mesmo_dominio_analisado_compara_o_dns(tmp_path):
+    outro_dns = {**DNS_DO_DESTINO, "A": ["76.76.21.22"]}
+    b = {"saidas": {**COM_REDIRECT["saidas"], "destino": {**REDIRECT, "url_destino": "x"}, "dns": outro_dns}}
+    a, b = duas(tmp_path, a=COM_REDIRECT, b=b)
+    assert comparar(a, b, MATRIZ).infra == ["hospedagem mudou"]
 
 
-def test_diff_destino_so_compara_quando_a_captura_o_viu(tmp_path):
-    # captura em erro (ou pulada): o `destino` volta ao alvo por falta de dado, não porque o redirect sumiu
-    sem_captura = {"status": {"captura": ("erro", "captura indisponível: Executable doesn't exist")}}
-    a, b = duas(tmp_path, a={"saidas": {"destino": REDIRECT}}, b=sem_captura)
-    assert comparar(a, b, MATRIZ).infra == []
+def test_diff_captura_em_erro_depois_do_redirect_diz_que_o_dominio_mudou(tmp_path):
+    # o caso do revisor: em b a captura caiu (HTTP 403 no destino) e os coletores voltaram ao redirecionador
+    a, b = duas(tmp_path, a=COM_REDIRECT, b={"status": {"captura": ("erro", "captura falhou: HTTP 403")}})
+    d = comparar(a, b, MATRIZ)
+    assert d.infra == ["domínio analisado mudou: phinvestimentos.com → exemplo.com.br (sem captura em b)"]
 
 
-def test_diff_execucao_sem_o_no_destino_nao_compara(tmp_path):
-    a, b = duas(tmp_path, a={"status": {"destino": "pendente"}}, b={"saidas": {"destino": REDIRECT}})
-    assert comparar(a, b, MATRIZ).infra == []
+def test_diff_execucao_de_antes_do_no_destino_vale_pelo_alvo(tmp_path):
+    # o caso do revisor: a execução antiga analisou o alvo; a nova seguiu o redirect
+    a, b = duas(tmp_path, b=COM_REDIRECT)
+    d = comparar(sem_o_no_destino(a), b, MATRIZ)
+    assert d.infra == ["domínio analisado mudou: exemplo.com.br → phinvestimentos.com"]
+    # as duas de antes do nó: o mesmo alvo, o DNS é comparado como sempre
+    a, b = duas(tmp_path / "antigas", b={"saidas": dns(A=["198.51.100.9"])})
+    assert comparar(sem_o_no_destino(a), sem_o_no_destino(b), MATRIZ).infra == ["hospedagem mudou"]
+
+
+def test_diff_dominio_analisado_que_mudou_nao_soma_as_capturas_do_wayback(tmp_path):
+    indice = {**saidas_base()["wayback_indice"], "total": 500}
+    a, b = duas(tmp_path, b={"saidas": {**COM_REDIRECT["saidas"], "wayback_indice": indice}})
+    assert comparar(a, b, MATRIZ).wayback_novas == 0  # 500 capturas de outro domínio não são 380 novas
 
 
 def test_diff_infra_na_ordem_e_renderizada(tmp_path):

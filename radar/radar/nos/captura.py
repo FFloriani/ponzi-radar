@@ -6,10 +6,10 @@ service workers bloqueados. O Playwright é a exceção à regra "toda saída vi
 própria e recebe o proxy de `config.rede`.
 
 Destino (melhorias do aceite, T1): o alvo que só redireciona (`phinv.link` → `phinvestimentos.com/login`) não é o site.
-Quando a página inicial termina noutro domínio registrável, que não é plataforma de conteúdo (`alvo.PLATAFORMAS`) nem
-serviço de estacionamento (`alvo.SERVICOS_DE_ESTACIONAMENTO`), as subpáginas saem do host dele e a saída `destino` o
-entrega ao nó `destino`, que o passa aos coletores de domínio. O redirect para plataforma ou estacionamento não troca o
-domínio analisado e fica em `redirect_ignorado`.
+Quando a página inicial termina noutro domínio registrável, que não é plataforma de conteúdo (`alvo.PLATAFORMAS`),
+serviço de estacionamento (`alvo.SERVICOS_DE_ESTACIONAMENTO`) nem serviço de terceiro (`alvo.SERVICOS_DE_TERCEIROS`),
+as subpáginas saem do host dele e a saída `destino` o entrega ao nó `destino`, que o passa aos coletores de domínio. O
+redirect para os outros não troca o domínio analisado e fica em `redirect_ignorado`.
 
 Opsec do analista (I5 da revisão final): o WebRTC só usa UDP pelo proxy (`ARGS_DO_NAVEGADOR`) e, com proxy, o
 `RTCPeerConnection` some da página (um STUN do site revelaria o IP real); o navegador usa o próprio User-Agent,
@@ -59,7 +59,7 @@ from radar.config import CapturaConfig, RedeConfig
 from radar.modelos import Contexto, ErroNo, Feito, Pulado
 from radar.motor import NoBase, Servicos
 from radar.nos._paginas import Chave, chave_da_pagina, ordenar_paginas
-from radar.nos.alvo import dominio_registravel, e_estacionamento, e_plataforma
+from radar.nos.alvo import dominio_registravel, e_estacionamento, e_plataforma, e_servico_de_terceiro
 from radar.pontuacao import (
     ERROS_DE_ALCANCE,
     PREFIXO_CAPTURA_INDISPONIVEL,
@@ -295,8 +295,9 @@ def _destino_do_redirect(url_final: str, alvo: str) -> tuple[dict | None, dict |
     """`(destino, redirect_ignorado)` da página inicial que terminou em `url_final`.
 
     - outro domínio registrável (http ou https): `({"url", "dominio"}, None)`, e os coletores passam a analisá-lo;
-    - plataforma de conteúdo ou serviço de estacionamento: `(None, {"url", "dominio", "motivo"})`, com o motivo
-      `"plataforma"` ou `"estacionamento"`: o destino não vira o alvo;
+    - plataforma de conteúdo, serviço de estacionamento ou serviço de terceiro (`alvo.SERVICOS_DE_TERCEIROS`: loja
+      de app, comunidade, checkout, hospedagem de arquivo): `(None, {"url", "dominio", "motivo"})`, com o motivo
+      `"plataforma"`, `"estacionamento"` ou `"servico_de_terceiro"`: o destino não vira o alvo;
     - o próprio domínio do alvo (`www.`, outro subdomínio), host sem domínio registrável (IP, `localhost`, nome sem
       sufixo público), outro esquema (`about:`, `chrome-error:`) ou URL quebrada: `(None, None)`.
 
@@ -316,6 +317,8 @@ def _destino_do_redirect(url_final: str, alvo: str) -> tuple[dict | None, dict |
         return None, {"url": url_final, "dominio": dominio, "motivo": "plataforma"}
     if e_estacionamento(dominio):
         return None, {"url": url_final, "dominio": dominio, "motivo": "estacionamento"}
+    if e_servico_de_terceiro(dominio):
+        return None, {"url": url_final, "dominio": dominio, "motivo": "servico_de_terceiro"}
     return {"url": url_final, "dominio": dominio}, None
 
 
@@ -619,7 +622,8 @@ class CapturaNo(NoBase):
     custódia), `terceiros` (domínios registráveis das requisições, diferentes do alvo e do destino), `bloqueada`,
     `falhas` (as subpáginas que não puderam ser capturadas, com o motivo), `destino` (`{"url", "dominio"}` quando a
     página inicial terminou noutro domínio registrável, senão `None`) e `redirect_ignorado` (`{"url", "dominio",
-    "motivo"}` quando esse domínio é plataforma ou estacionamento e o alvo continua o mesmo, senão `None`); ver
+    "motivo"}` quando esse domínio é plataforma, estacionamento ou serviço de terceiro e o alvo continua o mesmo,
+    senão `None`); ver
     `_destino_do_redirect`.
 
     Os erros do nó distinguem o site do analista (I2, ver `_erro_da_captura`): "captura falhou: HTTP <código>" e
