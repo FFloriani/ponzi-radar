@@ -38,6 +38,7 @@ from radar.nos.captura import (
     _opcoes_do_contexto,
     _terceiros,
 )
+from radar.pontuacao import PREFIXO_CAPTURA_INDISPONIVEL, PREFIXO_FALHA_NAVEGACAO
 
 AGORA = datetime(2026, 10, 7, 12, 0, 0)
 SITE = Path(__file__).parent / "fixtures" / "site_sintetico"
@@ -947,16 +948,68 @@ async def test_proxy_fora_do_ar_e_falha_do_analista_nao_do_site(tmp_path):
     assert "\n" not in e.value.mensagem
 
 
+MENSAGEM_NAVEGADOR_AUSENTE = (
+    'captura indisponível: navegador do Playwright não encontrado; rode "playwright install chromium" no venv do '
+    "radar ou confira PLAYWRIGHT_BROWSERS_PATH no ambiente do servidor MCP"
+)
+# o que o Playwright 1.63 devolve quando o Chromium não está onde procura (o caminho e o aviso mudam, a 1ª linha não)
+ERRO_DO_PLAYWRIGHT_SEM_NAVEGADOR = (
+    "BrowserType.launch: Executable doesn't exist at C:\\Users\\Analista\\AppData\\Local\\ms-playwright\\"
+    "chromium_headless_shell-1200\\chrome-headless-shell-win64\\chrome-headless-shell.exe\n"
+    "╔════════════════════════════════════════════════════════════╗\n"
+    "║ Looks like Playwright was just installed or updated.       ║\n"
+    "║ Please run the following command to download new browsers: ║\n"
+    "║     playwright install                                     ║\n"
+    "╚════════════════════════════════════════════════════════════╝"
+)
+
+
 async def test_navegador_que_nao_inicia_e_captura_indisponivel(tmp_path, monkeypatch):
     # o Chromium não instalado (depois de um `pip install -U playwright`) não pode virar "site fora do ar"
     async def sem_navegador(self, **kwargs):
-        raise PlaywrightError("BrowserType.launch: Executable doesn't exist at /ms-playwright/chromium\nlog")
+        raise PlaywrightError(ERRO_DO_PLAYWRIGHT_SEM_NAVEGADOR)
 
     monkeypatch.setattr(BrowserType, "launch", sem_navegador)
     with pytest.raises(ErroNo) as e:
         await capturar(tmp_path, "https://exemplo.com.br/", max_subpaginas=0)
     assert e.value.permanente is False
-    assert e.value.mensagem == "captura indisponível: BrowserType.launch: Executable doesn't exist at /ms-playwright/chromium"
+    assert e.value.mensagem == MENSAGEM_NAVEGADOR_AUSENTE
+
+
+@pytest.mark.parametrize(
+    "mensagem",
+    [
+        ERRO_DO_PLAYWRIGHT_SEM_NAVEGADOR,
+        "BrowserType.launch: Executable doesn't exist at /ms-playwright/chromium",
+        "BrowserType.launch: Executable doesn't exist at /ms-playwright/chromium\nlog",
+        "BrowserType.launch_persistent_context: Executable doesn't exist at /ms-playwright/chromium",
+    ],
+)
+def test_navegador_ausente_tem_mensagem_propria_sem_o_caminho_e_sem_quebra_de_linha(mensagem):
+    erro = modulo_captura._erro_da_captura(PlaywrightError(mensagem))
+    assert (erro.mensagem, erro.permanente) == (MENSAGEM_NAVEGADOR_AUSENTE, False)
+    assert "\n" not in erro.mensagem and "ms-playwright" not in erro.mensagem and "Analista" not in erro.mensagem
+    # continua sendo falha do lado do analista: o prefixo é o que o E6 e o dossiê (lacunas) reconhecem
+    assert erro.mensagem.startswith(PREFIXO_CAPTURA_INDISPONIVEL)
+    assert not erro.mensagem.startswith(PREFIXO_FALHA_NAVEGACAO)
+
+
+@pytest.mark.parametrize(
+    "erro",
+    [
+        PlaywrightError("BrowserType.launch: Timeout 180000ms exceeded."),
+        PlaywrightError("BrowserType.launch: Browser closed unexpectedly\nlog"),
+        PlaywrightError("Page.goto: net::ERR_PROXY_CONNECTION_FAILED at https://x.com.br/"),
+        ValueError("Executable doesn't exist"),
+        # o texto vem do site investigado: uma URL que o repita, no erro de navegação, não é navegador ausente
+        modulo_captura._FalhaDeNavegacao(
+            PlaywrightError("Page.goto: net::ERR_NAME_NOT_RESOLVED at https://x.com.br/Executable doesn't exist")
+        ),
+        PlaywrightError("Page.screenshot: falhou em https://x.com.br/Executable doesn't exist at /x"),
+    ],
+)
+def test_outras_falhas_nao_viram_navegador_ausente(erro):
+    assert modulo_captura._erro_da_captura(erro).mensagem != MENSAGEM_NAVEGADOR_AUSENTE
 
 
 @lento

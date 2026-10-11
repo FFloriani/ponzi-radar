@@ -164,6 +164,14 @@ def _representante(grupo: list[str]) -> str:
     return next((cnpj for cnpj in grupo if cnpj[8:12] == "0001"), grupo[0])
 
 
+def _representante_na_lista(grupo: list[str], por_valor: dict[str, Candidato]) -> str:
+    """O CNPJ que fala pela raiz na lista da P-CNPJ: o representante de sempre (`_representante`) entre os que estão no
+    texto visível, se a raiz tem algum; só quando todos os da raiz são dos textos internos, o representante deles. Assim
+    a empresa do rodapé não chega ao Claude marcada como texto interno só porque a matriz dela também está num script."""
+    visiveis = [cnpj for cnpj in grupo if not por_valor[cnpj].do_texto_interno]
+    return _representante(visiveis or grupo)
+
+
 def _titular(entradas: dict[str, dict]) -> str | None:
     titular = entradas.get("rdap", {}).get("cnpj_titular")
     return titular if isinstance(titular, str) and cnpj_valido(titular) else None
@@ -204,7 +212,8 @@ def _escolher(titular: str | None, candidatos: list[Candidato]) -> str | list[Ca
     Sozinho, o nó só escolhe o titular ou uma raiz do texto visível. A raiz que só aparece nos textos internos do
     aplicativo (`extra.origem = "texto_interno"`: o exemplo de um campo de cadastro, o gateway de uma tela de
     pagamento) nunca é escolhida sem o Claude (ruling R-A-T3-cnpj): sem titular, abre a P-CNPJ com ela como
-    candidato. Ela conta, como as outras, para a dúvida que abre a P-CNPJ.
+    candidato. Ela conta, como as outras, para a dúvida que abre a P-CNPJ. Na lista da P-CNPJ a raiz que tem algum
+    CNPJ no texto visível é representada por um candidato visível (`_representante_na_lista`), não pelo interno.
     """
     da_pagina = _grupos_por_raiz([c.valor for c in candidatos])
     por_valor = {c.valor: c for c in candidatos}
@@ -215,7 +224,7 @@ def _escolher(titular: str | None, candidatos: list[Candidato]) -> str | list[Ca
         (grupo,) = da_pagina.values()
         if not all(por_valor[cnpj].do_texto_interno for cnpj in grupo):
             return _representante(grupo)
-    escolhidos = [por_valor[_representante(grupo)] for grupo in da_pagina.values()]
+    escolhidos = [por_valor[_representante_na_lista(grupo, por_valor)] for grupo in da_pagina.values()]
     return [_candidato_do_titular(titular), *escolhidos] if titular is not None else escolhidos
 
 

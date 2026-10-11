@@ -486,3 +486,64 @@ investimentos/
 6. **Limites:** o Wayback devolveu 429 em `archive.org/wayback/available`, enquanto o CDX respondeu. Os limites ficam conservadores: Wayback a 1 req/2 s, crt.sh a 1 req/3 s.
 
 **Também conferido:** a BrasilAPI devolve o quadro de sócios, o RDAP do registro.br devolve o CNPJ do titular PJ, e crt.sh e DoH respondem.
+
+## Adendo 2026-10-11: melhorias do primeiro aceite
+
+Decisões tomadas ao corrigir o que o aceite manual de 08/10/2026 (`phinv.link` → `phinvestimentos.com`) mostrou. Onde este adendo difere do texto acima, vale o adendo. Uma linha por decisão; `Ruling R-A-*` são as decisões do controlador durante as revisões.
+
+### Destino depois de redirect
+
+- **Nó `destino`.** Entra depois da `captura` no DAG, com entrada `alvo`, opcional `captura` e `as_of` exato. Saídas: `dominio`, `redirecionado_de` e `url_destino`. Nunca falha: sem captura feita (pulada ou em erro) o domínio analisado é o do alvo.
+- **Dependências mudam.** `rdap`, `dns`, `ct`, `wayback_indice` e `wayback_snapshot` dependem de `destino` no lugar de `alvo` (o `wayback_snapshot` mantém `captura` como opcional). `registros` e `cvm_alertas` têm `destino` como opcional. No modo com captura esses coletores esperam a captura, de 30 a 90 s a mais; nos modos `nenhum` e retroativo a captura é pulada e nada muda (ruling R-A-destino).
+- **Quando o destino vale.** A página inicial terminar noutro domínio registrável http(s), diferente do alvo, que não seja plataforma (`PLATAFORMAS`), serviço de estacionamento (`SERVICOS_DE_ESTACIONAMENTO`) nem serviço de terceiro (`SERVICOS_DE_TERCEIROS`). O nó `destino` confere de novo a saída da captura, e o que não passa vale como "sem redirect".
+- **Plataforma, estacionamento e terceiro.** O redirect para eles não troca o domínio analisado: a captura grava `redirect_ignorado` (`{url, dominio, motivo}` com `plataforma`, `estacionamento` ou `servico_de_terceiro`) e o dossiê registra a linha.
+- **Listas fechadas, em `nos/alvo.py` (subdomínios valem).** `SERVICOS_DE_ESTACIONAMENTO`: sedoparking.com, parkingcrew.net, bodis.com, dan.com, afternic.com, hugedomains.com, above.com, parklogic.com, undeveloped.com. `SERVICOS_DE_TERCEIROS`: apple.com, discord.com, discord.gg, hotmart.com, kiwify.com.br, eduzz.com, monetizze.com.br, mediafire.com, mega.nz, dropbox.com. Um serviço fora das três listas vira o domínio analisado.
+- **Destino vale com a página bloqueada por anti-bot (ruling R-A-T1-bloqueada, contra a letra do plano).** O redirect foi visto antes do desafio, e o caso comum é o desafio da Cloudflare no próprio destino; pela regra literal a análise voltaria ao redirecionador.
+- **Subpáginas e terceiros.** Com destino, as subpáginas saem só do host da URL final (com ou sem `www.`), e a lista de domínios de terceiros exclui o alvo e o destino.
+- **CVM e BCB casam o alvo e o destino (ruling R-A-T1-cvm).** `cvm_alertas` e `registros` procuram o domínio do alvo e o do destino, porque uma deliberação ou um domínio verificado pode citar só o redirecionador; a mesma deliberação pode dar uma correspondência por domínio. A consulta guardada na custódia passa a ter `dominios: [...]` no lugar de `dominio` (as execuções de antes têm `dominio`).
+- **DNS do redirecionador.** O `dns` resolve também o A e o AAAA do redirecionador por DoH (saída `dns.redirecionador`, que o diff ignora), e `ips_do_alvo` junta os IPs dos dois.
+- **Opsec do destino.** `arquivar_fonte` e a validação recusam o domínio do alvo e o do destino (subdomínio, porta, IDN em Unicode ou punycode, todo salto de redirect) e os IPs dos dois; só a captura toca os dois sites.
+- **`arquivar_fonte` espera o `destino`.** Enquanto o nó não termina, `arquivar_fonte` e a evidência http(s) de `responder_pendencia` são recusados com "coleta em andamento"; a fonte `sha256:` não sai pela rede e continua valendo.
+- **Modo cego.** O domínio do destino e o host da `url_destino` entram na máscara como `[ALVO]`.
+- **Dossiê, seção 1.** Depois do alvo: "Redirecionamento: <alvo> → <url>; os coletores analisaram <domínio>" ou "Redireciona para <url> (<motivo>): análise mantida em <alvo>", com o motivo em português: "plataforma", "estacionamento de domínio" ou "serviço de terceiro".
+- **Diff: "domínio analisado mudou".** Quando o domínio analisado difere entre as execuções (redirect que apareceu, sumiu ou mudou, ou execução de antes do nó `destino`), a infraestrutura traz "domínio analisado mudou: <a> → <b>" (com "(sem captura em a|b)" se a captura não terminou) no lugar de "destino mudou"; hospedagem, NS e MX não se comparam.
+- **Diff: Wayback não comparável.** Com o domínio analisado mudado, "Capturas novas no Wayback" mostra "não comparável (domínio analisado mudou)" (`Diff.wayback_novas` é `None`), não 0.
+- **Deliberação que cita o alvo e o destino.** No diff, o rótulo e a chave do alerta (`cvm:<número>:dominio:<domínio>`) e a nota do C4 dizem o domínio citado ("cita o domínio phinv.link"); sem o domínio na correspondência, rótulo e chave são os de antes.
+- **Deferido (M3).** O redirect não é registrado quando a captura falha depois dele (por exemplo, 403 no destino): o `destino` volta ao alvo, e no modo cego o destino fica fora da máscara nesse caso.
+- **Deferido (M5).** No modo cego o canal da plataforma (o `@canal` do `t.me`) não entra na máscara; já era assim antes.
+
+### Domínio reaproveitado
+
+- **Detecção.** `pontuacao.dominio_reaproveitado(ex)` é função pura: compara o `rdap.registro` com o mais antigo entre `ct.primeiro_certificado` e `wayback_indice.primeiro` (os três do domínio do `destino`) e dispara com mais de 30 dias de folga (30 exatos não). Devolve `{registro, historico_desde, fonte_historico}`, com `crt.sh` no empate.
+- **Quieta no que não sabe.** Sem RDAP legível no `as_of`, sem CT nem Wayback com data, com nó em erro, pulado ou bloqueado, ou campo em `vazamento_temporal`, devolve `None`. Só lê datas `AAAA-MM-DD` (com hora depois, se vier).
+- **Só informa.** Pontos, estado e origem do D3 não mudam e a matriz não muda (ruling R-A-d3): o D3 já pontua a identidade nova pelo registro, e os pesos são da calibração.
+- **A nota do D3 substitui, não acrescenta (ruling R-A-T2-texto).** "domínio registrado de novo em <registro>; há histórico desde <data> (<fonte>), que pode ser de outro dono" toma o lugar de "domínio registrado em <registro>", e a data aparece uma vez só. Se o domínio não está na nota (D3 só pelo CNPJ recente, ou `nao_verificado`), a frase vai no fim.
+- **No `nao_se_aplica` a frase se parte.** O sufixo qualifica as datas, não o histórico: "domínio registrado de novo em <registro>: 12 meses ou mais; há histórico desde <data> (<fonte>), que pode ser de outro dono" e, com CNPJ, "domínio registrado de novo em <registro>; CNPJ aberto em <data>: 12 meses ou mais; há histórico desde …".
+- **Linha do tempo substitui.** O evento "Domínio registrado de novo; o histórico anterior pode ser de outro dono" (fonte "RDAP e <crt.sh|Wayback>") toma o lugar de "Domínio registrado". O primeiro certificado e os snapshots anteriores ao registro levam " (registro anterior do domínio)"; o CNPJ aberto não.
+- **Seção 6.** Os blocos Certificados e Wayback ganham "Atenção: antes de <registro>, o domínio tinha outro registro (possível outro dono)."
+- **Coluna Fonte do D3.** Segue "coletor: rdap, cnpj": mudá-la alteraria o ouro, e a nota já cita a fonte do histórico.
+- **Datas no texto.** Vêm sempre do `isoformat()` de uma data lida, nunca do texto bruto do coletor.
+
+### Textos internos do aplicativo
+
+- **O que é lido.** `extracao.texto_interno(html)` lê as strings de linguagem natural dos `<script>` sem `src`, de qualquer `type` (JSON, `ld+json` e `self.__next_f.push` do Next.js), nos primeiros 4 milhões de caracteres do HTML. O script termina no primeiro `</script` como no navegador, e os escapes de JS e de JSON são desfeitos em até 4 camadas.
+- **Filtro.** De 12 a 300 caracteres, ao menos 2 palavras de letras, sem controle, código, lista de classes CSS, hash nem base64; a string com HTML é descartada inteira, para nenhum HTML chegar ao texto.
+- **Formato e tetos.** Uma linha por string, `<chave> = <texto>` quando ela é o valor de uma chave de objeto, só `<texto>` nos outros casos, sem duplicatas. Tetos por página: 5.000 linhas, 300 mil caracteres e 500 mil literais; passar de qualquer um marca `truncado` com `texto_interno`.
+- **Artefato.** `.txt` de `tipo="texto_interno"` e `origem` igual à URL da página, citável pelo `sha256`; só é gravado se houver ao menos uma linha (por isso o ouro não muda). Um trecho do texto interno só confere se a fonte citada for esse `.txt`, não o HTML da página.
+- **Ordem dos candidatos.** Os do texto interno (`extra.origem = "texto_interno"`) vêm depois dos do texto visível e dos atributos de todas as páginas, para a pendência, que leva só os 20 primeiros por categoria, não perder os sinais visíveis das páginas seguintes.
+- **Um achado por execução.** O mesmo (categoria, valor) do texto interno sai uma vez: o dicionário do aplicativo se repete no layout de todas as páginas. O texto idêntico em outra página é guardado de novo com a origem dela.
+- **Regex sem a chave.** As regex rodam numa cópia do texto com a chave e o " = " em branco (mesmo tamanho): a chave é identificador do código (`saque.backend.erro…`) e viraria candidato em quase toda linha. O trecho e a posição valem no artefato, com as chaves.
+- **P-A2 e P-A3 não abrem por texto interno (ruling R-A-T3-a2).** Um rótulo interno de "histórico de rendimentos" ou de "investimento" abriria a pendência em todo aplicativo; a P-A3 ainda abre pela promessa da P-A1. Aberta por outro motivo, a pendência leva os internos.
+- **Frase e marca.** A frase "Candidatos com extra.origem=texto_interno vêm de textos internos do aplicativo…" está nos critérios de toda pendência que recebe candidatos da extração (P-CNPJ, P-A1, P-A2, P-A3, P-B, P-C, P-D4 e P-E), e o `conteudo_do_alvo` marca a linha como "[categoria, texto interno]" (ruling R-A-T3-a3).
+- **O nó `cnpj` não escolhe CNPJ só interno (ruling R-A-T3-cnpj).** Placeholder de cadastro e gateway de pagamento viravam o operador: o CNPJ que só aparece no texto interno abre a P-CNPJ como candidato marcado. O CNPJ que está também no texto visível vale como visível.
+- **Exceção: raiz visível, representante interno.** Sem titular, com uma raiz só e a matriz só no texto interno, o nó consulta a matriz: a empresa (a raiz) vem do texto visível, e a matriz só a representa.
+- **Representante na lista da P-CNPJ.** A raiz com algum CNPJ visível é representada por um candidato visível (a matriz, se for visível; senão o primeiro visível), nunca pelo interno; a raiz só interna segue representada pelo interno.
+- **Janela do `ver_artefato`.** Mostra no máximo `LIMITE_TEXTO` (60 mil caracteres), menor que o teto do texto interno (300 mil), sem paginação: o fim do texto pode ficar fora da janela do Claude, mas a validação confere o artefato inteiro (já era assim com HTML grande).
+- **Origem `regex_confirmada`.** O item sustentado só por candidato interno é rotulado `regex_confirmada` na pontuação: foi a regex que o achou.
+- **Falsos negativos conhecidos (deferidos).** Aspa solta fora de string (a regex literal `/"/g`) inverte a leitura do resto da linha; template literal com `${…}` e frase com endereço de carteira caem no filtro de código e de hash; `<script>` em comentário HTML ou `<noscript>` é lido; mensagem com `<b>` é descartada inteira; `e-mail inválido` em minúsculas conta como lista de classes CSS; o texto RSC "T" sem aspas não é lido; o ternário `a ? "x" : "y"` vira a linha `x = y`.
+
+### Ajustes pequenos
+
+- **`valor: null`.** Com `nao_encontrado` ou `inconclusivo`, `valor: null` vale `{}` (o que o aceite recusou com "valor: Input should be a valid dictionary"). Com `confirmado` ou `corrigido`, e com qualquer valor que não seja objeto nem `null`, continua exigindo objeto.
+- **Navegador não encontrado.** Quando o Playwright diz `Executable doesn't exist`, a captura falha com "captura indisponível: navegador do Playwright não encontrado; rode "playwright install chromium" no venv do radar ou confira PLAYWRIGHT_BROWSERS_PATH no ambiente do servidor MCP". Continua sendo falha do lado do analista: não conta para o E6 e aparece nas lacunas.
+- **README.** Uma nota diz que o Claude Code passa o ambiente inteiro ao servidor, que outros clientes (Claude Desktop, SDKs) podem passar um ambiente reduzido, e que `"env": {"PLAYWRIGHT_BROWSERS_PATH": "<caminho>"}` na configuração do servidor resolve um caminho próprio dos navegadores; outra diz que o radar analisa o destino de um redirect e o registra no dossiê.

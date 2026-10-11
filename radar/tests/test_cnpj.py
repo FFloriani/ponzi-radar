@@ -559,6 +559,70 @@ async def test_raiz_visivel_com_a_matriz_so_no_texto_interno_usa_a_matriz(respx_
     assert rota.call_count == 1
 
 
+FILIAL_3 = _com_dv("330001670003")  # a mesma raiz da Petrobras, ordem 0003
+assert cnpj_valido(FILIAL_3)
+
+
+def valores_da_p_cnpj(r) -> list[tuple[str, dict]]:
+    assert isinstance(r, Aguardando)
+    return [(c.valor, c.extra) for c in r.pendencias[0].candidatos]
+
+
+async def test_p_cnpj_representa_a_raiz_visivel_por_um_candidato_visivel(respx_mock, ctx_hoje, serv):
+    # N1 da re-revisão da T3: a filial da raiz A está no texto visível e a matriz dela só no texto interno; com a raiz
+    # B no texto interno a dúvida abre a P-CNPJ, e a empresa do rodapé não pode chegar ao Claude como "texto interno"
+    rota = mocar_brasilapi(respx_mock, PETROBRAS)
+    extras = [candidato_interno(PETROBRAS, 10), candidato_interno(CAIXA, 20)]
+    r = await CnpjNo().executar(ctx_hoje, entradas(PETROBRAS_FILIAL, extras=extras), {}, serv)
+    assert valores_da_p_cnpj(r) == [(PETROBRAS_FILIAL, {}), (CAIXA, INTERNO)]
+    # no conteudo_do_alvo a empresa do rodapé sai como visível; só a raiz B leva a marca
+    linhas = r.pendencias[0].conteudo_do_alvo.splitlines()
+    assert [linha for linha in linhas if linha.startswith("[cnpj")] == [
+        f"[cnpj] CNPJ {PETROBRAS_FILIAL}",
+        f"[cnpj, texto interno] CNPJ {CAIXA}",
+    ]
+    assert rota.call_count == 0
+
+
+async def test_p_cnpj_da_raiz_visivel_nao_depende_da_ordem_da_lista(respx_mock, ctx_hoje, serv):
+    # o interno (a matriz) vem antes do visível (a filial) e a raiz continua sendo a primeira da lista
+    lista = [candidato_interno(PETROBRAS, 0), candidato(PETROBRAS_FILIAL, 10), candidato_interno(CAIXA, 20)]
+    entrada = {"extracao": {"candidatos": lista, "fonte": "captura", "truncado": {}}, "rdap": {"cnpj_titular": None}}
+    r = await CnpjNo().executar(ctx_hoje, entrada, {}, serv)
+    assert valores_da_p_cnpj(r) == [(PETROBRAS_FILIAL, {}), (CAIXA, INTERNO)]
+
+
+async def test_p_cnpj_da_raiz_visivel_prefere_a_matriz_visivel_e_senao_o_primeiro_visivel(respx_mock, ctx_hoje, serv):
+    # filial visível, a matriz visível e uma filial interna: a matriz
+    extras = [candidato_interno(CAIXA, 30), candidato_interno(FILIAL_3, 40)]
+    lista = [candidato(PETROBRAS_FILIAL, 0), candidato(PETROBRAS, 10), *extras]
+    entrada = {"extracao": {"candidatos": lista, "fonte": "captura", "truncado": {}}, "rdap": {"cnpj_titular": None}}
+    assert valores_da_p_cnpj(await CnpjNo().executar(ctx_hoje, entrada, {}, serv)) == [
+        (PETROBRAS, {}),
+        (CAIXA, INTERNO),
+    ]
+    # duas filiais visíveis e a matriz interna: a primeira filial visível, na ordem da página
+    lista = [candidato_interno(PETROBRAS, 0), candidato(FILIAL_3, 10), candidato(PETROBRAS_FILIAL, 20), *extras[:1]]
+    entrada = {"extracao": {"candidatos": lista, "fonte": "captura", "truncado": {}}, "rdap": {"cnpj_titular": None}}
+    assert valores_da_p_cnpj(await CnpjNo().executar(ctx_hoje, entrada, {}, serv)) == [
+        (FILIAL_3, {}),
+        (CAIXA, INTERNO),
+    ]
+
+
+async def test_p_cnpj_com_titular_representa_a_raiz_visivel_da_pagina_por_um_visivel(respx_mock, ctx_hoje, serv):
+    # o titular (RDAP) é de outra raiz; a raiz da página tem a filial visível e a matriz só no texto interno
+    extras = [candidato_interno(PETROBRAS, 10)]
+    r = await CnpjNo().executar(ctx_hoje, entradas(PETROBRAS_FILIAL, extras=extras, titular=CAIXA), {}, serv)
+    assert valores_da_p_cnpj(r) == [(CAIXA, {"origem": "rdap"}), (PETROBRAS_FILIAL, {})]
+
+
+async def test_p_cnpj_da_raiz_so_interna_continua_representada_pelo_interno(respx_mock, ctx_hoje, serv):
+    extras = [candidato_interno(PETROBRAS_FILIAL, 10), candidato_interno(PETROBRAS, 20)]
+    r = await CnpjNo().executar(ctx_hoje, entradas(CAIXA, extras=extras), {}, serv)
+    assert valores_da_p_cnpj(r) == [(CAIXA, {}), (PETROBRAS, INTERNO)]
+
+
 async def test_nenhum_candidato_abre_pendencia_sem_candidatos(ctx_hoje, serv):
     r = await CnpjNo().executar(ctx_hoje, entradas(), {}, serv)
     assert isinstance(r, Aguardando)

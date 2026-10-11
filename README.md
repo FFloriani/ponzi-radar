@@ -78,6 +78,20 @@ O Claude Desktop não roda a partir da pasta do projeto, então o caminho do int
 
 O prompt `analisar_site` aparece no menu de prompts do servidor `radar`.
 
+### Navegador do Playwright
+
+A captura usa o Chromium que o `playwright install chromium` baixa. O servidor MCP o procura pelo ambiente que o cliente lhe passa:
+
+- o Claude Code passa o ambiente inteiro ao servidor, então o `PLAYWRIGHT_BROWSERS_PATH` do seu usuário chega;
+- outros clientes (Claude Desktop, SDKs) podem passar um ambiente reduzido, sem essa variável;
+- quem instalou os navegadores do Playwright num caminho próprio põe `"env": {"PLAYWRIGHT_BROWSERS_PATH": "<caminho>"}` na configuração do servidor, ao lado de `command` e `args`.
+
+Sem o navegador, o nó `captura` falha com a mensagem `captura indisponível: navegador do Playwright não encontrado; rode "playwright install chromium" no venv do radar ou confira PLAYWRIGHT_BROWSERS_PATH no ambiente do servidor MCP`. Isso não conta como "site fora do ar" e aparece nas lacunas do dossiê.
+
+### Redirecionamentos
+
+Se o endereço leva a outro domínio, o radar analisa o destino e registra o redirecionamento no dossiê. O redirecionamento para uma plataforma (Telegram, WhatsApp, Instagram), para um serviço de estacionamento de domínio ou para um serviço de terceiro (loja de aplicativos, Discord, checkout, hospedagem de arquivos) não troca o domínio analisado: o dossiê só registra o redirecionamento.
+
 ### Linha de comando
 
 Com o venv ativo, o comando `radar` serve para usar o radar sem o Claude e para conferir a custódia:
@@ -94,7 +108,7 @@ O `RUN_ID` tem a forma `<slug>/<AAAA-MM-DD_HHMMSS>`. A CLI não responde pendên
 
 ### Modos
 
-- **Sem contato** (`modo_contato="nenhum"`, `--sem-contato`): o radar não visita o site e analisa a página arquivada no Wayback. Em qualquer modo, só a captura toca o site: o `arquivar_fonte` recusa o domínio do alvo.
+- **Sem contato** (`modo_contato="nenhum"`, `--sem-contato`): o radar não visita o site e analisa a página arquivada no Wayback. Em qualquer modo, só a captura toca o site: o `arquivar_fonte` recusa o domínio do alvo e o do site para onde ele redireciona.
 - **Retroativo** (`as_of` no passado, `--as-of`): analisa o site como ele era na data. As fontes que só mostram o presente (DNS e captura ao vivo) ficam de fora; os dados que só existem como são hoje (sócios, CNAE, listas do BCB) aparecem marcados como "dado de hoje" e não pontuam; e a execução não é comparada com as execuções atuais.
 - **Cego** (`modo_cego=true`, `--cego`): serve para calibração, quando o Claude não pode saber qual é o alvo. O slug da pasta, e com ele o `run_id`, vira `cego-` mais o começo do HMAC-SHA256 do domínio, calculado com o segredo local `casos/.segredo_cego` (32 bytes, criado na primeira execução cega). Toda saída do servidor passa pela máscara (`[ALVO]`, `[EMPRESA]`, `[CNPJ]` e `[CNPJ_n]`, `[PESSOA_n]`), as screenshots não são entregues e o `comparar_execucoes` fica indisponível. Se o segredo se perder, as execuções cegas antigas ficam com o slug órfão.
 

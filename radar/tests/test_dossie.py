@@ -256,6 +256,25 @@ def test_dossie_item_do_coletor_cita_o_no_na_coluna_fonte(tmp_path):
     assert "coletor" not in celula_fonte("A1") and "coletor" not in celula_fonte("D2")
 
 
+def test_dossie_deliberacao_que_cita_o_alvo_e_o_destino_diz_qual_dominio(tmp_path):
+    # T1/R-A-T1-cvm: a mesma deliberação casa o redirecionador e o destino; a nota do C4 e a linha do tempo dizem qual
+    def citacao(dominio: str) -> dict:
+        return {
+            "tipo": "dominio", "valor": dominio, "numero": 15, "data": "2026-06-01",
+            "url": "https://cvm.example/d15", "trecho": "atuação irregular",
+        }  # fmt: skip
+
+    cvm = {"correspondencias": [citacao("phinv.link"), citacao("phinvestimentos.com")]}
+    cvm["cobertura"] = {"com_texto_integral": 1, "so_resumo": 0}
+    pasta = gravar(tmp_path, saidas={"cvm_alertas": cvm})
+    texto = dossie(pasta)
+    c4 = next(linha for linha in secao(texto, 3).splitlines() if linha.startswith("| C4"))
+    assert "Deliberação CVM 15 cita o domínio phinv.link; Deliberação CVM 15 cita o domínio phinvestimentos.com" in c4
+    eventos = [linha for linha in secao(texto, 4).splitlines() if "Deliberação 15" in linha]
+    assert len(eventos) == 2
+    assert "cita o domínio phinv.link" in eventos[0] and "cita o domínio phinvestimentos.com" in eventos[1]
+
+
 def test_dossie_item_nao_verificado_mostra_o_intervalo_de_pontos(tmp_path):
     s3 = secao(dossie(gravar(tmp_path)), 3)
     d2 = next(linha for linha in s3.splitlines() if linha.startswith("| D2"))
@@ -360,13 +379,29 @@ def test_dossie_mostra_o_redirect_seguido_e_o_dominio_analisado(tmp_path):
     )
 
 
-@pytest.mark.parametrize("motivo", ["plataforma", "estacionamento", "servico_de_terceiro"])
-def test_dossie_mostra_o_redirect_ignorado(tmp_path, motivo):
+@pytest.mark.parametrize(
+    "motivo,rotulo",
+    [
+        ("plataforma", "plataforma"),
+        ("estacionamento", "estacionamento de domínio"),
+        ("servico_de_terceiro", "serviço de terceiro"),
+    ],
+)
+def test_dossie_mostra_o_redirect_ignorado(tmp_path, motivo, rotulo):
     ignorado = {"url": "https://t.me/golpe", "dominio": "t.me", "motivo": motivo}
     captura = {**saidas_base()["captura"], "destino": None, "redirect_ignorado": ignorado}
     s1 = secao(dossie(gravar(tmp_path, saidas={"captura": captura})), 1)
-    assert f"- **Redireciona para** `https://t.me/golpe` ({motivo}): análise mantida em exemplo.com.br\n" in s1
-    assert "Redirecionamento:" not in s1
+    # o motivo da saída da captura é um identificador; o dossiê o escreve em português
+    assert f"- **Redireciona para** `https://t.me/golpe` ({rotulo}): análise mantida em exemplo.com.br\n" in s1
+    assert "servico_de_terceiro" not in s1 and "Redirecionamento:" not in s1
+
+
+@pytest.mark.parametrize("motivo,esperado", [("", "—"), (None, "—"), ("novo_motivo", "novo_motivo")])
+def test_dossie_redirect_ignorado_com_motivo_desconhecido_nao_quebra(tmp_path, motivo, esperado):
+    ignorado = {"url": "https://t.me/golpe", "dominio": "t.me", "motivo": motivo}
+    captura = {**saidas_base()["captura"], "destino": None, "redirect_ignorado": ignorado}
+    s1 = secao(dossie(gravar(tmp_path, saidas={"captura": captura})), 1)
+    assert f"- **Redireciona para** `https://t.me/golpe` ({esperado}): análise mantida em exemplo.com.br\n" in s1
 
 
 def test_dossie_sem_redirect_nao_mostra_as_linhas(tmp_path):
@@ -793,6 +828,20 @@ def test_dossie_lacunas_dizem_como_resolver_a_captura_indisponivel(tmp_path):
         "(para resolver: conferir o ambiente do analista (Chromium instalado, proxy no ar) e rodar de novo a análise)"
         in linha
     )
+
+
+def test_dossie_lacunas_mostram_a_mensagem_do_navegador_ausente(tmp_path):
+    # T4: o servidor MCP sem o PLAYWRIGHT_BROWSERS_PATH do analista; a mensagem diz o que rodar e o que conferir
+    motivo = (
+        'captura indisponível: navegador do Playwright não encontrado; rode "playwright install chromium" no venv do '
+        "radar ou confira PLAYWRIGHT_BROWSERS_PATH no ambiente do servidor MCP"
+    )
+    pasta = gravar(tmp_path, status={"captura": ("erro", motivo)})
+    s7 = secao(dossie(pasta), 7)
+    linha = next(linha for linha in s7.splitlines() if linha.startswith("- `captura`"))
+    assert 'rode "playwright install chromium" no venv do radar' in linha.replace("\\", "")
+    assert "PLAYWRIGHT" in linha and "ambiente do servidor MCP" in linha
+    assert "(para resolver: conferir o ambiente do analista (Chromium instalado, proxy no ar)" in linha
 
 
 def test_dossie_lacunas_so_listam_pulado_que_deixa_dado_sem_cobertura(tmp_path):

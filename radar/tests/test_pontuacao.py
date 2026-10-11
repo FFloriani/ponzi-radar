@@ -861,6 +861,10 @@ def test_d3_ganha_a_nota_do_dominio_reaproveitado_sem_mudar_pontos_nem_estado(ma
 
 FRASE_2015 = "domínio registrado de novo em 2015-03-02; há histórico desde 2010-02-03 (Wayback), que pode ser de outro dono"
 FRASE_2025 = "domínio registrado de novo em 2025-01-10; há histórico desde 2010-02-03 (Wayback), que pode ser de outro dono"
+# em nao_se_aplica o sufixo ": 12 meses ou mais" qualifica as datas, então fica entre as duas metades da frase
+CABECA_2015 = "domínio registrado de novo em 2015-03-02"
+CAUDA_2015 = "há histórico desde 2010-02-03 (Wayback), que pode ser de outro dono"
+assert FRASE_2015 == f"{CABECA_2015}; {CAUDA_2015}"
 
 
 def _com_historico_de_2010(registro: str, cnpj: dict | None = None, **kw) -> ExecucaoSalva:
@@ -879,10 +883,17 @@ def _com_historico_de_2010(registro: str, cnpj: dict | None = None, **kw) -> Exe
 @pytest.mark.parametrize(
     "registro,cnpj,estado,pontos,nota",
     [
-        # nao_se_aplica: nada é recente; a frase troca o "domínio registrado em", sem repetir a data
-        ("2015-03-02", {"abertura": "2014-01-10"}, "nao_se_aplica", 0, f"{FRASE_2015}; CNPJ aberto em 2014-01-10: 12 meses ou mais"),
+        # nao_se_aplica: nada é recente; a frase troca o "domínio registrado em", sem repetir a data, e o sufixo fica
+        # ao lado das datas que ele qualifica, não depois de "outro dono" (task-2-rereview.md)
+        (
+            "2015-03-02", {"abertura": "2014-01-10"}, "nao_se_aplica", 0,
+            f"{CABECA_2015}; CNPJ aberto em 2014-01-10: 12 meses ou mais; {CAUDA_2015}",
+        ),
         # empresa não identificada: só o domínio conta
-        ("2015-03-02", {"cnpj": None, "motivo": "não encontrado"}, "nao_se_aplica", 0, f"{FRASE_2015}: 12 meses ou mais"),
+        (
+            "2015-03-02", {"cnpj": None, "motivo": "não encontrado"}, "nao_se_aplica", 0,
+            f"{CABECA_2015}: 12 meses ou mais; {CAUDA_2015}",
+        ),
         # nao_verificado: o CNPJ é desconhecido e o domínio não aparece na nota; a frase vai no fim
         ("2015-03-02", {"abertura": None}, "nao_verificado", 0, f"CNPJ aberto: data indisponível no as_of; {FRASE_2015}"),
         # confirmado só pelo CNPJ recente: o domínio (antigo) não aparece, então a frase é anexada
@@ -947,6 +958,43 @@ def test_c4_pelo_coletor(tipo, matriz):
             tipo_fonte="oficial",
         )
     ]
+
+
+def _com_correspondencias(*correspondencias: dict):
+    return execucao({"cvm_alertas": {**base()["cvm_alertas"], "correspondencias": list(correspondencias)}})
+
+
+def test_c4_nota_diz_qual_dominio_a_deliberacao_cita(matriz):
+    # depois de um redirect (T1) a mesma deliberação pode citar o domínio do alvo e o do destino
+    do_alvo = {**_correspondencia("dominio"), "valor": "phinv.link"}
+    do_destino = {**_correspondencia("dominio"), "valor": "PhInvestimentos.com"}
+    c4 = item(_com_correspondencias(do_alvo, do_destino), "C4")
+    assert c4.nota == (
+        "Deliberação CVM 8123 cita o domínio phinv.link; Deliberação CVM 8123 cita o domínio phinvestimentos.com"
+    )
+    assert (c4.estado, c4.pontos, len(c4.evidencias)) == ("confirmado", 3, 2)
+    assert item(_com_correspondencias(_correspondencia("dominio")), "C4").nota == (
+        "Deliberação CVM 8123 cita o domínio exemplo.com.br"
+    )
+
+
+def test_c4_nota_do_cnpj_nao_leva_o_valor_e_o_nome_nao_entra(matriz):
+    cnpj, dominio, nome = (_correspondencia(t) for t in ("cnpj", "dominio", "nome"))
+    nota = item(_com_correspondencias(cnpj, dominio, nome), "C4").nota
+    assert nota == "Deliberação CVM 8123 cita o CNPJ; Deliberação CVM 8123 cita o domínio exemplo.com.br"
+    assert PETROBRAS not in nota
+
+
+@pytest.mark.parametrize("valor", [None, "", "  ", 7, ["x.com"]])
+def test_c4_nota_de_dominio_sem_valor_legivel_segue_como_antes(valor, matriz):
+    sem_valor = {**_correspondencia("dominio"), "valor": valor}
+    assert item(_com_correspondencias(sem_valor), "C4").nota == "Deliberação CVM 8123 cita o domínio"
+
+
+def test_c4_nota_de_dominio_hostil_fica_numa_linha(matriz):
+    hostil = {**_correspondencia("dominio"), "valor": "x.com\n## Título falso"}
+    nota = item(_com_correspondencias(hostil), "C4").nota
+    assert "\n" not in nota and nota == "Deliberação CVM 8123 cita o domínio x.com ## título falso"
 
 
 def test_c4_so_por_nome_vai_para_a_pc4(matriz):
@@ -1190,6 +1238,9 @@ _FALHAS_DE_ALCANCE = [
 # falha do lado do analista (navegador ausente, proxy ou túnel fora, sem internet, TLS): nunca é "site fora do ar",
 # nem na forma nova nem na antiga ("captura falhou: <mensagem do Playwright>"), que execuções em disco ainda têm
 _FALHAS_DO_ANALISTA = [
+    # a mensagem de hoje para o navegador que o servidor MCP não achou (melhorias do aceite, T4) e a de antes dela
+    'captura indisponível: navegador do Playwright não encontrado; rode "playwright install chromium" no venv do '
+    "radar ou confira PLAYWRIGHT_BROWSERS_PATH no ambiente do servidor MCP",
     "captura indisponível: BrowserType.launch: Executable doesn't exist at /ms-playwright/chromium",
     "captura indisponível: Page.goto: net::ERR_PROXY_CONNECTION_FAILED at https://exemplo.com.br/",
     "captura indisponível: ValueError: HAR ilegível",

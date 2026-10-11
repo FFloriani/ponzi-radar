@@ -47,6 +47,7 @@ ROTULO_DO_ESTADO = {
 _COM_PONTOS = frozenset({"confirmado", "nao_se_aplica", "nao_encontrado"})  # os outros são um intervalo, não zero
 _SEM_ESTAGIO = "sem estágio"
 _CITA = {"cnpj": "o CNPJ", "dominio": "o domínio", "nome": "o nome"}
+_TEXTO_NAO_COMPARAVEL = "não comparável (domínio analisado mudou)"
 _DATA_ISO = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
@@ -159,8 +160,17 @@ class Alerta:
     fonte: str | None
 
 
+def _dominio_citado(correspondencia: dict) -> str | None:
+    """O domínio que a deliberação cita (`valor` da correspondência `dominio`), em minúsculas e numa linha só; `None`
+    se a execução salva não o traz ou não é texto."""
+    valor = correspondencia.get("valor")
+    return (" ".join(valor.split()).lower() or None) if isinstance(valor, str) else None
+
+
 def alertas_da_execucao(ex: ExecucaoSalva) -> list[Alerta]:
-    """As deliberações da CVM que citam o alvo (`cvm_alertas`) e os alertas que a P-C4 confirmou."""
+    """As deliberações da CVM que citam o alvo (`cvm_alertas`) e os alertas que a P-C4 confirmou. A que cita um domínio
+    leva o domínio no rótulo e na chave: depois de um redirect ela pode citar o do alvo e o do destino, e são dois
+    alertas."""
     alertas: list[Alerta] = []
     cvm = saida(ex, "cvm_alertas")
     if cvm is not None and "correspondencias" not in (cvm.get("vazamento_temporal") or ()):
@@ -171,8 +181,13 @@ def alertas_da_execucao(ex: ExecucaoSalva) -> list[Alerta]:
             data = d.isoformat() if (d := data_iso(c.get("data"))) else None
             rotulo = f"alerta CVM: Deliberação {numero}" + (f" ({data})" if data else "")
             rotulo += f" cita {_CITA.get(tipo, 'o alvo')}"
+            chave = f"cvm:{numero}:{tipo}"
+            if tipo == "dominio" and (dominio := _dominio_citado(c)) is not None:
+                # a mesma deliberação pode citar o domínio do alvo e o do destino: cada um é um alerta
+                rotulo += f" {dominio}"
+                chave += f":{dominio}"
             fonte = c.get("url") if isinstance(c.get("url"), str) else None
-            alertas.append(Alerta(f"cvm:{numero}:{tipo}", rotulo, data, fonte))
+            alertas.append(Alerta(chave, rotulo, data, fonte))
     if (valor := valor_confirmado(ex, "P-C4")) is not None:
         try:
             c4 = ValorC4.model_validate(valor)
@@ -202,7 +217,8 @@ class Diff:
       `as_of` dela) e `site fora do ar` (NXDOMAIN em `b`, ou o site não respondeu à captura em `b` e respondeu em
       `a`, pelo critério da pontuação: `pontuacao.site_nao_respondeu`);
     - `socios_entraram` e `socios_sairam`: nomes do quadro de sócios (nunca CPF);
-    - `wayback_novas`: capturas do Wayback que `b` tem a mais (0 quando o domínio analisado mudou);
+    - `wayback_novas`: capturas do Wayback que `b` tem a mais; `None` ("não comparável") quando o domínio analisado
+      mudou: o índice de outro domínio não se subtrai, e 0 pareceria uma medida;
     - `matriz_diferente`: a `a` foi pontuada antes com outra matriz. `eixo1_a_matriz_original` é a conta de então
       (`None` se o `pontuacao.json` dela não a traz) e `matriz_versoes`, `(versão original, versão atual)` (com os
       8 primeiros hex do hash de cada uma quando as versões coincidem);
@@ -218,7 +234,7 @@ class Diff:
     infra: list[str]
     socios_entraram: list[str]
     socios_sairam: list[str]
-    wayback_novas: int
+    wayback_novas: int | None
     matriz_diferente: bool
     eixo1_a_matriz_original: Eixo1 | None
     total_pontos: int = 34
@@ -364,7 +380,7 @@ def comparar(a: ExecucaoSalva, b: ExecucaoSalva, matriz: Matriz) -> Diff:
         socios_entraram=entraram,
         socios_sairam=sairam,
         # as capturas de outro domínio não são novas: o Wayback do domínio de antes não se compara com o de agora
-        wayback_novas=0 if mudanca_de_dominio else _capturas_novas(a, b),
+        wayback_novas=None if mudanca_de_dominio else _capturas_novas(a, b),
         matriz_diferente=original is not None,
         eixo1_a_matriz_original=original[2] if original is not None else None,
         total_pontos=total_de_pontos(matriz),
@@ -452,5 +468,6 @@ def renderizar_diff(d: Diff) -> str:
         linhas.append("- Infraestrutura: nada a destacar")
     linhas += _lista("Sócios que entraram", d.socios_entraram)
     linhas += _lista("Sócios que saíram", d.socios_sairam)
-    linhas.append(f"- Capturas novas no Wayback: {d.wayback_novas}")
+    wayback = _TEXTO_NAO_COMPARAVEL if d.wayback_novas is None else d.wayback_novas
+    linhas.append(f"- Capturas novas no Wayback: {wayback}")
     return "\n".join(linhas) + "\n"

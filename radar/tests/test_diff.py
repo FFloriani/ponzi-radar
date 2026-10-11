@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from radar.arquivos import gravar_json_atomico
-from radar.diff import Diff, comparar, renderizar_diff, texto_classe, texto_intervalo
+from radar.diff import Diff, alertas_da_execucao, comparar, renderizar_diff, texto_classe, texto_intervalo
 from radar.execucao import carregar_execucao
 from radar.pontuacao import Eixo1, site_nao_respondeu
 from tests.execucao_em_disco import AGORA, MATRIZ, PETROBRAS, gravar, pend_e_com, resposta, saidas_base, sinal_e
@@ -149,6 +149,66 @@ def test_diff_alerta_que_ja_existia_nao_e_novo(tmp_path):
     cvm = {"cvm_alertas": {"correspondencias": [alerta], "cobertura": {"com_texto_integral": 3, "so_resumo": 0}}}
     a, b = duas(tmp_path, a={"saidas": cvm}, b={"saidas": cvm})
     assert comparar(a, b, MATRIZ).sinais_novos == []
+
+
+def _delib(numero: int, tipo: str, valor: str | None, data: str = "2026-09-01") -> dict:
+    achado = {"tipo": tipo, "numero": numero, "data": data, "url": f"https://conteudo.cvm.gov.br/d{numero}", "trecho": "x"}
+    return achado if valor is None else {**achado, "valor": valor}
+
+
+def _cvm(*correspondencias: dict) -> dict:
+    return {"cvm_alertas": {"correspondencias": list(correspondencias), "cobertura": {"com_texto_integral": 3, "so_resumo": 0}}}
+
+
+def test_diff_deliberacao_que_cita_o_alvo_e_o_destino_diz_qual_dominio(tmp_path):
+    # T1/R-A-T1-cvm: o `cvm_alertas` casa o domínio do alvo e o do destino, e a mesma deliberação pode citar os dois
+    cvm = _cvm(_delib(15, "dominio", "phinv.link"), _delib(15, "dominio", "phinvestimentos.com"))
+    a, b = duas(tmp_path, b={"saidas": cvm})
+    d = comparar(a, b, MATRIZ)
+    assert d.sinais_novos == [
+        "alerta CVM: Deliberação 15 (2026-09-01) cita o domínio phinv.link",
+        "alerta CVM: Deliberação 15 (2026-09-01) cita o domínio phinvestimentos.com",
+    ]
+    alertas = alertas_da_execucao(b)
+    assert len({al.chave for al in alertas}) == 2 and [al.fonte for al in alertas] == ["https://conteudo.cvm.gov.br/d15"] * 2
+    texto = renderizar_diff(d)
+    assert "cita o domínio phinv.link" in texto and "cita o domínio phinvestimentos.com" in texto
+
+
+def test_diff_alerta_da_cvm_so_e_novo_pelo_dominio_citado(tmp_path):
+    # a execução de antes só citava o redirecionador; a de agora cita também o destino: só esse é novo
+    antes = _cvm(_delib(15, "dominio", "phinv.link"))
+    agora = _cvm(_delib(15, "dominio", "phinv.link"), _delib(15, "dominio", "phinvestimentos.com"))
+    a, b = duas(tmp_path, a={"saidas": antes}, b={"saidas": agora})
+    assert comparar(a, b, MATRIZ).sinais_novos == ["alerta CVM: Deliberação 15 (2026-09-01) cita o domínio phinvestimentos.com"]
+    # e o mesmo domínio nas duas, escrito de outro jeito (caixa e espaço), não é novo
+    a, b = duas(tmp_path / "igual", a={"saidas": antes}, b={"saidas": _cvm(_delib(15, "dominio", " PHINV.link "))})
+    assert comparar(a, b, MATRIZ).sinais_novos == []
+
+
+@pytest.mark.parametrize("valor", [None, "", "   ", 5, ["phinv.link"]])
+def test_diff_alerta_de_dominio_sem_valor_legivel_segue_como_antes(tmp_path, valor):
+    # execução salva sem o domínio na correspondência (ou com lixo): o rótulo e a chave de sempre
+    achado = {**_delib(15, "dominio", None), "valor": valor}
+    a, b = duas(tmp_path, b={"saidas": _cvm(achado)})
+    assert comparar(a, b, MATRIZ).sinais_novos == ["alerta CVM: Deliberação 15 (2026-09-01) cita o domínio"]
+    assert [al.chave for al in alertas_da_execucao(b)] == ["cvm:15:dominio"]
+
+
+def test_diff_alerta_de_cnpj_e_de_nome_nao_levam_o_valor_no_rotulo(tmp_path):
+    cvm = _cvm(_delib(1, "cnpj", PETROBRAS), _delib(2, "nome", "exemplo investimentos"))
+    a, b = duas(tmp_path, b={"saidas": cvm})
+    assert comparar(a, b, MATRIZ).sinais_novos == [
+        "alerta CVM: Deliberação 1 (2026-09-01) cita o CNPJ",
+        "alerta CVM: Deliberação 2 (2026-09-01) cita o nome",
+    ]
+
+
+def test_diff_alerta_de_dominio_hostil_nao_quebra_a_linha_do_diff(tmp_path):
+    cvm = _cvm(_delib(15, "dominio", "x.com\n## Título falso | `código`"))
+    a, b = duas(tmp_path, b={"saidas": cvm})
+    texto = renderizar_diff(comparar(a, b, MATRIZ))
+    assert "\n## Título falso" not in texto and "\n- Sinais e alertas novos" in texto
 
 
 def test_diff_alerta_de_outro_regulador_da_pc4(tmp_path):
@@ -325,10 +385,36 @@ def test_diff_execucao_de_antes_do_no_destino_vale_pelo_alvo(tmp_path):
     assert comparar(sem_o_no_destino(a), sem_o_no_destino(b), MATRIZ).infra == ["hospedagem mudou"]
 
 
+NAO_COMPARAVEL = "- Capturas novas no Wayback: não comparável (domínio analisado mudou)"
+
+
 def test_diff_dominio_analisado_que_mudou_nao_soma_as_capturas_do_wayback(tmp_path):
     indice = {**saidas_base()["wayback_indice"], "total": 500}
     a, b = duas(tmp_path, b={"saidas": {**COM_REDIRECT["saidas"], "wayback_indice": indice}})
-    assert comparar(a, b, MATRIZ).wayback_novas == 0  # 500 capturas de outro domínio não são 380 novas
+    d = comparar(a, b, MATRIZ)
+    # 500 capturas de outro domínio não são 380 novas: o campo diz "não comparável" (None), não 0
+    assert d.wayback_novas is None
+    texto = renderizar_diff(d)
+    assert NAO_COMPARAVEL in texto.splitlines()
+    assert "Capturas novas no Wayback: 0" not in texto and "Capturas novas no Wayback: None" not in texto
+
+
+def test_diff_wayback_nao_comparavel_vale_nos_dois_sentidos_e_sem_captura(tmp_path):
+    # o redirect que some, e o domínio que mudou porque a captura caiu (o `destino` voltou ao alvo)
+    a, b = duas(tmp_path, a=COM_REDIRECT)
+    assert comparar(a, b, MATRIZ).wayback_novas is None
+    a, b = duas(tmp_path / "sem_captura", a=COM_REDIRECT, b={"status": {"captura": ("erro", "captura falhou: HTTP 403")}})
+    d = comparar(a, b, MATRIZ)
+    assert d.wayback_novas is None and NAO_COMPARAVEL in renderizar_diff(d).splitlines()
+
+
+def test_diff_mesmo_dominio_analisado_continua_contando_as_capturas_do_wayback(tmp_path):
+    # com o mesmo redirect nas duas execuções, o domínio analisado é o mesmo e o Wayback se compara
+    indice = {**saidas_base()["wayback_indice"], "total": 150}
+    b = {"saidas": {**COM_REDIRECT["saidas"], "wayback_indice": indice}}
+    a, b = duas(tmp_path, a=COM_REDIRECT, b=b)
+    d = comparar(a, b, MATRIZ)
+    assert d.wayback_novas == 30 and "- Capturas novas no Wayback: 30" in renderizar_diff(d).splitlines()
 
 
 def test_diff_infra_na_ordem_e_renderizada(tmp_path):

@@ -424,6 +424,30 @@ async def test_responder_fora_do_formato(abrir, tmp_path):
     assert ler_json(pasta(tmp_path, run_id) / "julgamentos.json") == []
 
 
+@pytest.mark.parametrize("status", ["nao_encontrado", "inconclusivo"])
+async def test_responder_com_valor_nulo_em_nao_encontrado_e_inconclusivo_e_aceito(abrir, tmp_path, status):
+    # o aceite de 08/10/2026: "resposta fora do formato: valor: Input should be a valid dictionary"
+    srv = await abrir()
+    run_id = await iniciar(srv)
+    resposta = {"status": status, "valor": None, "onde_procurou": ["site e redes sociais"]}
+    r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-A1", resposta=resposta)
+    assert r["aceita"] is True, r
+    (julgamento,) = ler_json(pasta(tmp_path, run_id) / "julgamentos.json")
+    assert (julgamento["resposta"]["status"], julgamento["resposta"]["valor"]) == (status, {})
+
+
+@pytest.mark.parametrize("status", ["confirmado", "corrigido"])
+async def test_responder_com_valor_nulo_em_confirmado_e_corrigido_continua_recusado(abrir, tmp_path, status):
+    srv = await abrir()
+    run_id = await iniciar(srv)
+    html = artefatos(tmp_path, run_id)["html"]
+    resposta = {**resposta_a1(html), "status": status, "valor": None}
+    r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-A1", resposta=resposta)
+    assert r["aceita"] is False and r["campo"] == "valor"
+    assert r["motivo"] == "resposta fora do formato: valor: Input should be a valid dictionary"
+    assert ler_json(pasta(tmp_path, run_id) / "julgamentos.json") == []  # nada gravado
+
+
 async def test_responder_pendencia_desconhecida_fechada_e_correcao(abrir, tmp_path):
     srv = await abrir()
     run_id = await iniciar(srv)

@@ -81,6 +81,13 @@ _MOTIVO_DESAFIO = "desafio anti-bot"
 _EXTENSOES_DE_ARQUIVO = frozenset({"zip", "pdf", "exe", "apk", "rar", "7z", "dmg", "msi"})
 _JS_LINKS = "() => Array.from(document.links, (link) => link.href)"
 _ERRO_DO_CHROMIUM = re.compile(r"net::(ERR_[A-Z0-9_]+)")
+# a 1ª linha do erro do Playwright quando o executável do Chromium não está onde ele procura (o caminho e o quadro de
+# aviso das linhas seguintes mudam com a versão e o sistema)
+_NAVEGADOR_AUSENTE = re.compile(r"BrowserType\.\w+: Executable doesn't exist\b")
+MOTIVO_NAVEGADOR_AUSENTE = (
+    'navegador do Playwright não encontrado; rode "playwright install chromium" no venv do radar '
+    "ou confira PLAYWRIGHT_BROWSERS_PATH no ambiente do servidor MCP"
+)
 # o WebRTC só usa UDP pelo proxy: sem proxy UDP (HTTP, SOCKS), nenhum candidato ICE sai pela rede do analista
 ARGS_DO_NAVEGADOR = (
     "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
@@ -397,8 +404,12 @@ def _erro_da_captura(erro: Exception) -> ErroNo:
 
     - o `goto` da página inicial não alcançou o site (`ERROS_DE_ALCANCE` ou timeout): "captura falhou: navegação:
       net::ERR_..." ou "captura falhou: navegação: timeout";
-    - qualquer outra falha é do lado do analista: "captura indisponível: <motivo>" (navegador ausente ou que não
-      inicia, proxy ou túnel fora, sem internet, certificado e TLS, erro inesperado do código).
+    - o Playwright não achou o executável do Chromium: "captura indisponível: navegador do Playwright não encontrado;
+      rode "playwright install chromium" no venv do radar ou confira PLAYWRIGHT_BROWSERS_PATH no ambiente do servidor
+      MCP" (o ambiente reduzido de um cliente MCP sem o `PLAYWRIGHT_BROWSERS_PATH` do analista cai aqui). Sem o caminho
+      nem o quadro de aviso do Playwright, e como as demais falhas do analista: não conta para o E6;
+    - qualquer outra falha é do lado do analista: "captura indisponível: <motivo>" (navegador que não inicia, proxy ou
+      túnel fora, sem internet, certificado e TLS, erro inesperado do código).
     """
     if isinstance(erro, _FalhaDeNavegacao):
         if isinstance(erro.original, PlaywrightTimeout):
@@ -406,6 +417,8 @@ def _erro_da_captura(erro: Exception) -> ErroNo:
         codigo = _ERRO_DO_CHROMIUM.search(str(erro.original))
         if codigo is not None and codigo.group(1) in ERROS_DE_ALCANCE:
             return ErroNo(f"{PREFIXO_FALHA_NAVEGACAO} net::{codigo.group(1)}", permanente=False)
+    elif isinstance(erro, PlaywrightError) and _NAVEGADOR_AUSENTE.match(_motivo(erro)):
+        return ErroNo(f"{PREFIXO_CAPTURA_INDISPONIVEL} {MOTIVO_NAVEGADOR_AUSENTE}", permanente=False)
     return ErroNo(f"{PREFIXO_CAPTURA_INDISPONIVEL} {_motivo(erro)}", permanente=False)
 
 

@@ -567,6 +567,16 @@ def _evidencia_cvm(correspondencia: dict) -> Evidencia:
     )
 
 
+def _o_que_cita(correspondencia: dict) -> str:
+    """"o CNPJ", ou "o domínio <domínio>": depois de um redirect a mesma deliberação pode citar o domínio do alvo e o do
+    destino, e a nota diz qual (sem o valor, quando a execução salva não o traz)."""
+    if correspondencia["tipo"] == "cnpj":
+        return "o CNPJ"
+    valor = correspondencia.get("valor")
+    dominio = " ".join(valor.split()).lower() if isinstance(valor, str) else ""
+    return f"o domínio {dominio}" if dominio else "o domínio"
+
+
 def _item_c4(ex: ExecucaoSalva, matriz: Matriz) -> Item:
     """A deliberação da CVM que cita o CNPJ ou o domínio confirma sozinha; correspondência só pelo nome vai para a
     P-C4, que decide o item."""
@@ -579,11 +589,10 @@ def _item_c4(ex: ExecucaoSalva, matriz: Matriz) -> Item:
         ]
         if exatas:
             maximo = matriz.itens["C4"].max
-            chave = {"cnpj": "o CNPJ", "dominio": "o domínio"}
             return Item(
                 id="C4", estado="confirmado", pontos=maximo, maximo=maximo, origem="coletor",
                 evidencias=[_evidencia_cvm(c) for c in exatas],
-                nota="; ".join(f"Deliberação CVM {c.get('numero')} cita {chave[c['tipo']]}" for c in exatas),
+                nota="; ".join(f"Deliberação CVM {c.get('numero')} cita {_o_que_cita(c)}" for c in exatas),
             )  # fmt: skip
     return _item_da_pendencia(ex, "C4", matriz)
 
@@ -630,7 +639,9 @@ def _item_d3(ex: ExecucaoSalva, matriz: Matriz) -> Item:
     """Domínio registrado ou CNPJ aberto menos de `meses_limite` meses antes do `as_of`. Sem empresa identificada, só
     o domínio conta; uma data que não se sabe impede o `nao_se_aplica`. Com o domínio reaproveitado, a frase do aviso
     toma o lugar de "domínio registrado em X" na nota (a data não se repete) ou, se o domínio não aparece na nota,
-    vai no fim dela; os pontos e o estado são os mesmos."""
+    vai no fim dela; em `nao_se_aplica` ela se parte: a cabeça ("domínio registrado de novo em X") fica no lugar do
+    domínio e a cauda (o histórico, que pode ser de outro dono) vem depois do ": 12 meses ou mais", que qualifica as
+    datas. Os pontos e o estado são os mesmos."""
     info = matriz.itens["D3"]
     as_of = ex.ctx.as_of
     conhecidas: list[tuple[str, date]] = []
@@ -646,31 +657,44 @@ def _item_d3(ex: ExecucaoSalva, matriz: Matriz) -> Item:
         else:
             conhecidas.append((rotulo, data))
 
-    aviso = ""
+    cabeca = cauda = aviso = ""
     if (reaproveitado := dominio_reaproveitado(ex)) is not None:
-        aviso = (
-            f"domínio registrado de novo em {reaproveitado['registro']}; há histórico desde "
-            f"{reaproveitado['historico_desde']} ({reaproveitado['fonte_historico']}), que pode ser de outro dono"
+        cabeca = f"domínio registrado de novo em {reaproveitado['registro']}"
+        cauda = (
+            f"há histórico desde {reaproveitado['historico_desde']} ({reaproveitado['fonte_historico']}), "
+            "que pode ser de outro dono"
         )
+        aviso = f"{cabeca}; {cauda}"
 
-    def fragmento(rotulo: str, data: date) -> str:
-        """"domínio registrado em X", ou a frase do aviso no lugar dele: a data do registro não se repete."""
-        return aviso if aviso and rotulo == _ROTULO_DOMINIO else f"{rotulo} em {data.isoformat()}"
+    def fragmento(rotulo: str, data: date, partido: bool = False) -> str:
+        """"domínio registrado em X", ou a frase do aviso no lugar dele (a data do registro não se repete); `partido`:
+        só a cabeça da frase, e a cauda vai depois do sufixo (ver `item`)."""
+        if aviso and rotulo == _ROTULO_DOMINIO:
+            return cabeca if partido else aviso
+        return f"{rotulo} em {data.isoformat()}"
 
-    def item(estado: EstadoItem, partes: list[str], sufixo: str = "", pontos: int = 0, origem: str = "coletor") -> Item:
-        if aviso and aviso not in partes:  # o domínio não está na nota (D3 só pelo CNPJ, ou data desconhecida)
-            partes = [*partes, aviso]
+    def item(
+        estado: EstadoItem, partes: list[str], sufixo: str = "", pontos: int = 0, origem: str = "coletor",
+        depois: str = "",
+    ) -> Item:  # fmt: skip
+        if aviso and aviso not in partes and cabeca not in partes:
+            partes = [*partes, aviso]  # o domínio não está na nota (D3 só pelo CNPJ, ou data desconhecida)
         return Item(
-            id="D3", estado=estado, pontos=pontos, maximo=info.max, origem=origem, nota="; ".join(partes) + sufixo
-        )
+            id="D3", estado=estado, pontos=pontos, maximo=info.max, origem=origem,
+            nota="; ".join(partes) + sufixo + depois,
+        )  # fmt: skip
 
     if novas := [(r, d) for r, d in conhecidas if as_of < _somar_meses(d, info.meses_limite)]:
         return item("confirmado", [fragmento(r, d) for r, d in novas], pontos=info.max)
     if desconhecidas or not conhecidas:
         return item("nao_verificado", desconhecidas or ["sem datas"], origem="nenhuma")
+    # o sufixo ("12 meses ou mais") qualifica as datas listadas: com o domínio reaproveitado a cauda da frase (o
+    # histórico, que pode ser de outro dono) vem depois dele, não colada a ele
+    partes = [fragmento(r, d, partido=True) for r, d in conhecidas]
     return item(
-        "nao_se_aplica", [fragmento(r, d) for r, d in conhecidas], sufixo=f": {info.meses_limite} meses ou mais"
-    )
+        "nao_se_aplica", partes, sufixo=f": {info.meses_limite} meses ou mais",
+        depois=f"; {cauda}" if cabeca and cabeca in partes else "",
+    )  # fmt: skip
 
 
 def itens_da_execucao(ex: ExecucaoSalva, matriz: Matriz) -> dict[str, Item]:

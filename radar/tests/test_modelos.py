@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -99,6 +100,39 @@ def test_inconclusivo_sem_evidencia_ok():
 def test_resposta_status_invalido():
     with pytest.raises(ValidationError):
         Resposta(status="talvez")
+
+
+@pytest.mark.parametrize("status", ["nao_encontrado", "inconclusivo"])
+def test_valor_nulo_em_nao_encontrado_e_inconclusivo_vale_objeto_vazio(status):
+    # o cliente que não achou nada manda `valor: null` (o aceite de 08/10/2026 recebeu "Input should be a valid dictionary")
+    dados = {"status": status, "valor": None, "onde_procurou": ["busca: 'x cnpj'"]}
+    for r in (Resposta(**dados), Resposta.model_validate(dados), Resposta.model_validate_json(json.dumps(dados))):
+        assert r.valor == {} and r.status == status
+    # e o que o radar grava é o objeto vazio, não o null
+    assert Resposta.model_validate(dados).model_dump(mode="json")["valor"] == {}
+
+
+@pytest.mark.parametrize("status", ["confirmado", "corrigido"])
+def test_valor_nulo_em_confirmado_e_corrigido_continua_exigindo_objeto(status):
+    with pytest.raises(ValidationError) as e:
+        Resposta(status=status, valor=None, evidencias=[_evidencia()])
+    (erro,) = e.value.errors()
+    assert erro["loc"] == ("valor",) and erro["msg"] == "Input should be a valid dictionary"
+
+
+@pytest.mark.parametrize("status", ["nao_encontrado", "inconclusivo"])
+@pytest.mark.parametrize("valor", ["", "x", 0, False, [], [{"a": 1}]])
+def test_so_o_nulo_e_aceito_no_lugar_do_objeto(status, valor):
+    # a folga é só para `null`: texto, número, booleano e lista continuam fora do formato
+    with pytest.raises(ValidationError) as e:
+        Resposta(status=status, valor=valor, onde_procurou=["busca"])
+    assert e.value.errors()[0]["loc"] == ("valor",)
+
+
+def test_valor_nulo_com_status_invalido_aponta_o_status():
+    with pytest.raises(ValidationError) as e:
+        Resposta.model_validate({"status": "talvez", "valor": None})
+    assert [erro["loc"] for erro in e.value.errors()][0] == ("status",)
 
 
 def test_resposta_ida_e_volta_json():

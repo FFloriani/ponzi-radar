@@ -70,6 +70,13 @@ _MAX_SANS = 20
 _MAX_TERCEIROS = 20
 _MAX_PAGINAS = 10
 _NA = "—"
+# o `redirect_ignorado.motivo` da captura é um identificador (`nos.captura._destino_do_redirect`); o dossiê o escreve
+# em português. Um motivo que não está aqui (uma saída de versão futura) sai como veio.
+_MOTIVO_DO_REDIRECT_IGNORADO = {
+    "plataforma": "plataforma",
+    "estacionamento": "estacionamento de domínio",
+    "servico_de_terceiro": "serviço de terceiro",
+}
 _AMBIENTE = Environment(
     loader=FileSystemLoader(Path(__file__).parent),
     undefined=StrictUndefined,
@@ -188,12 +195,13 @@ def _redirecionamento(ex: ExecucaoSalva) -> dict | None:
 
 
 def _redirect_ignorado(ex: ExecucaoSalva) -> dict | None:
-    """O redirect da página inicial para plataforma ou estacionamento, que a captura não seguiu (`redirect_ignorado`):
-    `{"url", "motivo"}`, ou `None` sem ele."""
+    """O redirect da página inicial para plataforma, estacionamento ou serviço de terceiro, que a captura não seguiu
+    (`redirect_ignorado`): `{"url", "motivo"}` (o motivo em português), ou `None` sem ele."""
     ignorado = (saida(ex, "captura") or {}).get("redirect_ignorado")
     if not isinstance(ignorado, dict) or not isinstance(ignorado.get("url"), str) or not ignorado["url"]:
         return None
-    return {"url": ignorado["url"], "motivo": str(ignorado.get("motivo") or _NA)}
+    motivo = str(ignorado.get("motivo") or _NA)
+    return {"url": ignorado["url"], "motivo": _MOTIVO_DO_REDIRECT_IGNORADO.get(motivo, motivo)}
 
 
 def _parametros_removidos(ex: ExecucaoSalva) -> list[str]:

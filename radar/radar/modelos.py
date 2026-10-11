@@ -8,7 +8,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator, model_validator
 
 StatusNo = Literal["pendente", "executando", "feito", "aguardando", "erro", "bloqueado", "pulado"]
 CapacidadeAsOf = Literal["exato", "filtravel", "so_atual"]
@@ -83,6 +83,16 @@ class Resposta(BaseModel):
     evidencias: list[Evidencia] = Field(default_factory=list)
     onde_procurou: list[str] = Field(default_factory=list)
     substitui: str | None = None
+
+    @field_validator("valor", mode="before")
+    @classmethod
+    def _valor_nulo_de_quem_nao_achou(cls, valor: object, info: ValidationInfo) -> object:
+        """`valor: null` em `nao_encontrado` e `inconclusivo` vale `{}`: quem não achou nada não tem campos para dar, e
+        nenhum nó lê o `valor` desses status. Em `confirmado` e `corrigido`, e em qualquer outro valor que não seja
+        objeto, o `null` segue recusado (o esquema da pendência precisa do objeto)."""
+        if valor is None and info.data.get("status") in ("nao_encontrado", "inconclusivo"):
+            return {}
+        return valor
 
     @model_validator(mode="after")
     def _regras_por_status(self) -> Resposta:
