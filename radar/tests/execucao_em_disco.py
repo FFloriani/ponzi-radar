@@ -11,7 +11,7 @@ import hashlib
 from datetime import date, datetime
 from pathlib import Path
 
-from radar.arquivos import gravar_json_atomico
+from radar.arquivos import gravar_json_atomico, ler_json
 from radar.custodia import Custodia
 from radar.modelos import Contexto, Resposta
 from radar.pendencias.definicoes import nova_pendencia
@@ -136,8 +136,12 @@ def gravar(
     abertas: tuple[str, ...] = (),
     marcas: dict[str, list[str]] | None = None,
     slug: str = "exemplo-com-br",
+    alvo: str = "exemplo.com.br",
 ) -> Path:
     """Grava a execução em `casos/<slug>/<AAAA-MM-DD_HHMMSS>` e devolve a pasta.
+
+    - `alvo`: o `contexto.alvo` (e a saída do nó `alvo` e do `destino`, se `saidas` não os trouxer); a `url_inicial`
+      é `https://<alvo>/`;
 
     - `saidas`: `{nó: saída}` troca ou acrescenta a saída do nó (que fica `feito`);
     - `status`: `{nó: "erro"}` ou `{nó: ("erro", motivo)}` tira o nó do `feito` e apaga a saída dele;
@@ -147,12 +151,16 @@ def gravar(
     carimbo = agora.strftime("%Y-%m-%d_%H%M%S")
     pasta = Path(casos) / slug / carimbo
     pasta.mkdir(parents=True)
+    url_inicial = URL_SITE if alvo == "exemplo.com.br" else f"https://{alvo}/"
     ctx = Contexto(
-        alvo="exemplo.com.br", slug=slug, url_inicial=URL_SITE, as_of=as_of or agora.date(), data_execucao=agora,
+        alvo=alvo, slug=slug, url_inicial=url_inicial, as_of=as_of or agora.date(), data_execucao=agora,
         modo_contato="captura", modo_cego=False, run_id=f"{slug}/{carimbo}", pasta=pasta,
     )  # fmt: skip
 
-    todas = {**saidas_base(), **(saidas or {})}
+    base = saidas_base()
+    base["alvo"] = {**base["alvo"], "dominio": alvo, "slug": slug, "url_inicial": url_inicial}
+    base["destino"] = {**base["destino"], "dominio": alvo}
+    todas = {**base, **(saidas or {})}
     pedidos = {**{n: s for n, s in _STATUS_PADRAO.items() if n not in (saidas or {})}, **(status or {})}
     for pendencia in abertas:
         pedidos[NO_DA_PENDENCIA[pendencia]] = "aguardando"
@@ -188,4 +196,18 @@ def gravar(
     )
     gravar_json_atomico(pasta / "evidencias.json", {no: todas[no] for no in NOS if no in todas})
     gravar_json_atomico(pasta / "julgamentos.json", julgamentos)
+    return pasta
+
+
+def antes_da_t1(pasta: Path) -> Path:
+    """Deixa a execução gravada como as de antes da T1 das melhorias do aceite: sem o nó `destino` no `estado.json` nem
+    no `evidencias.json`, e a saída da captura sem `destino`, `redirect_ignorado` e `saltos`."""
+    estado = ler_json(pasta / "estado.json")
+    estado["nos"].pop("destino", None)
+    gravar_json_atomico(pasta / "estado.json", estado)
+    evidencias = ler_json(pasta / "evidencias.json")
+    evidencias.pop("destino", None)
+    for chave in ("destino", "redirect_ignorado", "saltos"):
+        (evidencias.get("captura") or {}).pop(chave, None)
+    gravar_json_atomico(pasta / "evidencias.json", evidencias)
     return pasta

@@ -18,8 +18,10 @@ para o dossiê pôr a marca só no item que cita aquela evidência.
 
 `arquivar_fonte` é o único lugar por onde uma URL dada pelo Claude chega à rede. Ele recusa o que não é fonte
 pública: esquema que não é http(s), `localhost`, nome malformado, IP ou nome que resolve para IP não global, o
-alvo, o destino para onde ele redireciona (saída do nó `destino`) e os IPs do domínio analisado (só o nó `captura`
-visita o site) e serviços que fazem um terceiro visitar o alvo. Cada salto de
+alvo, o destino para onde ele redireciona (saída do nó `destino`), os outros domínios do site que a captura visitou
+(`captura.dominios_visitados`: o rastreador no meio do redirect, a página de uma execução gravada antes do nó
+`destino`) e os IPs do domínio analisado (só o nó `captura` visita o site) e serviços que fazem um terceiro visitar o
+alvo. Cada salto de
 redirect passa pelas mesmas regras: sem isso, um endereço público que redireciona para `http://127.0.0.1/`
 passaria. Com proxy configurado o nome não é resolvido aqui (quem resolve é o proxy). A resolução e a conexão são
 consultas separadas: um nome que muda de IP entre elas (DNS rebinding) não é detectado.
@@ -32,6 +34,7 @@ import ipaddress
 import json
 import re
 import socket
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import date
 from html.parser import HTMLParser
@@ -317,15 +320,17 @@ def _canonicos(ips: set[str] | None) -> frozenset[str]:
     return frozenset(canonicos)
 
 
-def _dominios_do_alvo(ctx: Contexto, dominio_destino: str | None) -> frozenset[str]:
-    """Os domínios registráveis que só a captura visita: o do alvo e o do destino do redirect (saída `dominio` do nó
-    `destino`), em minúsculas e em punycode, como `dominio_registravel` os devolve."""
+def _dominios_do_alvo(ctx: Contexto, dominio_destino: str | Iterable[str | None] | None) -> frozenset[str]:
+    """Os domínios registráveis que só a captura visita: o do alvo e os de `dominio_destino` (um domínio ou vários: o
+    destino do redirect, saída `dominio` do nó `destino`, e os que a captura visitou, `captura.dominios_visitados`), em
+    minúsculas e em punycode, como `dominio_registravel` os devolve. O que não é texto ou é vazio fica de fora."""
     dominios = {ctx.alvo.lower()}
-    if isinstance(dominio_destino, str) and (destino := dominio_destino.strip().rstrip(".").lower()):
-        try:
-            dominios.add(destino.encode("idna").decode("ascii"))
-        except UnicodeError:  # rótulo que o codec não aceita: vale como veio
-            dominios.add(destino)
+    for dominio in [dominio_destino] if isinstance(dominio_destino, str) else dominio_destino or ():
+        if isinstance(dominio, str) and (destino := dominio.strip().rstrip(".").lower()):
+            try:
+                dominios.add(destino.encode("idna").decode("ascii"))
+            except UnicodeError:  # rótulo que o codec não aceita: vale como veio
+                dominios.add(destino)
     return frozenset(dominios)
 
 
@@ -432,7 +437,7 @@ async def arquivar_fonte(
     ctx: Contexto,
     s: Servicos,
     ips_do_alvo: set[str] | None = None,
-    dominio_destino: str | None = None,
+    dominio_destino: str | Iterable[str | None] | None = None,
 ) -> FonteArquivada:
     """Baixa `url` pela `Rede` e guarda na custódia (`tipo="fonte"`, `origem=url`).
 
@@ -440,7 +445,8 @@ async def arquivar_fonte(
     "fonte não encontrada (domínio inexistente)..."; `ErroRede` se a página não pôde ser baixada ou o corpo passa
     de 10 MB. `ips_do_alvo`: os endereços A/AAAA do domínio analisado (saída do nó `dns`, que resolve o destino do
     redirect quando há); um IP literal deles é recusado. `dominio_destino`: o domínio para onde o alvo redireciona
-    (saída `dominio` do nó `destino`), recusado como o do alvo.
+    (saída `dominio` do nó `destino`) ou uma coleção com ele e os que a captura visitou (`captura.dominios_visitados`),
+    recusados como o do alvo.
     """
     dominios = _dominios_do_alvo(ctx, dominio_destino)
     return (await _arquivar(url, ctx, s, _canonicos(ips_do_alvo), dominios)).fonte
@@ -603,14 +609,15 @@ async def validar(
     s: Servicos,
     mascara: dict[str, str] | None = None,
     ips_do_alvo: set[str] | None = None,
-    dominio_destino: str | None = None,
+    dominio_destino: str | Iterable[str | None] | None = None,
 ) -> Validacao:
     """Confere a resposta do Claude à `pendencia` (spec 7.4). Ver o docstring do módulo para a ordem.
 
     `nao_encontrado` e `inconclusivo` sem evidências pulam os passos 2 a 4; com evidências, elas são
     validadas como as de qualquer outra resposta. `mascara` (a de `montar_mascara`) só vale com `ctx.modo_cego`.
     `ips_do_alvo`: os endereços A/AAAA do domínio analisado (saída do nó `dns`), cujo IP literal não é fonte.
-    `dominio_destino`: o domínio para onde o alvo redireciona (saída `dominio` do nó `destino`), que não é fonte.
+    `dominio_destino`: o domínio para onde o alvo redireciona (saída `dominio` do nó `destino`), ou a coleção com ele e
+    os que a captura visitou (`captura.dominios_visitados`), que não são fonte.
     """
     if (rejeicao := _validar_valor(resposta, pendencia, s) or _itens_fora(resposta, pendencia)) is not None:
         return rejeicao

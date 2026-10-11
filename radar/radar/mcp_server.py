@@ -64,6 +64,7 @@ from radar.execucao import listar_casos as casos_em_disco
 from radar.modelos import ErroNo, Pendencia, Resposta
 from radar.motor import Motor, NoBase, Servicos
 from radar.nos import nos_do_nucleo
+from radar.nos.captura import dominios_visitados
 from radar.pendencias.definicoes import CABECALHO_NAO_CONFIAVEL, DEFINICOES
 from radar.pendencias.mascara import MARCADOR, mascarar, montar_mascara
 from radar.pendencias.validacao import arquivar_fonte as baixar_fonte
@@ -412,6 +413,8 @@ class _Execucao:
     tarefa: asyncio.Task | None = None
     mascara: dict[str, str] = field(default_factory=dict)
     recusas_tardias: list[dict] = field(default_factory=list)
+    # a execução foi gravada antes do nó `destino` (o `estado.json` não o tem): ver `_Radar._destino_em_aberto`
+    sem_no_destino: bool = False
 
     @property
     def run_id(self) -> str:
@@ -469,6 +472,8 @@ class _Radar:
         servicos = criar_servicos(self.config, pasta, self.rede.sessao(), self.indices, self.matriz)
         try:
             aberta = _Execucao(Motor.carregar(pasta, self._nos(), servicos), servicos)
+            nos_gravados = (ler_json(pasta / "estado.json", {}) or {}).get("nos") or {}
+            aberta.sem_no_destino = "destino" in aberta.motor.status() and "destino" not in nos_gravados
             if aberta.cega:
                 salva = ler_json(pasta / NOME_DA_MASCARA, {})
                 if isinstance(salva, dict):
@@ -617,16 +622,25 @@ class _Radar:
     def _destino_em_aberto(ex: _Execucao) -> bool:
         """O nó `destino` está no DAG e ainda não terminou: o domínio para onde o alvo redireciona não é conhecido, e uma
         URL baixada agora pode ser o site investigado fora da captura (I2 da revisão da T1). No modo `nenhum` e no
-        retroativo a captura é pulada e o `destino` termina logo."""
+        retroativo a captura é pulada e o `destino` termina logo. Na execução gravada antes do nó (F2 da revisão
+        final), ele fica `pendente` até um `status` drenar, sem nada rodando: vale como terminal, e a recusa fica com
+        os domínios que a captura antiga visitou (`_dominios_destino`)."""
         status = ex.motor.status().get("destino")
+        if status == "pendente" and ex.sem_no_destino:
+            return False
         return status is not None and status not in _TERMINAIS
 
     @staticmethod
-    def _dominio_destino(ex: _Execucao) -> str | None:
-        """O domínio que os coletores analisam (saída `dominio` do nó `destino`), se ele terminou: depois de um redirect,
-        o do destino, que a validação recusa como fonte junto com o do alvo."""
+    def _dominios_destino(ex: _Execucao) -> set[str]:
+        """Os domínios do site que a validação recusa como fonte, além do alvo: o do nó `destino` (depois de um redirect,
+        o do destino) e os que a captura visitou (`captura.dominios_visitados`: as páginas e os saltos do redirect da
+        página inicial, fora plataforma, estacionamento e serviço de terceiro). Na execução gravada antes do nó
+        `destino`, são as páginas da captura antiga que dizem para onde o alvo foi (F1 da revisão final)."""
+        dominios = dominios_visitados(ex.motor.saidas("captura"), ex.motor.ctx.alvo)
         dominio = (ex.motor.saidas("destino") or {}).get("dominio")
-        return dominio if isinstance(dominio, str) and dominio else None
+        if isinstance(dominio, str) and dominio:
+            dominios.add(dominio)
+        return dominios
 
     def _escore(self, pasta: Path) -> dict:
         """O intervalo e a classe do eixo 1 com o que está no disco agora."""
@@ -766,7 +780,7 @@ class _Radar:
             async with prazo:
                 fonte = await baixar_fonte(
                     url, ex.motor.ctx, ex.servicos,
-                    ips_do_alvo=self._ips_do_alvo(ex), dominio_destino=self._dominio_destino(ex),
+                    ips_do_alvo=self._ips_do_alvo(ex), dominio_destino=self._dominios_destino(ex),
                 )  # fmt: skip
         except TimeoutError:
             if not prazo.expired():
@@ -812,7 +826,7 @@ class _Radar:
                 validacao = await validar(
                     modelo, pendencia, ex.motor.ctx, ex.servicos,
                     mascara=self._mascara(ex), ips_do_alvo=self._ips_do_alvo(ex),
-                    dominio_destino=self._dominio_destino(ex),
+                    dominio_destino=self._dominios_destino(ex),
                 )  # fmt: skip
         except TimeoutError:
             if not prazo.expired():

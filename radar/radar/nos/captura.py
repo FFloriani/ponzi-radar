@@ -48,6 +48,7 @@ from playwright.async_api import (
     CDPSession,
     Page,
     Request,
+    Response,
     Route,
     WebSocketRoute,
     async_playwright,
@@ -329,6 +330,28 @@ def _destino_do_redirect(url_final: str, alvo: str) -> tuple[dict | None, dict |
     return {"url": url_final, "dominio": dominio}, None
 
 
+def dominios_visitados(captura: Any, alvo: str) -> set[str]:
+    """Os domínios registráveis que a captura visitou e que são o site, além do alvo: o de cada página capturada e o de
+    cada salto do redirect da página inicial (`saltos`), sempre que `_destino_do_redirect` aceitaria aquele domínio como
+    destino (não é o alvo, plataforma, estacionamento nem serviço de terceiro). É o que a validação recusa como fonte
+    junto com o alvo (F1 da revisão final): cobre o rastreador no meio da cadeia (`alvo → trk → destino`), a subpágina
+    que redirecionou para outro domínio e a execução gravada antes do nó `destino`, cuja captura já foi parar no destino
+    sem gravar a saída `destino`. A saída da captura vem do disco e do site investigado: o que não é URL fica de fora."""
+    if not isinstance(captura, dict):
+        return set()
+    paginas = captura.get("paginas")
+    saltos = captura.get("saltos")
+    urls = [p.get("url") for p in paginas if isinstance(p, dict)] if isinstance(paginas, list) else []
+    urls += saltos if isinstance(saltos, list) else []
+    dominios = set()
+    for url in urls:
+        if isinstance(url, str):
+            destino, _ = _destino_do_redirect(url, alvo)
+            if destino is not None:
+                dominios.add(destino["dominio"])
+    return dominios
+
+
 def _host_do_site(url: str) -> str | None:
     host = urlsplit(url).hostname
     return host.removeprefix("www.") if host else None
@@ -444,6 +467,8 @@ class _Visita:
     texto: str
     screenshot: bytes
     links: list = field(default_factory=list)
+    # as URLs por onde a navegação passou antes de `url`, na ordem: os saltos de redirect e a página que navegou sozinha
+    saltos: list[str] = field(default_factory=list)
 
     @property
     def e_desafio(self) -> bool:
@@ -452,6 +477,21 @@ class _Visita:
     @property
     def e_erro_http(self) -> bool:
         return _e_erro_http(self.status)
+
+
+def _saltos(resposta: Response | None, url_final: str) -> list[str]:
+    """As URLs da cadeia que terminou em `url_final`, na ordem e sem ela: cada pedido redirecionado (`redirected_from`)
+    e a URL da resposta do `goto` quando a página navegou sozinha depois (JS, meta refresh)."""
+    if resposta is None:
+        return []
+    cadeia = []
+    pedido = resposta.request.redirected_from
+    while pedido is not None:
+        cadeia.append(pedido.url)
+        pedido = pedido.redirected_from
+    cadeia.reverse()
+    cadeia.append(resposta.url)
+    return [url for url in dict.fromkeys(cadeia) if url != url_final]
 
 
 async def _visitar(
@@ -480,6 +520,7 @@ async def _visitar(
             texto=await pagina.inner_text("body"),
             screenshot=await pagina.screenshot(full_page=True),
             links=await pagina.evaluate(_JS_LINKS) if com_links else [],
+            saltos=_saltos(resposta, pagina.url),
         )
     finally:
         with contextlib.suppress(PlaywrightError):
@@ -504,13 +545,14 @@ def _guardar_desafio(s: Servicos, v: _Visita) -> None:
 @dataclass
 class _Percurso:
     """O que a captura levou do site: as páginas (sem o HAR), se a inicial era um desafio anti-bot, as subpáginas que
-    falharam e o redirect da página inicial (`_destino_do_redirect`)."""
+    falharam, o redirect da página inicial (`_destino_do_redirect`) e a cadeia dele (`saltos`)."""
 
     paginas: list[dict]
     bloqueada: bool
     falhas: list[dict]
     destino: dict | None
     redirect_ignorado: dict | None
+    saltos: list[str]
 
 
 async def _percorrer(
@@ -532,7 +574,7 @@ async def _percorrer(
         screenshot = s.custodia.guardar(inicio.screenshot, "png", tipo="screenshot", origem=inicio.url)
         # sem texto e sem seguir links
         paginas = [{"url": inicio.url, "status": inicio.status, "screenshot": screenshot}]
-        return _Percurso(paginas, True, [], destino, ignorado)
+        return _Percurso(paginas, True, [], destino, ignorado, inicio.saltos)
     if inicio.e_erro_http:
         # o site caiu ou recusou o visitante: sem conteúdo para analisar, o motor cai no Wayback
         s.custodia.guardar(_bytes(inicio.html), "html", tipo="pagina", origem=inicio.url)
@@ -558,7 +600,7 @@ async def _percorrer(
             falhas.append({"url": url, "motivo": str(erro)})
         except Exception as erro:  # o conteúdo é do site investigado: nada dele derruba o nó
             falhas.append({"url": url, "motivo": _motivo(erro)})
-    return _Percurso(paginas, False, falhas, destino, ignorado)
+    return _Percurso(paginas, False, falhas, destino, ignorado, inicio.saltos)
 
 
 class _EnderecoLocal(Exception):
@@ -623,6 +665,7 @@ async def _capturar(ctx: Contexto, dominio: str, s: Servicos) -> Feito:
             "falhas": percurso.falhas,
             "destino": destino,
             "redirect_ignorado": percurso.redirect_ignorado,
+            "saltos": percurso.saltos,
         }
     )
 
@@ -636,8 +679,9 @@ class CapturaNo(NoBase):
     `falhas` (as subpáginas que não puderam ser capturadas, com o motivo), `destino` (`{"url", "dominio"}` quando a
     página inicial terminou noutro domínio registrável, senão `None`) e `redirect_ignorado` (`{"url", "dominio",
     "motivo"}` quando esse domínio é plataforma, estacionamento ou serviço de terceiro e o alvo continua o mesmo,
-    senão `None`); ver
-    `_destino_do_redirect`.
+    senão `None`); ver `_destino_do_redirect`. `saltos`: as URLs da cadeia de redirect da página inicial, na ordem e
+    sem a URL final (`[]` sem redirect; a captura gravada antes da revisão final não tem a chave): com as páginas, dão
+    os domínios que a validação recusa como fonte (`dominios_visitados`).
 
     Os erros do nó distinguem o site do analista (I2, ver `_erro_da_captura`): "captura falhou: HTTP <código>" e
     "captura falhou: navegação: ..." falam do site; "captura indisponível: ..." é falha local e não conta para o E6.
@@ -651,7 +695,7 @@ class CapturaNo(NoBase):
 
     nome = "captura"
     entradas = ("alvo",)
-    saidas = ("paginas", "terceiros", "bloqueada", "falhas", "destino", "redirect_ignorado")
+    saidas = ("paginas", "terceiros", "bloqueada", "falhas", "destino", "redirect_ignorado", "saltos")
     toca_alvo = True
     as_of = "so_atual"
 

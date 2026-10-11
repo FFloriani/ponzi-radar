@@ -30,6 +30,7 @@ from radar.nos import captura as modulo_captura
 from radar.nos.alvo import SERVICOS_DE_ESTACIONAMENTO, SERVICOS_DE_TERCEIROS
 from radar.nos.captura import (
     CapturaNo,
+    dominios_visitados,
     _bytes,
     _destino_do_redirect,
     _e_desafio,
@@ -114,7 +115,7 @@ def test_declaracao():
         True,
         "so_atual",
     )
-    assert set(no.saidas) == {"paginas", "terceiros", "bloqueada", "falhas", "destino", "redirect_ignorado"}
+    assert set(no.saidas) == {"paginas", "terceiros", "bloqueada", "falhas", "destino", "redirect_ignorado", "saltos"}
 
 
 async def test_pulado_sem_contato(tmp_path, monkeypatch):
@@ -1245,6 +1246,99 @@ async def test_redirect_para_outro_dominio_captura_as_subpaginas_do_destino(tmp_
     assert verificar(tmp_path) == []
 
 
+# Três nomes locais: o alvo redireciona para um rastreador, que redireciona para o destino (F1 da revisão final)
+TRK_LOCAL = "trk-sintetico.net"
+
+
+class _TresNomes(SimpleHTTPRequestHandler):
+    def do_GET(self) -> None:
+        host = (self.headers.get("Host") or "").rpartition(":")[0]
+        self.server.pedidos.append((host, self.path))
+        saltos = {
+            ALVO_LOCAL: f"http://{TRK_LOCAL}:{self.server.server_port}/r?c=1",
+            TRK_LOCAL: f"http://{DESTINO_LOCAL}:{self.server.server_port}/index.html",
+        }
+        if host in saltos:
+            self.send_response(302)
+            self.send_header("Location", saltos[host])
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        super().do_GET()
+
+    def log_message(self, *a) -> None:
+        pass
+
+
+@lento
+async def test_redirect_em_varios_saltos_grava_a_cadeia_da_pagina_inicial(tmp_path, monkeypatch):
+    regras = f"--host-resolver-rules=MAP {ALVO_LOCAL} 127.0.0.1, MAP {TRK_LOCAL} 127.0.0.1, MAP {DESTINO_LOCAL} 127.0.0.1"
+    monkeypatch.setattr(modulo_captura, "ARGS_DO_NAVEGADOR", (*modulo_captura.ARGS_DO_NAVEGADOR, regras))
+    servidor = ThreadingHTTPServer(("127.0.0.1", 0), partial(_TresNomes, directory=str(SITE)))
+    servidor.daemon_threads = True
+    servidor.pedidos = []
+    threading.Thread(target=servidor.serve_forever, daemon=True).start()
+    try:
+        porta = servidor.server_port
+        r, _ = await capturar(tmp_path, f"http://{ALVO_LOCAL}:{porta}/", alvo=ALVO_LOCAL, max_subpaginas=0)
+    finally:
+        servidor.shutdown()
+        servidor.server_close()
+    # a cadeia, na ordem e sem a URL final; o destino é o do fim dela
+    assert r.saidas["saltos"] == [f"http://{ALVO_LOCAL}:{porta}/", f"http://{TRK_LOCAL}:{porta}/r?c=1"]
+    assert r.saidas["destino"] == {"url": f"http://{DESTINO_LOCAL}:{porta}/index.html", "dominio": DESTINO_LOCAL}
+    # o rastreador e o destino são o site; o alvo já é recusado pelo `ctx.alvo`
+    assert dominios_visitados(r.saidas, ALVO_LOCAL) == {TRK_LOCAL, DESTINO_LOCAL}
+
+
+@lento
+async def test_sem_redirect_nao_ha_saltos(servidor_local, tmp_path):
+    r, _ = await capturar(tmp_path, servidor_local + "/index.html", max_subpaginas=0)
+    assert r.saidas["saltos"] == []
+
+
+@lento
+async def test_redirect_no_mesmo_host_tambem_e_salto(servidor_local, tmp_path):
+    r, _ = await capturar(tmp_path, servidor_local + "/inicio", max_subpaginas=0)
+    assert r.saidas["saltos"] == [servidor_local + "/inicio"]
+
+
+def test_dominios_visitados_pelas_paginas_e_pelos_saltos():
+    captura = {
+        "paginas": [
+            {"url": "https://phinvestimentos.com/login"},
+            {"url": "https://www.phinvestimentos.com/planos"},
+            {"url": "https://t.me/golpe"},  # plataforma: não é o site
+            {"url": "https://subpagina-que-redirecionou.com.br/x"},
+        ],
+        "saltos": ["https://phinv.link/", "https://trk.example.net/c?id=1", "https://sedoparking.com/x"],
+    }
+    assert dominios_visitados(captura, "phinv.link") == {
+        "phinvestimentos.com", "subpagina-que-redirecionou.com.br", "example.net"
+    }  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    "captura",
+    [
+        None,
+        {},
+        {"paginas": None, "saltos": None},
+        {"paginas": [None, 7, {"url": None}, {"url": "não é url"}, {"url": "http://[::1"}], "saltos": [None, 3, ""]},
+        {"paginas": [{"url": "https://exemplo.com.br/"}, {"url": "http://127.0.0.1:8080/"}]},  # o alvo e um IP
+    ],
+)
+def test_dominios_visitados_de_captura_estranha_ou_antiga(captura):
+    assert dominios_visitados(captura, "exemplo.com.br") == set()
+
+
+def test_dominios_visitados_de_captura_antiga_sem_saltos():
+    # a captura gravada antes da T1 não tem `destino` nem `saltos`, mas a página dela já é do site para onde o alvo foi
+    assert dominios_visitados({"paginas": [{"url": "https://phinvestimentos.com/login"}]}, "phinv.link") == {
+        "phinvestimentos.com"
+    }
+
+
 def _visita(url: str, links: list[str] | None = None) -> modulo_captura._Visita:
     return modulo_captura._Visita(url, 200, {}, "pagina", "<html>x</html>", "texto da pagina", PNG, links or [])
 
@@ -1274,6 +1368,7 @@ async def test_redirect_para_plataforma_ou_estacionamento_mantem_o_alvo(tmp_path
     r, _ = await capturar(tmp_path, "https://exemplo.com.br/", alvo="exemplo.com.br", max_subpaginas=5)
     assert r.saidas["destino"] is None
     assert r.saidas["redirect_ignorado"] == {"url": final, "dominio": dominio, "motivo": motivo}
+    assert r.saidas["saltos"] == []  # o `_visitar` trocado não informa a cadeia
     # a plataforma e o estacionamento não são rastreados: só os links do alvo
     assert visitadas == ["https://exemplo.com.br/", "https://exemplo.com.br/planos"]
 
@@ -1282,7 +1377,8 @@ async def test_redirect_para_plataforma_ou_estacionamento_mantem_o_alvo(tmp_path
 async def test_destino_tambem_vale_quando_a_pagina_do_destino_e_um_desafio(tmp_path, monkeypatch):
     async def visitar(contexto, url, cfg, com_links, guarda):
         return modulo_captura._Visita(
-            "https://phinvestimentos.com/login", 403, {}, "Just a moment...", "<html>cf-chl</html>", "", PNG, []
+            "https://phinvestimentos.com/login", 403, {}, "Just a moment...", "<html>cf-chl</html>", "", PNG, [],
+            ["https://phinv.link/", "https://trk.example.net/c"],
         )
 
     monkeypatch.setattr(modulo_captura, "_visitar", visitar)
@@ -1291,6 +1387,7 @@ async def test_destino_tambem_vale_quando_a_pagina_do_destino_e_um_desafio(tmp_p
     # o redirect foi visto antes do desafio: o Wayback e os coletores olham o destino
     assert r.saidas["destino"] == {"url": "https://phinvestimentos.com/login", "dominio": "phinvestimentos.com"}
     assert r.saidas["redirect_ignorado"] is None
+    assert r.saidas["saltos"] == ["https://phinv.link/", "https://trk.example.net/c"]  # a cadeia vale no desafio
 
 
 # ---------------------------------------------------------------------------- opsec da captura (I5)

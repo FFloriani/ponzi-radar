@@ -999,7 +999,19 @@ async def test_destino_recusado_com_a_mensagem_do_modo(tmp_path, serv):
         assert v == Validacao(False, esperado, "evidencias[0].fonte", [])
 
 
-@pytest.mark.parametrize("dominio_destino", [None, "", "  "])
+async def test_varios_dominios_do_site_sao_recusados(ctx, serv, respx_mock):
+    # F1 da revisão final: o destino, o rastreador do meio da cadeia e o site para onde a captura antiga foi
+    visitados = {DESTINO, "rastreio.net", " Outro-Site.com.br. ", "", None}
+    for url in (f"https://{DESTINO}/x", "https://trk.rastreio.net/c", "https://www.outro-site.com.br/y"):
+        with pytest.raises(ErroNo) as erro:
+            await arquivar_fonte(url, ctx, serv, dominio_destino=visitados)
+        assert erro.value.mensagem == MOTIVO_ALVO
+        v = await validar(confirmado(ev(url)), pend(ctx), ctx, serv, dominio_destino=visitados)
+        assert v == Validacao(False, MOTIVO_ALVO, "evidencias[0].fonte", [])
+    assert respx_mock.calls.call_count == 0
+
+
+@pytest.mark.parametrize("dominio_destino", [None, "", "  ", set(), frozenset({""})])
 async def test_sem_destino_o_dominio_dele_e_fonte_comum(ctx, serv, respx_mock, dominio_destino):
     servir(respx_mock, f"https://{DESTINO}/noticia", pagina())
     assert (await arquivar_fonte(f"https://{DESTINO}/noticia", ctx, serv, dominio_destino=dominio_destino)).texto

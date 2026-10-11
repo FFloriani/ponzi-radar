@@ -30,6 +30,7 @@ from radar.execucao import carregar_execucao
 from radar.mcp_server import AVISO_NAO_CONFIAVEL, LIMITE_TEXTO, criar_servidor
 from radar.modelos import Aguardando, Candidato, ErroNo, Feito
 from radar.motor import Motor, NoBase
+from radar.nos import nos_do_nucleo
 from radar.nos.alvo import AlvoNo
 from radar.nos.cvm import _guardar as guardar_indice
 from radar.nos.destino import DestinoNo
@@ -39,6 +40,7 @@ from radar.pendencias.definicoes import CABECALHO_NAO_CONFIAVEL, DEFINICOES, nov
 from radar.pendencias.mascara import MARCADOR
 from radar.pontuacao import CLASSES
 from radar.rede import Rede
+from tests.execucao_em_disco import antes_da_t1, gravar, saidas_base
 
 ALVO = "exemplo.com.br"
 IP_DO_ALVO = "93.184.216.34"
@@ -1060,7 +1062,7 @@ async def test_arquivar_fonte_recusa_o_destino_do_redirect(abrir, monkeypatch):
     r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-A1",
                      resposta=resposta_a1(f"https://{DESTINO}/planos"))  # fmt: skip
     assert r["aceita"] is False and r["motivo"].startswith("fonte recusada: o alvo só é acessado pela captura"), r
-    assert [c["dominio_destino"] for c in chamadas] == [DESTINO]
+    assert [c["dominio_destino"] for c in chamadas] == [{DESTINO}]
 
 
 async def test_sem_no_destino_a_validacao_so_conhece_o_alvo(abrir, monkeypatch):
@@ -1068,7 +1070,7 @@ async def test_sem_no_destino_a_validacao_so_conhece_o_alvo(abrir, monkeypatch):
     srv = await abrir()
     run_id = await iniciar(srv)
     await chamar(srv, "responder_pendencia", run_id=run_id, id="P-A1", resposta=NAO_ENCONTRADO)
-    assert chamadas[0]["dominio_destino"] is None
+    assert chamadas[0]["dominio_destino"] == set()  # sem destino nem captura: nenhum domínio além do alvo
 
 
 async def test_modo_cego_mascara_o_destino_do_redirect(abrir, tmp_path):
@@ -1170,6 +1172,63 @@ async def test_sem_o_no_destino_no_dag_a_fonte_url_nao_espera(abrir, respx_mock,
     run_id = await iniciar(srv)
     respx_mock.get("https://noticia.example/x").mock(return_value=httpx.Response(200, html="<p>noticia</p>"))
     assert "ref" in await chamar(srv, "arquivar_fonte", run_id=run_id, url="https://noticia.example/x")
+
+
+MOTIVO_ALVO = "fonte recusada: o alvo só é acessado pela captura; cite o sha256 da captura ou o snapshot do Wayback"
+TRK = "trk.rastreio.net"  # um rastreador do operador no meio da cadeia de redirect
+
+
+class CapturaComSaltos(NoBase):
+    """A captura que foi do alvo a um rastreador e dele ao `DESTINO` (F1 da revisão final)."""
+
+    nome = "captura"
+    entradas = ("alvo",)
+    toca_alvo = True
+    as_of = "so_atual"
+
+    async def executar(self, ctx, entradas, respostas, s):
+        url = f"https://{DESTINO}/login"
+        return Feito({"paginas": [{"url": url}], "terceiros": [], "bloqueada": False, "falhas": [],
+                      "destino": {"url": url, "dominio": DESTINO}, "redirect_ignorado": None,
+                      "saltos": [f"https://{ALVO}/", f"https://{TRK}/c?id=1"]})  # fmt: skip
+
+
+async def test_redirect_em_varios_saltos_recusa_os_tres_dominios(abrir, monkeypatch, respx_mock, dns_publico):
+    chamadas = espiar_validar(monkeypatch)
+    srv = await abrir([AlvoNo(), Coleta(), CapturaComSaltos(), DestinoNo(), Pend("pend_a1", "P-A1")])
+    run_id = await iniciar(srv)
+    for url in (f"https://{ALVO}/x", f"https://{TRK}/c?id=2", f"https://app.{DESTINO}/termos"):
+        r = await chamar(srv, "arquivar_fonte", run_id=run_id, url=url)
+        assert r["erro"].startswith("fonte recusada: o alvo só é acessado pela captura"), (url, r)
+        r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-A1", resposta=resposta_a1(url))
+        assert (r["aceita"], r["campo"]) == (False, "evidencias[0].fonte"), (url, r)
+        assert r["motivo"].startswith("fonte recusada: o alvo só é acessado pela captura"), (url, r)
+    # o domínio do rastreador (registrável) e o do destino; o do alvo a validação já tem pelo contexto
+    assert chamadas[0]["dominio_destino"] == {DESTINO, "rastreio.net"}
+
+
+async def test_execucao_de_antes_da_t1_recusa_o_site_que_a_captura_visitou(abrir, tmp_path, respx_mock, dns_publico):
+    # F1 e F2 da revisão final: a execução gravada antes da T1 não tem o nó `destino`, e a captura dela já foi parar no
+    # site para onde o alvo redireciona. Aberta no MCP, antes de qualquer `status`, ela não fica presa em "coleta em
+    # andamento", e o site que a captura visitou é recusado como o alvo
+    captura = {**saidas_base()["captura"], "paginas": [{"url": f"https://{DESTINO}/login", "status": 200}]}
+    pasta_antiga = antes_da_t1(gravar(tmp_path / "casos", slug="phinv-link", alvo="phinv.link",
+                                      saidas={"captura": captura}, abertas=("P-A1",)))  # fmt: skip
+    run_id = f"phinv-link/{pasta_antiga.name}"
+    srv = await abrir(nos_do_nucleo())
+    for url in (f"https://{DESTINO}/termos", f"https://www.{DESTINO}/", "https://phinv.link/ajuda"):
+        r = await chamar(srv, "arquivar_fonte", run_id=run_id, url=url)
+        assert r == {"erro": MOTIVO_ALVO}, (url, r)
+    r = await chamar(srv, "responder_pendencia", run_id=run_id, id="P-A1",
+                     resposta=resposta_a1(f"https://{DESTINO}/planos"))  # fmt: skip
+    assert (r["aceita"], r["motivo"], r["campo"]) == (False, MOTIVO_ALVO, "evidencias[0].fonte")
+    noticia = respx_mock.get("https://noticia.example/materia").mock(
+        return_value=httpx.Response(200, html="<html><body>reportagem sobre o site</body></html>")
+    )
+    assert "ref" in await chamar(srv, "arquivar_fonte", run_id=run_id, url="https://noticia.example/materia")
+    assert noticia.call_count == 1
+    # nada drenou o motor: o `estado.json` antigo continua sem o nó `destino`
+    assert "destino" not in ler_json(pasta_antiga / "estado.json")["nos"]
 
 
 IP_DO_REDIRECIONADOR = "104.16.132.229"
