@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "radar-piramides"
+name = "ponzi-radar"
 version = "0.1.0"
-description = "Radar de pirâmides financeiras: pipeline de análise passiva de sites e servidor MCP"
+description = "Passive OSINT radar that scores investment websites for Ponzi and pyramid scheme risk (DAG pipeline + MCP server)"
 requires-python = ">=3.12"
 dependencies = [
     "httpx[socks]>=0.28",

@@ -3,7 +3,7 @@
 
 Uso:
     GH_TOKEN=$(gh auth token) python tools/publicar.py -m "mensagem" ARQ [ARQ ...]
-    (opções: --repo FFloriani/piramide-pentest  --branch main)
+    (opções: --repo FFloriani/ponzi-radar  --branch main)
 
 ARQ é um caminho relativo à raiz do repositório (a pasta acima de tools/), de onde o
 conteúdo é lido. O trailer de coautoria é acrescentado à mensagem se faltar. Caminhos em
@@ -33,7 +33,7 @@ from typing import Any
 
 API = "https://api.github.com"
 RAIZ = Path(__file__).resolve().parents[1]
-REPO_PADRAO = "FFloriani/piramide-pentest"
+REPO_PADRAO = "FFloriani/ponzi-radar"
 BRANCH_PADRAO = "main"
 TRAILER = "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 PASTA_PROIBIDA = "casos"

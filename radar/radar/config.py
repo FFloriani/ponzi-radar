@@ -16,7 +16,7 @@ UA_NAVEGADOR = (
     "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 )
 # com proxy configurado, a `Rede` troca este padrão por um neutro (`rede.UA_API_NEUTRO`): ele identifica o projeto
-UA_API = "radar-piramides/0.1 (pesquisa; github.com/FFloriani/piramide-pentest)"
+UA_API = "ponzi-radar/0.1 (pesquisa; github.com/FFloriani/ponzi-radar)"
 
 
 def _limites_padrao() -> dict[str, float]:
