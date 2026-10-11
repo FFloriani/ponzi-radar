@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from datetime import date, datetime
@@ -1862,6 +1863,104 @@ async def test_no_o_wayback_tambem_traz_os_textos_internos(ctx, serv):
     (registro,) = registros_internos(serv)
     assert registro["origem"] == "http://alvo.com.br/"
     assert [c["valor"] for c in resultado.saidas["candidatos"]] == ["saques", "bônus de indicação"]
+
+
+# --- CPU fora do loop e o mesmo script lido uma vez (F3 da revisão final)
+
+
+@pytest.fixture
+def scripts_lidos(monkeypatch):
+    """Um cache de scripts vazio e a contagem das leituras de verdade (as que não vieram do cache), por script."""
+    monkeypatch.setattr(modulo_extracao, "_CACHE_DE_SCRIPTS", modulo_extracao._CacheDeScripts())
+    lidos: list[str] = []
+    ler = modulo_extracao._ler_um_script
+
+    def espia(script: str):
+        lidos.append(script)
+        return ler(script)
+
+    monkeypatch.setattr(modulo_extracao, "_ler_um_script", espia)
+    return lidos
+
+
+async def test_no_o_mesmo_script_em_varias_paginas_e_lido_uma_vez(ctx, serv, scripts_lidos):
+    extra = script_com({"x": "Seu plano rende 1% ao dia sem risco"})
+    login = pagina_com_html(serv, "https://alvo.com.br/login", "Entrar", HTML_I18N)
+    cadastro = pagina_com_html(serv, "https://alvo.com.br/cadastro", "Cadastre-se", HTML_I18N + extra)
+    igual = pagina_com_html(serv, "https://alvo.com.br/entrar", "Entrar de novo", HTML_I18N)
+    resultado = await _extrair_da_captura(ctx, serv, login, cadastro, igual)
+    # o dicionário de layout está nas três páginas e o extra numa: duas leituras, não quatro
+    assert len(scripts_lidos) == 2 and len(set(scripts_lidos)) == 2
+    # e o resultado é o de sempre (`test_no_o_mesmo_achado_do_texto_interno_sai_uma_vez`)
+    assert [c["valor"] for c in resultado.saidas["candidatos"]] == ["saques", "bônus de indicação", "1|dia", "sem risco"]
+    assert [r["origem"] for r in registros_internos(serv)] == [
+        "https://alvo.com.br/login", "https://alvo.com.br/cadastro", "https://alvo.com.br/entrar"
+    ]  # fmt: skip
+
+
+def test_texto_interno_do_script_em_cache_e_igual_ao_lido(scripts_lidos):
+    html = HTML_I18N + script_com({"a": "Saques de rendimento estão bloqueados.", "b": "Outro texto natural aqui"})
+    primeira, segunda = texto_interno(html), texto_interno(html)
+    assert primeira == segunda
+    # o texto repetido no segundo script fica com a chave do primeiro, como na leitura sem cache
+    assert primeira.texto.split("\n") == [*LINHAS_I18N, "b = Outro texto natural aqui"]
+    assert len(scripts_lidos) == 2  # a segunda página inteira veio do cache
+
+
+def test_texto_interno_o_teto_de_literais_vale_para_a_pagina_e_nao_para_o_script(monkeypatch, scripts_lidos):
+    monkeypatch.setattr(modulo_extracao, "_LITERAIS_MAXIMOS", 10)
+    um = "<script>var a = [" + ",".join(f'"Texto natural número {i} do primeiro"' for i in range(6)) + "];</script>"
+    dois = "<script>var b = [" + ",".join(f'"Texto natural número {i} do segundo"' for i in range(6)) + "];</script>"
+    interno = texto_interno(um + dois)
+    # 6 literais do primeiro e 4 do segundo: o 11º literal da página corta, mesmo o segundo script tendo só 6
+    assert interno.truncado is True
+    assert interno.texto.split("\n") == [
+        *(f"Texto natural número {i} do primeiro" for i in range(6)),
+        *(f"Texto natural número {i} do segundo" for i in range(4)),
+    ]
+    # o segundo script sozinho cabe no teto: em outra página, vem inteiro e sem corte
+    sozinho = texto_interno(dois)
+    assert (len(sozinho.texto.split("\n")), sozinho.truncado) == (6, False)
+
+
+def test_texto_interno_script_maior_que_o_teto_de_linhas_marca_o_corte_mesmo_do_cache(scripts_lidos):
+    grande = script_com({f"k{i}": f"Mensagem número {i} do aplicativo" for i in range(MAX_LINHAS_DO_TEXTO_INTERNO + 5)})
+    for _ in range(2):  # a segunda vem do cache
+        interno = texto_interno(grande)
+        assert interno.truncado is True and len(interno.texto.split("\n")) == MAX_LINHAS_DO_TEXTO_INTERNO
+    assert len(scripts_lidos) == 1
+
+
+async def test_no_o_calculo_roda_fora_do_loop(ctx, serv, monkeypatch, scripts_lidos):
+    # o texto interno e as regex bloqueiam a thread (aqui, de propósito): o loop do servidor continua respondendo
+    ler, extrair_texto = modulo_extracao._ler_um_script, modulo_extracao._extrair_texto
+
+    def ler_devagar(script):
+        time.sleep(0.3)
+        return ler(script)
+
+    def extrair_devagar(texto, artefato):
+        time.sleep(0.3)
+        return extrair_texto(texto, artefato)
+
+    monkeypatch.setattr(modulo_extracao, "_ler_um_script", ler_devagar)
+    monkeypatch.setattr(modulo_extracao, "_extrair_texto", extrair_devagar)
+    p = pagina_com_html(serv, "https://alvo.com.br/login", "Entrar", HTML_I18N)
+    batidas = 0
+
+    async def relogio():
+        nonlocal batidas
+        while True:
+            await asyncio.sleep(0.01)
+            batidas += 1
+
+    tarefa = asyncio.create_task(relogio())
+    try:
+        resultado = await _extrair_da_captura(ctx, serv, p)
+    finally:
+        tarefa.cancel()
+    assert [c["valor"] for c in resultado.saidas["candidatos"]] == ["saques", "bônus de indicação"]
+    assert batidas >= 20  # 0,6 s de cálculo: no loop, o relógio não bateria nenhuma vez
 
 
 # --- dentro do motor: as dependências, a normalização das saídas e a retomada

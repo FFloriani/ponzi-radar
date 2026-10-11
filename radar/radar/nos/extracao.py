@@ -19,7 +19,9 @@ custo linear:
 O custo é linear também para `"1" * 100_000`, `"%" * 100_000`, `"a." * 100_000` e `"1%" * 1_000_000`
 (ver tests/test_extracao.py). O HTML passa pelo `HTMLParser` da stdlib, que é linear, e só até
 `_HTML_MAXIMO` caracteres ou `_TAGS_MAXIMAS` tags. Os scripts são achados por `str.find` nos mesmos `_HTML_MAXIMO`
-caracteres e lidos literal a literal, com teto de literais, de linhas e de caracteres por página.
+caracteres e lidos literal a literal, com teto de literais, de linhas e de caracteres por página. Cada script é
+lido uma vez por conteúdo (`_CACHE_DE_SCRIPTS`), e o nó faz o cálculo das páginas numa thread: o loop do servidor
+não para.
 
 Convenções:
 - as regex ignoram a caixa: as de letras rodam numa cópia do texto em minúsculas, com os mesmos índices
@@ -37,12 +39,14 @@ Convenções:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
 import re
+import threading
 from bisect import bisect_right
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Iterable, Iterator
 from decimal import Decimal
 from html.parser import HTMLParser
@@ -918,19 +922,44 @@ def _e_texto_natural(texto: str) -> bool:
     return palavras >= 2 and 2 * palavras >= len(pedacos) and 2 * classes < len(pedacos)
 
 
-class _LeitorDeScripts:
-    """Junta as linhas do texto interno de uma página, com os tetos de linhas, de caracteres e de literais.
+def _chave_da_linha(chave: str | None) -> str | None:
+    """A chave como vai na linha (espaços colapsados), ou `None` se ela é vazia, longa demais ou tem controle."""
+    if chave is None:
+        return None
+    chave = " ".join(chave.split())
+    return None if not chave or len(chave) > _CHAVE_MAXIMA or _CONTROLE.search(chave) else chave
 
-    `sem_chaves` tem as mesmas linhas com a chave e o ` = ` trocados por espaços (mesmo tamanho): as regex de
-    candidatos rodam nele, e a chave (`saque.backend.erro...`, um identificador do código) não vira achado.
-    """
+
+class _Evento(NamedTuple):
+    """Um texto do script, já de uma linha só e de linguagem natural, com a chave já como vai na linha: `literal` é
+    quantos literais o script tinha lido quando o texto saiu."""
+
+    literal: int
+    chave: str | None
+    texto: str
+
+
+class _LeituraDoScript(NamedTuple):
+    """O que um script dá ao texto interno, sem depender da página: os textos distintos e naturais, na ordem, e quantos
+    literais ele tem (até `_LITERAIS_MAXIMOS` + 1, onde a leitura para de qualquer jeito). `cortado`: o script tem
+    mais textos distintos do que cabem numa página, e a leitura parou no primeiro que sobra."""
+
+    eventos: tuple[_Evento, ...]
+    literais: int
+    cortado: bool
+
+
+class _LeitorDeScript:
+    """Lê os literais de um script sozinho e guarda os textos dele (`_LeituraDoScript`), que a página junta depois com
+    os tetos dela (`_LeitorDeScripts.juntar`). Para no primeiro literal acima de `_LITERAIS_MAXIMOS` e no primeiro texto
+    distinto além de `MAX_LINHAS_DO_TEXTO_INTERNO` (`cortado`): a página nunca passaria deles, e ler o resto seria
+    trabalho jogado fora."""
 
     def __init__(self) -> None:
-        self.linhas: list[str] = []
-        self.sem_chaves: list[str] = []
-        self.truncado = False
+        self.truncado = False  # para a leitura
+        self.cortado = False
+        self.eventos: list[_Evento] = []
         self._vistos: set[str] = set()
-        self._caracteres = 0
         self._literais = 0
 
     def ler(self, codigo: str, abre: re.Pattern[str], camada: int) -> None:
@@ -978,10 +1007,53 @@ class _LeitorDeScripts:
         texto = " ".join(texto.split())  # uma linha só: quebras (inclusive U+2028) e espaços repetidos viram um espaço
         if self.truncado or texto in self._vistos or not _e_texto_natural(texto):
             return
-        if chave is not None:
-            chave = " ".join(chave.split())
-            if not chave or len(chave) > _CHAVE_MAXIMA or _CONTROLE.search(chave):
-                chave = None
+        if len(self._vistos) >= MAX_LINHAS_DO_TEXTO_INTERNO:
+            self.cortado = self.truncado = True
+            return
+        self._vistos.add(texto)
+        self.eventos.append(_Evento(self._literais, _chave_da_linha(chave), texto))
+
+
+class _LeitorDeScripts:
+    """Junta as linhas do texto interno de uma página, com os tetos de linhas, de caracteres e de literais.
+
+    `sem_chaves` tem as mesmas linhas com a chave e o ` = ` trocados por espaços (mesmo tamanho): as regex de
+    candidatos rodam nele, e a chave (`saque.backend.erro...`, um identificador do código) não vira achado.
+    """
+
+    def __init__(self) -> None:
+        self.linhas: list[str] = []
+        self.sem_chaves: list[str] = []
+        self.truncado = False
+        self._vistos: set[str] = set()
+        self._caracteres = 0
+        self._literais = 0
+
+    def juntar(self, leitura: _LeituraDoScript) -> None:
+        """Os textos de um script lido sozinho, como se a página o lesse agora, literal a literal: com a contagem de
+        literais dela, o teto de literais corta onde cortaria (no primeiro literal acima de `_LITERAIS_MAXIMOS`), e o
+        texto que a página já tem não entra de novo.
+
+        A leitura `cortada` dá o mesmo que a leitura da página: se todos os textos guardados entraram sem estourar um
+        teto, a página tem exatamente esses `MAX_LINHAS_DO_TEXTO_INTERNO` textos (ela não cabe mais), e o primeiro texto
+        que o script ainda tinha é novo para ela, então a página cortaria nele."""
+        antes = self._literais
+        for evento in leitura.eventos:
+            if antes + evento.literal > _LITERAIS_MAXIMOS:
+                self.truncado = True
+                return
+            self._acrescentar(evento.chave, evento.texto)
+            if self.truncado:
+                return
+        self._literais = antes + leitura.literais
+        if leitura.cortado or self._literais > _LITERAIS_MAXIMOS:
+            self.truncado = True
+
+    def _acrescentar(self, chave: str | None, texto: str) -> None:
+        """A linha do texto (já de uma linha só e natural, com a chave já normalizada), se a página ainda não o tem e
+        ele cabe nos tetos de linhas e de caracteres; senão a página fica `truncado`."""
+        if texto in self._vistos:
+            return
         linha = f"{chave} = {texto}" if chave else texto
         tamanho = len(linha) + (1 if self.linhas else 0)  # com a quebra que a separa da anterior
         cheio = self._caracteres + tamanho > MAX_CARACTERES_DO_TEXTO_INTERNO
@@ -994,10 +1066,49 @@ class _LeitorDeScripts:
         self.sem_chaves.append(" " * (len(linha) - len(texto)) + texto)
 
 
+def _ler_um_script(script: str) -> _LeituraDoScript:
+    """Os textos de um script sozinho (`_LeitorDeScript`)."""
+    leitor = _LeitorDeScript()
+    leitor.ler(script, _ABRE_NO_CODIGO, 0)
+    return _LeituraDoScript(tuple(leitor.eventos), leitor._literais, leitor.cortado)
+
+
+class _CacheDeScripts:
+    """As leituras dos scripts pelo sha256 do conteúdo: o mesmo `<script>` de layout em várias páginas (o dicionário de
+    textos do aplicativo, o runtime do Next.js) é lido uma vez. Guarda as `maximo` últimas, cada uma com até
+    `MAX_LINHAS_DO_TEXTO_INTERNO` textos; a extração roda em threads (`asyncio.to_thread`), daí a trava."""
+
+    def __init__(self, maximo: int = 32) -> None:
+        self._maximo = maximo
+        self._leituras: OrderedDict[bytes, _LeituraDoScript] = OrderedDict()
+        self._trava = threading.Lock()
+
+    def leitura(self, script: str) -> _LeituraDoScript:
+        # os tetos entram na chave: a leitura guardada com outros tetos (um teste que os troca) não vale
+        tetos = f"{_LITERAIS_MAXIMOS}:{MAX_LINHAS_DO_TEXTO_INTERNO}:".encode()
+        chave = hashlib.sha256(tetos + script.encode("utf-8", "surrogatepass")).digest()
+        with self._trava:
+            if chave in self._leituras:
+                self._leituras.move_to_end(chave)
+                return self._leituras[chave]
+        leitura = _ler_um_script(script)  # fora da trava: duas threads podem ler o mesmo script, e dá o mesmo
+        with self._trava:
+            self._leituras[chave] = leitura
+            self._leituras.move_to_end(chave)
+            while len(self._leituras) > self._maximo:
+                self._leituras.popitem(last=False)
+        return leitura
+
+
+_CACHE_DE_SCRIPTS = _CacheDeScripts()
+
+
 def _ler_scripts(html: str) -> _LeitorDeScripts:
+    """O texto interno da página, script a script: cada um vem do cache (`_CACHE_DE_SCRIPTS`) e é juntado com os tetos
+    da página (F3 da revisão final). O resultado é o da leitura literal a literal da página inteira."""
     leitor = _LeitorDeScripts()
     for script in _scripts_embutidos(html):
-        leitor.ler(script, _ABRE_NO_CODIGO, 0)
+        leitor.juntar(_CACHE_DE_SCRIPTS.leitura(script))
         if leitor.truncado:
             break
     return leitor
@@ -1065,13 +1176,37 @@ def _ler(s: Servicos, ref: str) -> str:
     return s.custodia.ler(ref).decode("utf-8", errors="replace")
 
 
-def _candidatos_internos(
-    html: str, url: str, s: Servicos, refs_lidas: set[str], truncadas: set[str]
+class _Pagina(NamedTuple):
+    """O cálculo de uma página, sem a custódia: os candidatos do texto e dos atributos, as categorias cortadas no teto
+    e o texto interno (as linhas e as mesmas linhas sem as chaves)."""
+
+    da_pagina: list[Candidato]
+    truncadas: set[str]
+    interno: _LeitorDeScripts | None
+
+
+def _calcular_pagina(texto: str, ref: str, html: str | None, ref_html: str | None) -> _Pagina:
+    """As regex do texto e dos atributos e a leitura dos scripts: o trabalho de CPU da página, que roda numa thread
+    (F3 da revisão final: com 11 páginas de 4 MB, o loop do servidor ficaria parado por segundos)."""
+    da_pagina, truncadas = _extrair_texto(texto, ref)
+    if html is None or ref_html is None:
+        return _Pagina(da_pagina, truncadas, None)
+    dos_atributos, truncadas_html = _extrair_atributos(html, ref_html)
+    da_pagina, truncadas = _juntar(da_pagina, dos_atributos, truncadas | truncadas_html)
+    return _Pagina(da_pagina, truncadas, _ler_scripts(html))
+
+
+def _montar_internos(sem_chaves: str, texto: str, ref: str) -> tuple[list[Candidato], set[str]]:
+    return _montar(_achados(sem_chaves), texto, ref, origem=ORIGEM_TEXTO_INTERNO)
+
+
+async def _candidatos_internos(
+    leitor: _LeitorDeScripts, url: str, s: Servicos, refs_lidas: set[str], truncadas: set[str]
 ) -> list[Candidato]:
-    """Guarda o texto interno do `html` na custódia (`tipo="texto_interno"`, `origem=url`, `.txt`) e devolve os
-    candidatos dele, com `extra.origem = "texto_interno"`. Sem texto interno, nada é guardado. O texto já lido em
-    outra página (`refs_lidas`) é guardado de novo, com esta origem, mas os candidatos dele já saíram."""
-    leitor = _ler_scripts(html)
+    """Guarda o texto interno da página (`leitor`) na custódia (`tipo="texto_interno"`, `origem=url`, `.txt`) e devolve
+    os candidatos dele, com `extra.origem = "texto_interno"`. Sem texto interno, nada é guardado. O texto já lido em
+    outra página (`refs_lidas`) é guardado de novo, com esta origem, mas os candidatos dele já saíram. A custódia fica
+    no loop; as regex vão para uma thread."""
     if leitor.truncado:
         truncadas.add(ORIGEM_TEXTO_INTERNO)
     if not leitor.linhas:
@@ -1081,9 +1216,7 @@ def _candidatos_internos(
     if ref in refs_lidas:
         return []
     refs_lidas.add(ref)
-    candidatos, truncadas_internas = _montar(
-        _achados("\n".join(leitor.sem_chaves)), texto, ref, origem=ORIGEM_TEXTO_INTERNO
-    )
+    candidatos, truncadas_internas = await asyncio.to_thread(_montar_internos, "\n".join(leitor.sem_chaves), texto, ref)
     truncadas |= truncadas_internas
     return candidatos
 
@@ -1124,13 +1257,14 @@ class ExtracaoNo(NoBase):
         for pagina in paginas:
             ref = pagina["texto"]
             url = pagina.get("url") or ref
-            da_pagina, truncadas = _extrair_texto(_ler(s, ref), ref)
+            ref_html = pagina.get("html") or None
+            texto, html = _ler(s, ref), (_ler(s, ref_html) if ref_html else None)
+            # o cálculo (regex, atributos e scripts) numa thread; a custódia, no loop
+            calculo = await asyncio.to_thread(_calcular_pagina, texto, ref, html, ref_html)
+            da_pagina, truncadas = calculo.da_pagina, calculo.truncadas
             internos: list[Candidato] = []
-            if ref_html := pagina.get("html"):
-                html = _ler(s, ref_html)
-                dos_atributos, truncadas_html = _extrair_atributos(html, ref_html)
-                da_pagina, truncadas = _juntar(da_pagina, dos_atributos, truncadas | truncadas_html)
-                internos = _candidatos_internos(html, url, s, refs_internas, truncadas)
+            if calculo.interno is not None:
+                internos = await _candidatos_internos(calculo.interno, url, s, refs_internas, truncadas)
             lidas.append((url, da_pagina, internos, truncadas))
         candidatos = [c for _, da_pagina, _, _ in lidas for c in da_pagina]
         vistos_internos: set[tuple[str, str]] = set()
